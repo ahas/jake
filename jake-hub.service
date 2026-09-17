@@ -1,0 +1,25 @@
+[Unit]
+Description=jake hub — the main-host side of the remote-control tunnel
+After=network-online.target
+Wants=network-online.target
+# Without its config file the hub has neither the shared secret it authenticates the agent with nor
+# the control token the console presents, so it could only crash-loop; don't start at all until the
+# file is in place. The file lives with the runtime data rather than in the checkout: a secret inside
+# a git tree is an untracked file, and an untracked file is one `git clean` away from gone. The hub
+# reads this same file itself, so the condition guards exactly what the process needs.
+ConditionPathExists=%h/.local/share/jake/hub.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# The checkout the hub runs from. It is not compiled; bun runs the entry point in place.
+WorkingDirectory=%h/repos/ahas/infra/jake
+ExecStart=%h/.bun/bin/bun src/hub/main.ts
+Restart=always
+RestartSec=5
+# The same PATH BMO's units carry, so bun and the tools a login shell reaches for are found the same
+# way whether the hub was started by systemd or from a shell.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+node_modules/
+*.env
+!*.env.example
+dist/
+
+# The browser sidecar downloads its browser here at install time; never commit it.
+sidecar/browsers/

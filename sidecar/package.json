@@ -1,0 +1,11 @@
+{
+  "name": "jake-browser-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Uncompiled Bun sidecar the jake agent spawns to drive a browser; ships beside the agent with its own node_modules and downloaded browser.",
+  "main": "index.ts",
+  "dependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}
