@@ -2,14 +2,15 @@ import { describe, expect, test } from "bun:test";
 
 import {
   BROWSER_PREFIX,
-  BrowserHandler,
-  BrowserSupervisor,
+  BrowserEngine,
   browserHandlers,
-  type BrowserSupervisorOptions,
-  type SidecarCallOutcome,
-  type SidecarChild,
-  type SidecarSpawner,
+  type BrowserBackend,
+  type BrowserCaller,
+  type BrowserCallOutcome,
+  type BrowserEngineOptions,
+  type BrowserSession,
 } from "../src/agent/browser";
+import type { BrowserDriver, FetchParams, NavigateParams } from "../src/agent/browser-ops";
 import type { CallContext } from "../src/agent/capability";
 import { nullLogger } from "../src/agent/log";
 import { AgentRuntime } from "../src/agent/runtime";
@@ -18,8 +19,8 @@ import { DEFAULT_MAX_PAYLOAD_BYTES } from "../src/protocol";
 import type { AgentConfig } from "../src/config";
 
 // A controllable clock: timers fire only when the test advances time, so a call timeout and the idle
-// shutdown are exercised deterministically without waiting on the wall clock. The read loop that
-// delivers responses runs on the real event loop, independent of this fake.
+// shutdown are exercised deterministically without waiting on the wall clock. The engine's own awaits
+// run on the real microtask queue, independent of this fake.
 class FakeScheduler implements Scheduler {
   current = 0;
   private seq = 0;
@@ -36,7 +37,7 @@ class FakeScheduler implements Scheduler {
     this.timers.delete(handle as number);
   }
   setInterval(): TimerHandle {
-    throw new Error("the supervisor does not use setInterval");
+    throw new Error("the engine does not use setInterval");
   }
   clearInterval(): void {
     // unused
@@ -52,77 +53,101 @@ class FakeScheduler implements Scheduler {
   }
 }
 
-// A fake sidecar child: it records the request lines written to it, lets a test emit response lines
-// on its stdout, and settles its exit when killed or when the test ends it — standing in for a real
-// spawned process without one.
-class FakeChild implements SidecarChild {
-  readonly writes: string[] = [];
-  killed = false;
-  private ended = false;
-  private controller!: ReadableStreamDefaultController<Uint8Array>;
-  private resolveExit!: (value: { code: number | null }) => void;
-  readonly stdout: ReadableStream<Uint8Array>;
-  readonly exited: Promise<{ code: number | null }>;
+// A fake driver: navigate is answerable or left hanging (for the timeout case), and every other
+// method returns a canned value. It records the operations it was asked to perform.
+class FakeDriver implements BrowserDriver {
+  readonly calls: string[] = [];
+  navigateResult: { url: string; status: number | null } = { url: "http://x/", status: 200 };
+  hang = false;
+  private resolveHung: (() => void) | null = null;
 
+  async navigate(params: NavigateParams): Promise<{ url: string; status: number | null }> {
+    this.calls.push(`navigate:${params.url}`);
+    if (this.hang) {
+      await new Promise<void>((resolve) => {
+        this.resolveHung = resolve;
+      });
+    }
+    return this.navigateResult;
+  }
+  async source(): Promise<{ url: string; html: string }> {
+    this.calls.push("source");
+    return { url: "http://x/", html: "<html></html>" };
+  }
+  async shot(): Promise<{ png: string; bytes: number }> {
+    this.calls.push("shot");
+    return { png: "AAAA", bytes: 3 };
+  }
+  async evaluate(params: { expression: string }): Promise<{ value: unknown }> {
+    this.calls.push(`eval:${params.expression}`);
+    return { value: 42 };
+  }
+  async fetch(_params: FetchParams): Promise<{
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+    body: string;
+    bytes: number;
+    truncated: boolean;
+  }> {
+    this.calls.push("fetch");
+    return { status: 200, statusText: "OK", headers: {}, body: "hi", bytes: 2, truncated: false };
+  }
+  async close(): Promise<void> {
+    this.resolveHung?.();
+  }
+}
+
+// A fake session: it owns a driver, exposes a `closed` the test can resolve to simulate the browser
+// dying, and records that it was closed.
+class FakeSession implements BrowserSession {
+  readonly driver = new FakeDriver();
+  closedCount = 0;
+  private resolveClosed!: () => void;
+  readonly closed: Promise<void>;
   constructor() {
-    this.stdout = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        this.controller = controller;
-      },
-    });
-    this.exited = new Promise((resolve) => {
-      this.resolveExit = resolve;
+    this.closed = new Promise<void>((resolve) => {
+      this.resolveClosed = resolve;
     });
   }
-  writeLine(line: string): void {
-    this.writes.push(line);
+  close(): void {
+    this.closedCount++;
+    this.resolveClosed();
   }
-  kill(): void {
-    this.killed = true;
-    this.end(143);
-  }
-  /** The id the sidecar would echo for the nth request the supervisor wrote. */
-  requestId(index: number): number {
-    return (JSON.parse(this.writes[index]!) as { id: number }).id;
-  }
-  /** Emit a success response for the request at `index`. */
-  respond(index: number, result: unknown): void {
-    this.emit(JSON.stringify({ id: this.requestId(index), ok: true, result }));
-  }
-  emit(line: string): void {
-    this.controller.enqueue(new TextEncoder().encode(`${line}\n`));
-  }
-  end(code: number | null): void {
-    if (this.ended) {
-      return;
-    }
-    this.ended = true;
-    try {
-      this.controller.close();
-    } catch {
-      // already closed
-    }
-    this.resolveExit({ code });
+  /** Simulate the browser process exiting on its own. */
+  die(): void {
+    this.resolveClosed();
   }
 }
 
-class FakeSpawner implements SidecarSpawner {
-  readonly children: FakeChild[] = [];
-  spawn(): SidecarChild {
-    const child = new FakeChild();
-    this.children.push(child);
-    return child;
+class FakeBackend implements BrowserBackend {
+  readonly sessions: FakeSession[] = [];
+  isAvailable = true;
+  failOpen = false;
+  /** When set, every session it opens hands out a driver whose calls hang until the session closes. */
+  hangDriver = false;
+  available(): boolean {
+    return this.isAvailable;
+  }
+  open(): Promise<BrowserSession> {
+    if (this.failOpen) {
+      return Promise.reject(new Error("Edge would not launch"));
+    }
+    const session = new FakeSession();
+    session.driver.hang = this.hangDriver;
+    this.sessions.push(session);
+    return Promise.resolve(session);
   }
 }
 
-function options(overrides: Partial<BrowserSupervisorOptions> = {}): BrowserSupervisorOptions {
+function options(backend: BrowserBackend, overrides: Partial<BrowserEngineOptions> = {}): BrowserEngineOptions {
   return {
-    spawner: new FakeSpawner(),
+    backend,
     scheduler: new FakeScheduler(),
     log: nullLogger,
     idleMs: 10_000,
     callTimeoutMs: 5_000,
-    installHint: "install the sidecar first",
+    installHint: "install Edge first",
     ...overrides,
   };
 }
@@ -133,183 +158,174 @@ function ctx(signal: AbortSignal): CallContext {
 
 const liveSignal = (): AbortSignal => new AbortController().signal;
 
-// A short turn of the event loop, so an emitted response is read and correlated before the assertion.
+// A short turn of the event loop, so the engine's serialised queue and awaits progress before the
+// assertion. It uses the real timer, independent of the fake scheduler.
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-describe("BrowserSupervisor — availability", () => {
-  test("a null spawner is unavailable and every call is a named install error", async () => {
-    const supervisor = new BrowserSupervisor(options({ spawner: null }));
-    expect(supervisor.available()).toBe(false);
-    const outcome = await supervisor.call("navigate", { url: "http://x/" }, liveSignal());
+describe("BrowserEngine — availability", () => {
+  test("an unavailable backend answers every call with a named install error", async () => {
+    const backend = new FakeBackend();
+    backend.isAvailable = false;
+    const engine = new BrowserEngine(options(backend));
+    expect(engine.available()).toBe(false);
+    const outcome = await engine.call("navigate", { url: "http://x/" }, liveSignal());
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.code).toBe("browser-unavailable");
-      expect(outcome.message).toBe("install the sidecar first");
+      expect(outcome.message).toBe("install Edge first");
     }
+    expect(backend.sessions.length).toBe(0);
   });
 
-  test("a spawner present is available", () => {
-    expect(new BrowserSupervisor(options()).available()).toBe(true);
+  test("an available backend is available", () => {
+    expect(new BrowserEngine(options(new FakeBackend())).available()).toBe(true);
   });
 });
 
-describe("BrowserSupervisor — lazy start and correlation", () => {
-  test("spawns the child only on the first call and returns the matching response", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
-    expect(spawner.children.length).toBe(0);
+describe("BrowserEngine — lazy open and reuse", () => {
+  test("opens the session only on the first call and returns its result", async () => {
+    const backend = new FakeBackend();
+    const engine = new BrowserEngine(options(backend));
+    expect(backend.sessions.length).toBe(0);
 
-    const promise = supervisor.call("navigate", { url: "http://x/" }, liveSignal());
-    expect(spawner.children.length).toBe(1);
-    const child = spawner.children[0]!;
-    await settle();
-    child.respond(0, { url: "http://x/", status: 200 });
-
-    const outcome = await promise;
+    const outcome = await engine.call("navigate", { url: "http://x/" }, liveSignal());
+    expect(backend.sessions.length).toBe(1);
     expect(outcome).toEqual({ ok: true, result: { url: "http://x/", status: 200 } });
-    expect(JSON.parse(child.writes[0]!)).toMatchObject({ method: "navigate", params: { url: "http://x/" } });
+    expect(backend.sessions[0]!.driver.calls).toEqual(["navigate:http://x/"]);
   });
 
-  test("a second call reuses the same child", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
-
-    const first = supervisor.call("source", {}, liveSignal());
-    await settle();
-    spawner.children[0]!.respond(0, { url: "http://x/", html: "<p>" });
-    await first;
-
-    const second = supervisor.call("eval", { expression: "1" }, liveSignal());
-    expect(spawner.children.length).toBe(1);
-    await settle();
-    spawner.children[0]!.respond(1, { value: 1 });
-    expect((await second).ok).toBe(true);
+  test("a second call reuses the same session", async () => {
+    const backend = new FakeBackend();
+    const engine = new BrowserEngine(options(backend));
+    await engine.call("source", {}, liveSignal());
+    const second = await engine.call("eval", { expression: "1" }, liveSignal());
+    expect(backend.sessions.length).toBe(1);
+    expect(second).toEqual({ ok: true, result: { value: 42 } });
   });
 
-  test("a sidecar error response is passed through as an outcome error", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
-    const promise = supervisor.call("navigate", { url: "nope" }, liveSignal());
-    await settle();
-    spawner.children[0]!.emit(JSON.stringify({ id: spawner.children[0]!.requestId(0), ok: false, error: { code: "driver-error", message: "timeout" } }));
-    const outcome = await promise;
-    expect(outcome).toEqual({ ok: false, code: "driver-error", message: "timeout" });
+  test("a driver error becomes a driver-error outcome", async () => {
+    const backend = new FakeBackend();
+    const engine = new BrowserEngine(options(backend));
+    // An unknown op is turned into an unknown-op outcome by the dispatch.
+    const outcome = await engine.call("teleport", {}, liveSignal());
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("unknown-op");
+  });
+
+  test("a bad-params call is rejected before the browser is reached", async () => {
+    const backend = new FakeBackend();
+    const engine = new BrowserEngine(options(backend));
+    const outcome = await engine.call("navigate", {}, liveSignal());
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("bad-params");
   });
 });
 
-describe("BrowserSupervisor — idle shutdown", () => {
-  test("shuts the child down after the idle period and starts a fresh one on the next call", async () => {
-    const spawner = new FakeSpawner();
+describe("BrowserEngine — launch failure", () => {
+  test("a backend that cannot open is a browser-launch-failed outcome", async () => {
+    const backend = new FakeBackend();
+    backend.failOpen = true;
+    const engine = new BrowserEngine(options(backend));
+    const outcome = await engine.call("navigate", { url: "http://x/" }, liveSignal());
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("browser-launch-failed");
+  });
+});
+
+describe("BrowserEngine — idle shutdown", () => {
+  test("closes the session after the idle period and opens a fresh one on the next call", async () => {
+    const backend = new FakeBackend();
     const scheduler = new FakeScheduler();
-    const supervisor = new BrowserSupervisor(options({ spawner, scheduler, idleMs: 10_000 }));
+    const engine = new BrowserEngine(options(backend, { scheduler, idleMs: 10_000 }));
 
-    const promise = supervisor.call("source", {}, liveSignal());
-    await settle();
-    spawner.children[0]!.respond(0, { url: "http://x/", html: "" });
-    await promise;
+    await engine.call("source", {}, liveSignal());
+    expect(backend.sessions[0]!.closedCount).toBe(0);
 
-    expect(spawner.children[0]!.killed).toBe(false);
     scheduler.advance(10_000);
-    expect(spawner.children[0]!.killed).toBe(true);
+    expect(backend.sessions[0]!.closedCount).toBe(1);
 
-    const next = supervisor.call("source", {}, liveSignal());
-    expect(spawner.children.length).toBe(2);
-    await settle();
-    spawner.children[1]!.respond(0, { url: "http://y/", html: "" });
-    expect((await next).ok).toBe(true);
+    const next = await engine.call("source", {}, liveSignal());
+    expect(backend.sessions.length).toBe(2);
+    expect(next.ok).toBe(true);
   });
 });
 
-describe("BrowserSupervisor — mid-call death and restart", () => {
-  test("a child that dies mid-call fails the waiting call and the next call restarts it", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
+describe("BrowserEngine — mid-call death", () => {
+  test("a session that dies mid-call fails the call and the next call reopens", async () => {
+    const backend = new FakeBackend();
+    backend.hangDriver = true;
+    const engine = new BrowserEngine(options(backend));
 
-    const promise = supervisor.call("navigate", { url: "http://x/" }, liveSignal());
+    const promise = engine.call("navigate", { url: "http://x/" }, liveSignal());
     await settle();
-    spawner.children[0]!.end(1); // the child crashed before answering
+    backend.sessions[0]!.die();
 
     const outcome = await promise;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.code).toBe("sidecar-exited");
+    if (!outcome.ok) expect(outcome.code).toBe("browser-crashed");
 
-    const restart = supervisor.call("navigate", { url: "http://x/" }, liveSignal());
-    expect(spawner.children.length).toBe(2);
-    await settle();
-    spawner.children[1]!.respond(0, { url: "http://x/", status: 200 });
-    expect((await restart).ok).toBe(true);
-  });
-
-  test("a death fails every call that was in flight at once", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
-
-    const a = supervisor.call("source", {}, liveSignal());
-    const b = supervisor.call("eval", { expression: "1" }, liveSignal());
-    await settle();
-    spawner.children[0]!.end(null);
-
-    for (const outcome of await Promise.all([a, b])) {
-      expect(outcome.ok).toBe(false);
-      if (!outcome.ok) expect(outcome.code).toBe("sidecar-exited");
-    }
+    backend.hangDriver = false;
+    const restart = await engine.call("source", {}, liveSignal());
+    expect(backend.sessions.length).toBe(2);
+    expect(restart.ok).toBe(true);
   });
 });
 
-describe("BrowserSupervisor — timeout and abandonment", () => {
-  test("a call that never answers times out and tears the child down", async () => {
-    const spawner = new FakeSpawner();
+describe("BrowserEngine — timeout and abandonment", () => {
+  test("a call that never answers times out and tears the session down", async () => {
+    const backend = new FakeBackend();
+    backend.hangDriver = true;
     const scheduler = new FakeScheduler();
-    const supervisor = new BrowserSupervisor(options({ spawner, scheduler, callTimeoutMs: 5_000 }));
+    const engine = new BrowserEngine(options(backend, { scheduler, callTimeoutMs: 5_000 }));
 
-    const promise = supervisor.call("navigate", { url: "http://x/" }, liveSignal());
+    const promise = engine.call("navigate", { url: "http://x/" }, liveSignal());
     await settle();
     scheduler.advance(5_000);
 
     const outcome = await promise;
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("browser-timeout");
-    expect(spawner.children[0]!.killed).toBe(true);
+    expect(backend.sessions[0]!.closedCount).toBe(1);
   });
 
-  test("an aborted connection abandons the call without killing the child", async () => {
-    const spawner = new FakeSpawner();
-    const supervisor = new BrowserSupervisor(options({ spawner }));
+  test("an aborted connection abandons the call without closing the session", async () => {
+    const backend = new FakeBackend();
+    backend.hangDriver = true;
+    const engine = new BrowserEngine(options(backend));
     const controller = new AbortController();
 
-    const promise = supervisor.call("source", {}, controller.signal);
+    const promise = engine.call("navigate", { url: "http://x/" }, controller.signal);
     await settle();
     controller.abort();
 
     const outcome = await promise;
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("abandoned");
-    expect(spawner.children[0]!.killed).toBe(false);
+    expect(backend.sessions[0]!.closedCount).toBe(0);
   });
 });
 
 // --- Handlers ------------------------------------------------------------------------------------
 
-// A supervisor stub with a fixed outcome, so a handler's shaping is checked apart from the child.
-class StubSupervisor extends BrowserSupervisor {
-  constructor(private readonly outcome: SidecarCallOutcome) {
-    super(options({ spawner: null }));
-  }
-  override call(): Promise<SidecarCallOutcome> {
+// A caller with a fixed outcome, so a handler's shaping is checked apart from the engine.
+class StubCaller implements BrowserCaller {
+  constructor(private readonly outcome: BrowserCallOutcome) {}
+  call(): Promise<BrowserCallOutcome> {
     return Promise.resolve(this.outcome);
   }
 }
 
 describe("BrowserHandler — shaping", () => {
-  test("a plain method returns the sidecar result as the value with no blob", async () => {
-    const handler = new BrowserHandler(`${BROWSER_PREFIX}source`, "source", new StubSupervisor({ ok: true, result: { url: "http://x/", html: "<p>" } }), (r) => ({ ok: true, value: r, blob: null }));
-    const outcome = await handler.handle({}, ctx(liveSignal()));
+  test("a plain method returns the driver result as the value with no blob", async () => {
+    const handlers = browserHandlers(new StubCaller({ ok: true, result: { url: "http://x/", html: "<p>" } }), DEFAULT_MAX_PAYLOAD_BYTES);
+    const source = handlers.find((h) => h.method === `${BROWSER_PREFIX}source`)!;
+    const outcome = await source.handle({}, ctx(liveSignal()));
     expect(outcome).toEqual({ ok: true, value: { url: "http://x/", html: "<p>" }, blob: null });
   });
 
   test("shot carries the PNG across as a labelled blob and reports the byte length", async () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2]).toString("base64");
-    const handlers = browserHandlers(new StubSupervisor({ ok: true, result: { png, bytes: 6 } }), DEFAULT_MAX_PAYLOAD_BYTES);
+    const handlers = browserHandlers(new StubCaller({ ok: true, result: { png, bytes: 6 } }), DEFAULT_MAX_PAYLOAD_BYTES);
     const shot = handlers.find((h) => h.method === `${BROWSER_PREFIX}shot`)!;
     const outcome = await shot.handle({}, ctx(liveSignal()));
     expect(outcome.ok).toBe(true);
@@ -321,15 +337,15 @@ describe("BrowserHandler — shaping", () => {
 
   test("shot refuses a PNG past the frame payload cap", async () => {
     const png = Buffer.from([1, 2, 3, 4, 5, 6]).toString("base64");
-    const handlers = browserHandlers(new StubSupervisor({ ok: true, result: { png, bytes: 6 } }), 4);
+    const handlers = browserHandlers(new StubCaller({ ok: true, result: { png, bytes: 6 } }), 4);
     const shot = handlers.find((h) => h.method === `${BROWSER_PREFIX}shot`)!;
     const outcome = await shot.handle({}, ctx(liveSignal()));
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("payload-too-large");
   });
 
-  test("a supervisor error is passed straight through", async () => {
-    const handlers = browserHandlers(new StubSupervisor({ ok: false, code: "browser-unavailable", message: "install it" }), DEFAULT_MAX_PAYLOAD_BYTES);
+  test("an engine error is passed straight through", async () => {
+    const handlers = browserHandlers(new StubCaller({ ok: false, code: "browser-unavailable", message: "install it" }), DEFAULT_MAX_PAYLOAD_BYTES);
     const outcome = await handlers[0]!.handle({}, ctx(liveSignal()));
     expect(outcome).toEqual({ ok: false, code: "browser-unavailable", message: "install it" });
   });
@@ -339,6 +355,7 @@ describe("BrowserHandler — shaping", () => {
 
 describe("AgentRuntime — advertise flag", () => {
   const config = { heartbeatMs: 1000 } as AgentConfig;
+  const caller = new StubCaller({ ok: false, code: "browser-unavailable", message: "x" });
 
   test("an unadvertised handler is registered but kept out of the capability list", () => {
     const runtime = new AgentRuntime(config, {
@@ -347,8 +364,7 @@ describe("AgentRuntime — advertise flag", () => {
       log: nullLogger,
       agentVersion: "test",
     });
-    const supervisor = new BrowserSupervisor(options({ spawner: null }));
-    for (const handler of browserHandlers(supervisor, DEFAULT_MAX_PAYLOAD_BYTES)) {
+    for (const handler of browserHandlers(caller, DEFAULT_MAX_PAYLOAD_BYTES)) {
       runtime.registerCall(handler, { advertise: false });
     }
     expect(runtime.capabilities()).not.toContain(`${BROWSER_PREFIX}navigate`);
@@ -362,8 +378,7 @@ describe("AgentRuntime — advertise flag", () => {
       log: nullLogger,
       agentVersion: "test",
     });
-    const supervisor = new BrowserSupervisor(options());
-    for (const handler of browserHandlers(supervisor, DEFAULT_MAX_PAYLOAD_BYTES)) {
+    for (const handler of browserHandlers(caller, DEFAULT_MAX_PAYLOAD_BYTES)) {
       runtime.registerCall(handler, { advertise: true });
     }
     expect(runtime.capabilities()).toContain(`${BROWSER_PREFIX}shot`);

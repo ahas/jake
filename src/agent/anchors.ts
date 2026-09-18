@@ -15,17 +15,17 @@ import nodePath from "node:path";
 import { encodePowerShellScript } from "./exec";
 import { startupDir, type Platform, type PlatformEnv } from "./platform";
 
-// The two binaries of the self-healing pair. They are different programs with different names — and
-// so different hashes — on purpose: a single `taskkill /IM`, one antivirus signature on a running
-// image, or one job-object teardown then cannot end both at once. jake-agent carries the tunnel and
-// every capability; jake-guard is the small supervisor that carries none, so the two differ in
-// crash surface and attack surface as well as in name.
-export const AGENT_BINARY = "jake-agent.exe";
-export const GUARD_BINARY = "jake-guard.exe";
+// The self-healing pair is two processes of one executable. The agent (the tunnel carrier) runs it
+// with no argument; the guard (the small supervisor that carries no capability) runs the same
+// executable with the guard-mode flag. One deliverable, two run modes: the agent and the guard are
+// distinct processes that watch each other by heartbeat, and either alone brings the other back.
+export const JAKE_BINARY = "jake.exe";
+export const GUARD_MODE_FLAG = "--guard";
 
-// The stable identifiers each binary is anchored under. One name serves as the registry value name,
+// The stable identifiers each run mode is anchored under. One name serves as the registry value name,
 // the scheduled-task name, and the Startup shortcut's base name, so an anchor of any kind is found,
-// rewritten, and removed by the same key.
+// rewritten, and removed by the same key. The two names are distinct so the agent and the guard hold
+// separate anchors and separate scheduled tasks, and each can be relaunched on its own.
 export const AGENT_ANCHOR_NAME = "JakeAgent";
 export const GUARD_ANCHOR_NAME = "JakeGuard";
 
@@ -33,20 +33,29 @@ export const GUARD_ANCHOR_NAME = "JakeGuard";
 // this user's logon.
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-/** One binary to anchor: the identifier it is registered under, and the executable an anchor starts. */
+/** One run mode to anchor: the identifier it is registered under, the executable, and its arguments. */
 export interface AnchorTarget {
-  /** The registry value name, task name, and shortcut base name this binary is anchored under. */
+  /** The registry value name, task name, and shortcut base name this run mode is anchored under. */
   name: string;
   /** The absolute path to the executable the anchor launches. */
   binaryPath: string;
+  /** The arguments the anchor launches the executable with — empty for the agent, the guard flag for the guard. */
+  args: readonly string[];
 }
 
-/** The two anchor targets for an install laid out in one directory: the agent and the guard exes. */
+/** The two anchor targets for an install in one directory: the agent and guard run modes of one exe. */
 export function installTargets(dir: string): { agent: AnchorTarget; guard: AnchorTarget } {
+  const binaryPath = nodePath.win32.join(dir, JAKE_BINARY);
   return {
-    agent: { name: AGENT_ANCHOR_NAME, binaryPath: nodePath.win32.join(dir, AGENT_BINARY) },
-    guard: { name: GUARD_ANCHOR_NAME, binaryPath: nodePath.win32.join(dir, GUARD_BINARY) },
+    agent: { name: AGENT_ANCHOR_NAME, binaryPath, args: [] },
+    guard: { name: GUARD_ANCHOR_NAME, binaryPath, args: [GUARD_MODE_FLAG] },
   };
+}
+
+/** The command line an anchor launches: the quoted executable path followed by its arguments. */
+function invocation(target: AnchorTarget): string {
+  const quoted = `"${target.binaryPath}"`;
+  return target.args.length === 0 ? quoted : `${quoted} ${target.args.join(" ")}`;
 }
 
 /** Quote a string as a PowerShell single-quoted literal, doubling any single quote inside it. */
@@ -70,11 +79,12 @@ function powershellCommand(script: string): string[] {
 // --- Registry Run key ----------------------------------------------------------------------------
 
 /**
- * Add (or overwrite, with `/f`) the per-user Run value that launches this binary at logon. The data
- * is the binary path wrapped in quotes so a path with spaces is launched as one argument.
+ * Add (or overwrite, with `/f`) the per-user Run value that launches this run mode at logon. The data
+ * is the executable path wrapped in quotes — so a path with spaces is launched as one argument —
+ * followed by any run-mode argument.
  */
 export function runKeyAddCommand(target: AnchorTarget): string[] {
-  return ["reg", "add", RUN_KEY, "/v", target.name, "/t", "REG_SZ", "/d", `"${target.binaryPath}"`, "/f"];
+  return ["reg", "add", RUN_KEY, "/v", target.name, "/t", "REG_SZ", "/d", invocation(target), "/f"];
 }
 
 /** Remove this binary's per-user Run value. */
@@ -98,7 +108,7 @@ export function taskCreateCommand(target: AnchorTarget): string[] {
     "/tn",
     target.name,
     "/tr",
-    `"${target.binaryPath}"`,
+    invocation(target),
     "/sc",
     "onlogon",
     "/rl",
@@ -137,13 +147,16 @@ export function startupShortcutPath(target: AnchorTarget, env: PlatformEnv): str
  */
 export function startupShortcutCreateCommand(target: AnchorTarget, env: PlatformEnv): string[] {
   const lnk = startupShortcutPath(target, env);
-  const script = [
+  const lines = [
     `$s = (New-Object -ComObject WScript.Shell).CreateShortcut(${psSingleQuote(lnk)})`,
     `$s.TargetPath = ${psSingleQuote(target.binaryPath)}`,
     `$s.WorkingDirectory = ${psSingleQuote(nodePath.win32.dirname(target.binaryPath))}`,
-    "$s.Save()",
-  ].join("\n");
-  return powershellCommand(script);
+  ];
+  if (target.args.length > 0) {
+    lines.push(`$s.Arguments = ${psSingleQuote(target.args.join(" "))}`);
+  }
+  lines.push("$s.Save()");
+  return powershellCommand(lines.join("\n"));
 }
 
 /** Remove this binary's Startup-folder shortcut. Absence is not an error. */

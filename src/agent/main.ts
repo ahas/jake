@@ -1,10 +1,9 @@
-// The agent's entry point on 하스's Windows box. It reads the single environment file beside the
+// The agent's run mode on 하스's Windows box. It reads the single environment file beside the
 // executable, wires the real seams — a WebSocket dialer, the system clock, a rolling file log —
 // registers whatever capabilities this build carries, and hands control to the reconnect loop, which
 // dials the hub and keeps the connection alive without end. Nothing here is a credential: the hub
-// URL and the shared secret come from the config file. This file is compiled into the Windows
-// executable by the build step; the capability registrations below are filled in by their own build
-// stages.
+// URL and the shared secret come from the config file. This is one of the two run modes of the single
+// executable the build produces; src/main.ts chooses between this and the guard by the command line.
 
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -12,7 +11,8 @@ import { dirname, join } from "node:path";
 import type { AgentConfig } from "../config";
 import { agentFileEnv, loadAgentConfig } from "../config";
 import { JAKE_VERSION } from "../version";
-import { browserHandlers, BrowserSupervisor, bunSidecarSpawner, type SidecarSpawner } from "./browser";
+import { browserHandlers, BrowserEngine } from "./browser";
+import { edgeBackend, realEdgeLauncher } from "./edge";
 import { ShellRunner, windowsSpawner } from "./exec";
 import { FetchHandler } from "./fetch";
 import { acquireInstanceLock, diskLockFs, releaseInstanceLock, systemPidAlive } from "./instance";
@@ -27,7 +27,7 @@ import type { Watchdog } from "./watchdog";
 /** This agent build's version, announced to the hub in the hello. Stamped in at compile time. */
 const AGENT_VERSION = JAKE_VERSION;
 
-function main(): void {
+export function runAgent(): void {
   const config = loadAgentConfig(agentFileEnv(dirname(process.execPath)));
   const log = fileLogger(agentLogPath(process.platform, process.env));
 
@@ -75,21 +75,28 @@ function main(): void {
     }),
   );
 
-  // The browser capability lives in the sidecar the installer lays down beside the executable. When
-  // that directory and its downloaded browser are present the supervisor drives them; when they are
-  // not, the supervisor is unavailable, the browser methods are registered but not advertised, and a
-  // call to one comes back as a stated "install it" error instead of a crash.
-  const supervisor = new BrowserSupervisor({
-    spawner: resolveSidecarSpawner(config),
+  // The browser capability drives Microsoft Edge over CDP. The engine launches Edge lazily on the
+  // first browser call and shuts it down when idle; when Edge is not found on this machine the engine
+  // is unavailable, the browser methods are registered but not advertised, and a call to one comes
+  // back as a stated "install Edge" error instead of a crash.
+  const engine = new BrowserEngine({
+    backend: edgeBackend(
+      realEdgeLauncher({
+        executablePath: config.browserExecutablePath,
+        headless: config.browserHeadless,
+        startupTimeoutMs: config.browserStartupTimeoutMs,
+        log,
+      }),
+    ),
     scheduler: systemScheduler,
     log,
     idleMs: config.browserIdleMs,
     callTimeoutMs: config.browserCallTimeoutMs,
     installHint:
-      "the browser sidecar is not installed; run the installer's browser download (playwright install) to enable browser.* capabilities",
+      "Microsoft Edge was not found on this machine; install Edge (or set JAKE_BROWSER_PATH) to enable browser.* capabilities",
   });
-  const advertiseBrowser = supervisor.available();
-  for (const handler of browserHandlers(supervisor, config.maxPayloadBytes)) {
+  const advertiseBrowser = engine.available();
+  for (const handler of browserHandlers(engine, config.maxPayloadBytes)) {
     runtime.registerCall(handler, { advertise: advertiseBrowser });
   }
 
@@ -102,7 +109,7 @@ function main(): void {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       persistence?.stop();
-      supervisor.stop();
+      engine.stop();
       runtime.stop();
       process.exit(0);
     });
@@ -159,25 +166,3 @@ function resolveNircmdPath(): string | null {
   const candidate = join(dirname(process.execPath), "nircmd.exe");
   return existsSync(candidate) ? candidate : null;
 }
-
-/**
- * Build the spawner for the browser sidecar, or null when it is not installed here. The sidecar is a
- * directory the installer lays down beside the executable — its own entry, its own bun runtime, and
- * its own downloaded browser. It counts as installed only when both the entry and the browser
- * directory are present; a directory without the downloaded browser is treated as absent, so the
- * capability is not advertised until the browser is really there. The sidecar's own bun runs it; a
- * bun on PATH is the development fallback when none was shipped beside it.
- */
-function resolveSidecarSpawner(config: AgentConfig): SidecarSpawner | null {
-  const dir = config.browserSidecarDir ?? join(dirname(process.execPath), "sidecar");
-  const entry = join(dir, "index.ts");
-  const browsers = join(dir, "browsers");
-  if (!existsSync(entry) || !existsSync(browsers)) {
-    return null;
-  }
-  const shippedBun = join(dir, process.platform === "win32" ? "bun.exe" : "bun");
-  const command = existsSync(shippedBun) ? [shippedBun, entry] : ["bun", entry];
-  return bunSidecarSpawner(command, dir);
-}
-
-main();

@@ -1,11 +1,10 @@
-// The guard's entry point on 하스's Windows box: jake-guard.exe, the small supervisor half of the
-// self-healing pair. It carries no tunnel and no capability handlers — its whole job is to watch the
-// agent by its heartbeat, rewrite the autostart anchors, and relaunch the agent when it goes stale.
-// Because it is a different program from the agent, with a different name and hash, one taskkill,
-// antivirus signature, or job-object teardown aimed at the agent cannot take the guard with it, and
-// the surviving guard brings the agent back. It reads the same environment file the agent does, laid
-// down beside both exes by the installer. docs/architecture.md is the canonical statement of the
-// staying-alive scheme.
+// The guard's run mode on 하스's Windows box: the small supervisor half of the self-healing pair. It
+// carries no tunnel and no capability handlers — its whole job is to watch the agent by its
+// heartbeat, rewrite the autostart anchors, and relaunch the agent when it goes stale. It runs from
+// the same executable as the agent, chosen by the guard-mode flag on the command line, and is a
+// separate process that watches the agent and is watched back, so either can bring the other back.
+// It reads the same environment file the agent does, laid down beside the executable by the
+// installer. docs/architecture.md is the canonical statement of the staying-alive scheme.
 
 import { dirname } from "node:path";
 
@@ -17,7 +16,7 @@ import { acquireInstanceLock, diskLockFs, releaseInstanceLock, systemPidAlive } 
 import { buildWatchdog, lockPath } from "../agent/persistence";
 import { systemScheduler } from "../agent/transport";
 
-function main(): void {
+export function runGuard(): void {
   const config = loadAgentConfig(agentFileEnv(dirname(process.execPath)));
   const log = fileLogger(agentLogPath(process.platform, process.env));
 
@@ -50,5 +49,3 @@ function main(): void {
   log.log("info", "guard-starting", { installDir: dirname(process.execPath), version: JAKE_VERSION });
   watchdog.start();
 }
-
-main();

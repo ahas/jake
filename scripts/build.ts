@@ -1,11 +1,12 @@
-// The build step. It cross-compiles the two Windows binaries from main-host — no Windows toolchain
-// is needed to produce them — and assembles the install layout the installer copies into place. Run
-// it with `bun scripts/build.ts`.
+// The build step. It cross-compiles the single Windows executable from main-host — no Windows
+// toolchain is needed to produce it — and assembles the install layout the installer copies into
+// place. Run it with `bun scripts/build.ts`.
 //
-// The output is dist/jake/, a single folder, not a single file: the browser capability cannot be
-// compiled into the executable (docs/architecture.md states why), so the sidecar travels beside the
-// exes as its own directory, and the screenshot fallback nircmd.exe and the example config sit
-// alongside. The installer, itself carried in the layout, copies this folder to a per-user location.
+// The whole agent, including the browser capability, compiles into one executable: the browser is
+// Microsoft Edge, already on 하스's box, driven over CDP, so nothing a compile cannot carry is
+// bundled and no browser is downloaded (docs/architecture.md states this). The layout is that one
+// executable plus the screenshot fallback nircmd.exe, the example config, and the install scripts;
+// the agent and the guard are two run modes of the same executable, so there is one binary, not two.
 //
 // nircmd.exe is fetched here rather than committed, because a third-party binary does not belong in
 // the tree. The fetch is best-effort: nircmd is only the screenshot fallback for the case where
@@ -14,7 +15,7 @@
 
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -73,21 +74,6 @@ function compile(entry: string, outName: string, version: string): void {
   }
 }
 
-/** Copy the sidecar into the layout, leaving out the downloaded browser (installed on the box). */
-function copySidecar(): void {
-  const src = join(repoRoot, "sidecar");
-  const dest = join(layoutDir, "sidecar");
-  cpSync(src, dest, {
-    recursive: true,
-    // Never carry the downloaded browser into the layout — it is hundreds of megabytes and is
-    // fetched on 하스's box at install time. Everything else, including node_modules, travels.
-    filter: (from) => {
-      const rel = from.slice(src.length + 1);
-      return rel !== "browsers" && !rel.startsWith(`browsers${sep}`);
-    },
-  });
-}
-
 /** Fetch nircmd.exe into the layout, best-effort. Returns whether it landed. */
 async function fetchNircmd(): Promise<boolean> {
   const zipPath = join(distDir, "nircmd-x64.zip");
@@ -138,13 +124,8 @@ async function main(): Promise<void> {
   rmSync(layoutDir, { recursive: true, force: true });
   mkdirSync(layoutDir, { recursive: true });
 
-  console.log("· compiling jake-agent.exe");
-  compile("src/agent/main.ts", "jake-agent.exe", version);
-  console.log("· compiling jake-guard.exe");
-  compile("src/guard/main.ts", "jake-guard.exe", version);
-
-  console.log("· copying the browser sidecar");
-  copySidecar();
+  console.log("· compiling jake.exe");
+  compile("src/main.ts", "jake.exe", version);
 
   console.log("· fetching nircmd.exe (screenshot fallback)");
   const gotNircmd = await fetchNircmd();
@@ -156,13 +137,10 @@ async function main(): Promise<void> {
   place("docs/install.md", "INSTALL.md");
 
   console.log("\nlayout:");
-  for (const name of ["jake-agent.exe", "jake-guard.exe"]) {
-    console.log(`  ${name}  ${sizeOf(join(layoutDir, name))}`);
-  }
-  console.log(`  sidecar/  (node_modules bundled, browser downloaded at install)`);
+  console.log(`  jake.exe  ${sizeOf(join(layoutDir, "jake.exe"))}`);
   console.log(`  nircmd.exe  ${gotNircmd ? sizeOf(join(layoutDir, "nircmd.exe")) : "(not bundled)"}`);
   console.log(`  agent.env.example, install.ps1, uninstall.ps1, INSTALL.md`);
-  console.log(`\ndone. version ${version} stamped into both binaries.`);
+  console.log(`\ndone. version ${version} stamped into the executable.`);
 }
 
 void main().catch((error) => {

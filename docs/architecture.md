@@ -11,64 +11,51 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   command and every result travels over that one connection, in both directions. This is why the
   connection feels like an SSH session even though 비모 never dialed in.
 
-## The three programs
+## The programs
 
 - **hub** — runs permanently on main-host as a systemd user service. It accepts the single agent's
   outbound connection, and it exposes a loopback control API that the console and 비모 drive it
   through. It is reachable from 하스's network through a `*.ahas.io` name fronted by NPM. It holds no
   capability itself; it relays.
-- **agent** — runs on 하스's Windows box. It dials the hub, authenticates, and then runs whatever the
-  hub sends: PowerShell and WSL commands with live-streamed output, a screen capture, a fetch from
-  inside 하스's LAN, and browser control. It listens for nothing; it only dials.
-- **browser sidecar** — a separate, uncompiled program the agent spawns as a child when a browser
-  capability is first used. It owns the browser and talks to the agent over its own standard input
-  and output.
+- **agent** — runs on 하스's Windows box from a single executable. It dials the hub, authenticates,
+  and then runs whatever the hub sends: PowerShell and WSL commands with live-streamed output, a
+  screen capture, a fetch from inside 하스's LAN, and browser control. It listens for nothing; it only
+  dials. The same executable also runs as the **guard**, a small supervisor that carries no
+  capability and only keeps the agent alive; the command line chooses which of the two a process is.
+  The staying-alive scheme below is what makes them a pair.
 
-## Why the browser lives outside the compiled agent
+## The browser: Edge driven over CDP
 
-- The agent ships as a single compiled Windows executable. Building it that way is what makes the
-  install one file 하스 runs, with no toolchain on his machine.
-- The browser-automation library cannot be compiled into that executable: the compile step fails
-  while bundling it, against a defect that is open upstream and has no accepted workaround. Even if
-  the bundling succeeded, the browser binary the library drives is hundreds of megabytes that no
-  compiled bundle carries — it is downloaded separately at install time.
-- So the browser capability is split out. The installer lays the sidecar down as its own directory,
-  with its own dependencies and its own downloaded browser, beside the agent's executable. The agent
-  starts it lazily on the first browser call, talks to it over a line protocol on its standard
-  streams — no extra listening port on 하스's machine — and shuts it down after an idle period so a
-  browser is not sitting in memory for nothing.
-- If the sidecar directory is absent or its browser was never downloaded, the agent simply does not
-  offer the browser capability, and a browser call comes back as a stated error rather than a crash.
-
-## The browser sidecar
-
-- The sidecar answers a small line protocol on its standard streams: one JSON request per line in,
-  one JSON response per line out, each response carrying the id of the request it answers so the
-  agent can correlate them. Binary — a screenshot's PNG — rides inside a response as base64 with its
-  declared byte length, the same way the tunnel's own frames carry bytes. A request the sidecar
-  cannot parse carries no id to answer and is skipped rather than crashed on.
-- It exposes five methods: navigate a page, read its source, screenshot it, evaluate an expression
-  in it, and fetch from inside its context so the page's own origin and cookies apply. Each is its
-  own named capability on the tunnel rather than one browser call switching on a parameter, so the
-  hello list names exactly what the agent can do and each is invoked directly. All of them share the
-  one browser the sidecar owns: a single browser, a single context, and a single page, created lazily
-  on the first call that needs a page.
-- The sidecar processes requests one at a time. A single page cannot serve two overlapping
-  navigations, so a second request waits for the one before it to answer.
-- The agent supervises the sidecar as a child process and never lets one failure become a crash.
-  When the sidecar is not installed the browser methods are still registered — so a call that arrives
-  is answered — but they are kept out of the hello list, and the answer is a stated error naming how
-  to install it. When the child dies while calls are waiting, every waiting call fails with the
-  reason and the next call starts a fresh child. A call that never answers is bounded by a wall-clock
-  timeout, and reaching it tears the child down so the next call is served by a new one rather than
-  queuing behind a wedged page. The child is shut down after an idle period and started again on the
-  next call.
-- The sidecar drives the browser shipped in its own directory rather than a machine-wide cache, so it
-  is self-contained: it points its browser-automation library at that co-located download. The agent
-  counts the capability as installed only when both the sidecar's entry and its downloaded browser
-  are present; a directory without the browser is treated as not installed, so the capability is not
-  advertised until the browser is really there. A screenshot the sidecar returns is subject to the
-  same frame payload cap every binary result answers to.
+- The browser capability drives Microsoft Edge, already installed on 하스's Windows box, over the
+  Chrome DevTools Protocol. The agent launches Edge with a remote-debugging endpoint and holds one
+  WebSocket to it; every browser operation is a CDP command on that connection. Because nothing is
+  bundled that a compile cannot carry and no browser is downloaded, the whole capability lives inside
+  the agent's own executable — one file, not a file plus a co-located program and a separate browser.
+- Edge is launched headless by default, with a throwaway user-data directory so it never touches
+  하스's own Edge profile, and with the flags that keep an unattended launch from prompting. The OS
+  picks the debugging port, and the agent reads it back from the file Edge writes into that directory,
+  which also carries the browser endpoint's path — so the agent learns the exact loopback WebSocket
+  to dial. No listening port is opened on 하스's machine beyond Edge's own loopback endpoint.
+- Five operations are offered: navigate a page, read its source, screenshot it, evaluate an
+  expression in it, and fetch from inside its context so the page's own origin and cookies apply.
+  Each is its own named capability rather than one browser call switching on a parameter, so the
+  hello list names exactly what the agent can do and each is invoked directly. They share one page:
+  a single Edge, a single page target, created lazily on the first call that needs it.
+  - A navigation reports the page's final URL and the HTTP status of the document response, captured
+    from the network events the page emits and keyed to that navigation. It waits for the page's load
+    (or DOM-content) lifecycle event, bounded by the call's own timeout.
+  - A screenshot's PNG rides back as base64 with its declared byte length, subject to the same frame
+    payload cap every binary result answers to; a full-page shot clips to the page's content size.
+  - An evaluation and a page-context fetch run the expression in the page and return its
+    JSON-serialisable value; an expression that throws is reported as a stated error, not a crash.
+- The engine drives the browser one call at a time — a single page cannot serve two overlapping
+  navigations — holding the browser only as long as calls keep coming. When Edge is not found on the
+  machine the engine is unavailable: the browser methods are still registered, so a call that arrives
+  is answered, but they are kept out of the hello list and the answer is a stated "install Edge"
+  error. When Edge exits mid-call, the waiting call fails with the reason and the next call launches a
+  fresh Edge. A call that never answers is bounded by a wall-clock timeout, and reaching it tears Edge
+  down so the next call starts clean rather than queuing behind a wedged page. Edge is shut down after
+  an idle period and launched again on the next call, so a browser is not left in memory for nothing.
 
 ## The agent's connection
 
@@ -111,12 +98,12 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 - 하스's Windows environment resets from time to time, and a reset can wipe a scheduled-task entry.
   The agent must come back on its own from a crash, a reboot, and the deletion of any one autostart
   registration.
-- The pair is two different programs. **jake-agent.exe** carries the tunnel and every capability;
-  **jake-guard.exe** is a small supervisor that carries none. They are separate binaries with
-  separate names — and so separate hashes — on purpose: a single `taskkill /IM`, one antivirus
-  signature on a running image, or one job-object teardown cannot end both at once, and the survivor
-  brings the other back. Because the guard holds no capability, its crash surface and its attack
-  surface both differ from the agent's, not only its name.
+- The pair is two processes of one executable. Run with no argument it is the **agent** — the tunnel
+  and every capability; run with the guard-mode flag it is the **guard** — a small supervisor that
+  carries none. One deliverable, two run modes: the guard exists so that a failure of the agent
+  process is caught and repaired by something that is still running, and the agent returns the favour.
+  They are distinct processes with distinct anchors and distinct scheduled tasks, so either can be
+  relaunched on its own, and each watches the other.
 - Each process watches the other by a heartbeat, not by watching for an exit. On every tick a
   process rewrites the file that records its own liveness and reads the file its peer keeps; a peer
   whose timestamp is older than the staleness threshold — or whose file is missing — reads as dead,
@@ -133,15 +120,16 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   relaunch, while a real death or hang is caught within about three minutes.
 - The three anchors are all per-user and need no elevation: a logon-triggered scheduled task with no
   stored credentials, a per-user run entry in the registry, and a shortcut in the Startup folder.
-  Both binaries are anchored all three ways, so either can return on its own at logon. The
-  consequence of staying per-user is stated plainly: after a kill that ends both processes and wipes
-  the anchors, recovery is bound to this user's **next interactive logon**, not to the next boot. On
-  a machine without auto-logon those are different events, and the gap between them is unbounded
-  until someone logs in. Boot-time recovery, or a task that runs whether the user is logged on or
-  not, would need an administrator account the install may not have, so neither is used.
-- Because all three anchors for a binary fire at the same logon, a single logon would otherwise start
-  three copies of it. A single-instance guard prevents that: each binary takes an exclusive lock on
-  startup, and only the copy that takes it runs while the rest exit. The lock is a file created
+  Both run modes are anchored all three ways — the agent's anchors launch the executable with no
+  argument, the guard's launch it with the guard-mode flag — so either can return on its own at
+  logon. The consequence of staying per-user is stated plainly: after a kill that ends both processes
+  and wipes the anchors, recovery is bound to this user's **next interactive logon**, not to the next
+  boot. On a machine without auto-logon those are different events, and the gap between them is
+  unbounded until someone logs in. Boot-time recovery, or a task that runs whether the user is logged
+  on or not, would need an administrator account the install may not have, so neither is used.
+- Because all three anchors for a run mode fire at the same logon, a single logon would otherwise
+  start three copies of it. A single-instance guard prevents that: each run mode takes an exclusive
+  lock on startup, and only the copy that takes it runs while the rest exit. The lock is a file created
   atomically — the OS lets exactly one exclusive create win, so even near-simultaneous copies cannot
   both take it — and it holds the holder's process id, so a lock left behind by a crashed process is
   reclaimed once that id is seen to be gone, rather than blocking the binary forever.
@@ -216,25 +204,24 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 ## The build and the install
 
-- The two binaries are cross-compiled for Windows from main-host, so no Windows toolchain is needed
-  to produce them. Each is a single self-contained executable with the runtime embedded, and the
-  build version is stamped into both at compile time — the agent announces it to the hub and the
-  guard records it in its log. The browser sidecar is not compiled, for the reason stated above, so
-  the build's output is a layout folder rather than a lone file: the two executables, the sidecar
-  directory with its dependencies but without the downloaded browser, the screenshot fallback binary,
-  the example config, and the install scripts.
+- One executable is cross-compiled for Windows from main-host, so no Windows toolchain is needed to
+  produce it. It is a single self-contained file with the runtime embedded, and the build version is
+  stamped into it at compile time — the agent run mode announces it to the hub and the guard records
+  it in its log. The whole agent, browser capability included, compiles into that one file, because
+  the browser is Edge driven over CDP rather than a bundled library and a downloaded browser. The
+  build's output is a small layout: the executable, the screenshot fallback binary, the example
+  config, and the install scripts.
 - The installer runs in 하스's own user session without elevation. It copies the layout to a per-user
   location, and it is what asks for the hub URL, the shared secret, and the agent name and writes
   them into the config file beside the executable — the credential is entered at install time and
-  exists only in that file, never in the repository and never in a binary. It can optionally set up
-  the browser sidecar: fetch a runtime for it and download its browser. It registers all three
-  anchors for both binaries, starts the pair, and then verifies by reading the agent's own local log
-  for a record that it reached the hub — the installer runs on the Windows box and cannot reach the
-  hub's loopback control API, so the confirmation is read locally.
+  exists only in that file, never in the repository and never in the executable. It registers all
+  three anchors for both run modes, starts the pair, and then verifies by reading the agent's own
+  local log for a record that it reached the hub — the installer runs on the Windows box and cannot
+  reach the hub's loopback control API, so the confirmation is read locally.
 - The install is re-runnable over an existing one without duplicating anchors: each anchor is
   overwritten in place, a running pair is stopped before its executable is replaced and started again
   after, and hand-edited tuning keys in the config are preserved. The uninstaller reverses it —
-  stopping the pair, removing all three anchors for both binaries, and deleting the layout — and
+  stopping the pair, removing all three anchors for both run modes, and deleting the layout — and
   leaves removing the config an explicit choice, so a reinstall keeps the hub URL and secret unless
   they are asked to be dropped.
 

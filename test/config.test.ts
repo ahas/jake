@@ -38,7 +38,9 @@ describe("loadAgentConfig", () => {
     expect(config.execTimeoutMs).toBe(5 * 60 * 1000);
     expect(config.fetchMaxBodyBytes).toBe(8 * 1024 * 1024);
     expect(config.fetchMaxRedirects).toBe(5);
-    expect(config.browserSidecarDir).toBeNull();
+    expect(config.browserExecutablePath).toBeNull();
+    expect(config.browserHeadless).toBe(true);
+    expect(config.browserStartupTimeoutMs).toBe(20 * 1000);
     expect(config.browserIdleMs).toBe(5 * 60 * 1000);
     expect(config.browserCallTimeoutMs).toBe(60 * 1000);
   });
@@ -54,7 +56,9 @@ describe("loadAgentConfig", () => {
       JAKE_EXEC_TIMEOUT_MS: "1000",
       JAKE_FETCH_MAX_BODY_BYTES: "4096",
       JAKE_FETCH_MAX_REDIRECTS: "0",
-      JAKE_BROWSER_SIDECAR_DIR: "C:\\jake\\sidecar",
+      JAKE_BROWSER_PATH: "C:\\Edge\\msedge.exe",
+      JAKE_BROWSER_HEADLESS: "false",
+      JAKE_BROWSER_STARTUP_TIMEOUT_MS: "12000",
       JAKE_BROWSER_IDLE_MS: "90000",
       JAKE_BROWSER_CALL_TIMEOUT_MS: "30000",
     });
@@ -67,7 +71,9 @@ describe("loadAgentConfig", () => {
     expect(config.fetchMaxBodyBytes).toBe(4096);
     // A redirect bound of zero is a legitimate choice: follow none.
     expect(config.fetchMaxRedirects).toBe(0);
-    expect(config.browserSidecarDir).toBe("C:\\jake\\sidecar");
+    expect(config.browserExecutablePath).toBe("C:\\Edge\\msedge.exe");
+    expect(config.browserHeadless).toBe(false);
+    expect(config.browserStartupTimeoutMs).toBe(12_000);
     expect(config.browserIdleMs).toBe(90_000);
     expect(config.browserCallTimeoutMs).toBe(30_000);
   });

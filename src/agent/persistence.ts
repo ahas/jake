@@ -40,7 +40,7 @@ export interface PersistenceDeps {
   config: AgentConfig;
   platform: Platform;
   env: PlatformEnv;
-  /** The directory both binaries and the sidecar were installed into — where the anchors point. */
+  /** The directory the executable was installed into — where the anchors point. */
   installDir: string;
   scheduler: Scheduler;
   log: Logger;

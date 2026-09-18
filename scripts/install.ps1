@@ -4,17 +4,22 @@
 
 .DESCRIPTION
   Run this from inside the folder it ships in (the build layout), in your own PowerShell session —
-  no administrator rights are needed. It copies the agent to a per-user location, writes the hub URL
-  and shared secret you give it into the config file beside the exe, registers the three per-user
-  autostart anchors for both binaries, starts the agent/guard pair, and then reports whether the
-  agent reached the hub.
+  no administrator rights are needed. It copies the executable to a per-user location, writes the hub
+  URL and shared secret you give it into the config file beside it, registers the three per-user
+  autostart anchors for both run modes (the agent and its guard), starts the pair, and then reports
+  whether the agent reached the hub.
+
+  jake is one executable run two ways: the agent carries the tunnel and every capability, and the
+  guard is a small supervisor that watches the agent and brings it back. Both run from the same
+  jake.exe, the guard with a flag. The browser capability drives Microsoft Edge, which is already on
+  your machine — nothing extra is downloaded.
 
   It is safe to run again over an existing install: the anchors are overwritten in place rather than
   duplicated, a running pair is stopped before its exe is replaced and started again afterwards, and
   your tuning keys in agent.env are preserved.
 
   The credential you enter lives only in the config file this writes on your machine. It is never in
-  the repository and never compiled into a binary.
+  the repository and never compiled into the executable.
 
 .PARAMETER HubUrl
   The hub to dial, e.g. wss://jake.example.org . Prompted for if omitted.
@@ -28,12 +33,6 @@
 .PARAMETER InstallDir
   Where to install. Defaults to %LOCALAPPDATA%\Programs\jake (a per-user, space-free location).
 
-.PARAMETER WithBrowser
-  Also set up the browser sidecar: fetch a Bun runtime for it and download its browser. Large.
-
-.PARAMETER NoBrowser
-  Skip the browser sidecar setup without being asked.
-
 .PARAMETER NonInteractive
   Never prompt. Requires HubUrl, Secret, and AgentName to be passed as arguments.
 #>
@@ -43,18 +42,16 @@ param(
   [string]$Secret,
   [string]$AgentName,
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\jake",
-  [switch]$WithBrowser,
-  [switch]$NoBrowser,
   [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $Payload = $PSScriptRoot
 
-$AgentBinary = 'jake-agent.exe'
-$GuardBinary = 'jake-guard.exe'
+$Binary = 'jake.exe'
 $AgentAnchor = 'JakeAgent'
 $GuardAnchor = 'JakeGuard'
+$GuardFlag = '--guard'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $StartupDir = [Environment]::GetFolderPath('Startup')
 $LogPath = Join-Path $env:LOCALAPPDATA 'jake\agent.log'
@@ -110,8 +107,8 @@ function Resolve-Value($current, $key, $prompt, [switch]$secret) {
 }
 
 Write-Host "jake agent installer" -ForegroundColor White
-if (-not (Test-Path (Join-Path $Payload $AgentBinary)) -or -not (Test-Path (Join-Path $Payload $GuardBinary))) {
-  throw "Run this from the folder that contains $AgentBinary and $GuardBinary."
+if (-not (Test-Path (Join-Path $Payload $Binary))) {
+  throw "Run this from the folder that contains $Binary."
 }
 
 $HubUrl    = Resolve-Value $HubUrl    'JAKE_HUB_URL'    'Hub URL (e.g. wss://jake.example.org)'
@@ -121,7 +118,7 @@ $AgentName = Resolve-Value $AgentName 'JAKE_AGENT_NAME' 'Agent name'
 # --- stop any running pair (a running exe cannot be overwritten) ---------------------------------
 
 Write-Step "stopping any running agent"
-Get-Process -Name 'jake-agent', 'jake-guard' -ErrorAction SilentlyContinue | ForEach-Object {
+Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
   try { $_ | Stop-Process -Force } catch { }
 }
 Start-Sleep -Milliseconds 500
@@ -130,22 +127,12 @@ Start-Sleep -Milliseconds 500
 
 Write-Step "installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach ($name in @($AgentBinary, $GuardBinary, 'nircmd.exe', 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
+foreach ($name in @($Binary, 'nircmd.exe', 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
   $src = Join-Path $Payload $name
   if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
 }
-# The sidecar directory is merged, not replaced, so an already-downloaded browser under
-# sidecar\browsers survives an update. Copying the contents (src\*) into the destination merges into
-# an existing sidecar rather than nesting a sidecar\sidecar inside it.
-$sidecarSrc = Join-Path $Payload 'sidecar'
-if (Test-Path $sidecarSrc) {
-  $sidecarDest = Join-Path $InstallDir 'sidecar'
-  New-Item -ItemType Directory -Force -Path $sidecarDest | Out-Null
-  Copy-Item -Path (Join-Path $sidecarSrc '*') -Destination $sidecarDest -Recurse -Force
-}
-$AgentExe = Join-Path $InstallDir $AgentBinary
-$GuardExe = Join-Path $InstallDir $GuardBinary
-Write-Ok "binaries in place"
+$Exe = Join-Path $InstallDir $Binary
+Write-Ok "executable in place"
 
 # --- write agent.env, preserving any existing tuning keys ---------------------------------------
 
@@ -170,61 +157,29 @@ Set-EnvKey $lines 'JAKE_AGENT_NAME' $AgentName
 Set-Content -LiteralPath $envPath -Value $lines -Encoding UTF8
 Write-Ok "config written (credential stays on this machine only)"
 
-# --- optional browser sidecar setup -------------------------------------------------------------
-
-$doBrowser = $false
-if ($WithBrowser) { $doBrowser = $true }
-elseif ($NoBrowser -or $NonInteractive) { $doBrowser = $false }
-else {
-  $ans = Read-Host -Prompt "Set up the browser sidecar now? Downloads a Bun runtime and a browser (~), large. [y/N]"
-  $doBrowser = ($ans -match '^[Yy]')
-}
-if ($doBrowser) {
-  Write-Step "setting up the browser sidecar"
-  $sidecar = Join-Path $InstallDir 'sidecar'
-  $bunExe = Join-Path $sidecar 'bun.exe'
-  if (-not (Test-Path $bunExe)) {
-    $onPath = Get-Command bun -ErrorAction SilentlyContinue
-    if ($onPath) {
-      $bunExe = $onPath.Source
-    } else {
-      Write-Step "fetching a Bun runtime for the sidecar"
-      $tmp = Join-Path $env:TEMP "bun-windows-x64.zip"
-      Invoke-WebRequest -Uri 'https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64.zip' -OutFile $tmp
-      $ex = Join-Path $env:TEMP "bun-extract-$PID"
-      Expand-Archive -LiteralPath $tmp -DestinationPath $ex -Force
-      $found = Get-ChildItem -LiteralPath $ex -Recurse -Filter 'bun.exe' | Select-Object -First 1
-      if (-not $found) { throw "bun.exe not found in the downloaded archive" }
-      Copy-Item -LiteralPath $found.FullName -Destination (Join-Path $sidecar 'bun.exe') -Force
-      Remove-Item -LiteralPath $tmp, $ex -Recurse -Force -ErrorAction SilentlyContinue
-      $bunExe = Join-Path $sidecar 'bun.exe'
-    }
-  }
-  Write-Step "downloading the browser (this is the large part)"
-  $cli = Join-Path $sidecar 'node_modules\playwright-core\cli.js'
-  $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $sidecar 'browsers'
-  & $bunExe $cli install chromium
-  if ($LASTEXITCODE -ne 0) { Write-Warn2 "browser download did not complete; browser.* stays unavailable until it does" }
-  else { Write-Ok "browser ready" }
-}
-
-# --- register the three anchors for both binaries -----------------------------------------------
+# --- register the three anchors for both run modes ----------------------------------------------
 # These mirror src/agent/anchors.ts exactly, so the watchdog's per-tick rewrite maintains the same
 # registrations rather than competing with them: a per-user Run value, a logon-triggered scheduled
 # task with no stored credentials at the limited run level, and a Startup-folder shortcut. All three
 # are per-user and need no elevation. Overwriting in place is what makes a re-run add no duplicates.
+# The guard run mode launches the same exe with the guard flag.
 
-function Register-Anchor($name, $exe, $workingDir) {
-  # Run key: value data is the exe path wrapped in quotes, as the watchdog writes it. The key itself
-  # is created only if absent — it normally already holds other apps' entries, which must be left be.
+function Register-Anchor($name, $exe, $arguments, $workingDir) {
+  # Run key: value data is the quoted exe path plus any argument, as the watchdog writes it. The key
+  # itself is created only if absent — it normally already holds other apps' entries, which stay.
   if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
-  New-ItemProperty -Path $RunKey -Name $name -Value ('"' + $exe + '"') -PropertyType String -Force | Out-Null
+  $data = if ($arguments) { '"' + $exe + '" ' + $arguments } else { '"' + $exe + '"' }
+  New-ItemProperty -Path $RunKey -Name $name -Value $data -PropertyType String -Force | Out-Null
 
   # Scheduled task: logon-triggered, self-owned (current user, interactive token, no stored
   # password), limited run level. Equivalent to `schtasks /create /sc onlogon /rl limited /f`, which
   # the watchdog uses to maintain it and `schtasks /run` to relaunch it; created here via the cmdlets
-  # to pass the exe path as a value rather than through fragile native-command quoting.
-  $action = New-ScheduledTaskAction -Execute $exe
+  # to pass the exe path and argument as values rather than through fragile native-command quoting.
+  if ($arguments) {
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
+  } else {
+    $action = New-ScheduledTaskAction -Execute $exe
+  }
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
@@ -235,22 +190,23 @@ function Register-Anchor($name, $exe, $workingDir) {
   $shell = New-Object -ComObject WScript.Shell
   $sc = $shell.CreateShortcut($lnk)
   $sc.TargetPath = $exe
+  if ($arguments) { $sc.Arguments = $arguments }
   $sc.WorkingDirectory = $workingDir
   $sc.Save()
 }
 
 Write-Step "registering autostart anchors"
-Register-Anchor $AgentAnchor $AgentExe $InstallDir
-Register-Anchor $GuardAnchor $GuardExe $InstallDir
-Write-Ok "anchors registered for both binaries"
+Register-Anchor $AgentAnchor $Exe '' $InstallDir
+Register-Anchor $GuardAnchor $Exe $GuardFlag $InstallDir
+Write-Ok "anchors registered for the agent and the guard"
 
 # --- start the pair and verify it reached the hub -----------------------------------------------
 
 Write-Step "starting the agent and guard"
 $logMark = 0
 if (Test-Path $LogPath) { $logMark = (Get-Item $LogPath).Length }
-Start-Process -FilePath $AgentExe -WorkingDirectory $InstallDir -WindowStyle Hidden
-Start-Process -FilePath $GuardExe -WorkingDirectory $InstallDir -WindowStyle Hidden
+Start-Process -FilePath $Exe -WorkingDirectory $InstallDir -WindowStyle Hidden
+Start-Process -FilePath $Exe -ArgumentList $GuardFlag -WorkingDirectory $InstallDir -WindowStyle Hidden
 
 Write-Step "waiting for the agent to reach the hub"
 $reached = $false

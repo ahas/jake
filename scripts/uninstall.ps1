@@ -3,7 +3,7 @@
   Remove the jake agent for the current user, non-elevated.
 
 .DESCRIPTION
-  Stops the agent/guard pair, removes all three autostart anchors for both binaries, and deletes the
+  Stops the agent/guard pair, removes all three autostart anchors for both run modes, and deletes the
   install folder. The config file (agent.env) is kept by default so a reinstall keeps your hub URL
   and secret; pass -RemoveConfig to delete it too. The rolling log under %LOCALAPPDATA%\jake is left
   in place unless -RemoveConfig is given.
@@ -30,7 +30,7 @@ $DataDir = Join-Path $env:LOCALAPPDATA 'jake'
 
 function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
 
-# Remove all three anchors for one binary, mirroring the remove commands in src/agent/anchors.ts.
+# Remove all three anchors for one run mode, mirroring the remove commands in src/agent/anchors.ts.
 # Absence of any one anchor is not an error — the point is that none remains afterwards.
 function Unregister-Anchor($name) {
   try { Remove-ItemProperty -Path $RunKey -Name $name -ErrorAction Stop } catch { }
@@ -42,7 +42,7 @@ function Unregister-Anchor($name) {
 Write-Host "jake agent uninstaller" -ForegroundColor White
 
 Write-Step "stopping the agent and guard"
-Get-Process -Name 'jake-agent', 'jake-guard' -ErrorAction SilentlyContinue | ForEach-Object {
+Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
   try { $_ | Stop-Process -Force } catch { }
 }
 Start-Sleep -Milliseconds 500
