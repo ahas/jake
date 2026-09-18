@@ -40,6 +40,8 @@ export interface ConnectionDeps {
   missedHeartbeatLimit: number;
   /** The largest declared frame payload this side will accept. */
   maxPayloadBytes: number;
+  /** Called when the hub sends a leave frame, to erase the agent and depart. Absent under test. */
+  onLeave?: () => void;
   scheduler: Scheduler;
   log: Logger;
 }
@@ -144,6 +146,7 @@ export class AgentConnection {
       pong: ignore,
       exec: (frame) => this.onExec(frame),
       cancel: (frame) => this.onCancel(frame),
+      leave: () => this.onLeave(),
       error: (frame) => this.onInboundError(frame),
       hello: ignore,
       stdout: ignore,
@@ -183,6 +186,15 @@ export class AgentConnection {
     // The run reports its own end (with canceled set) through the sink; the core removes it then, not
     // here, so a cancel for an already-finished run is simply a no-op.
     this.runs.get(frame.id)?.cancel();
+  }
+
+  private onLeave(): void {
+    // The hub has told the agent to erase itself and go. The departure stops this connection's own
+    // reconnect loop and watchdog as its first act, so nothing here needs to end the connection; it
+    // only hands off to the departure the runtime wired in. A build with no handler (a test) logs and
+    // ignores it, since erasing the machine is not something to do by default.
+    this.deps.log.log("warn", "leave-received", {});
+    this.deps.onLeave?.();
   }
 
   private onInboundError(frame: ErrorFrame): void {

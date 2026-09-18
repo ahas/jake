@@ -20,6 +20,8 @@ export interface RuntimeDeps {
   log: Logger;
   /** This agent build's version, announced in the hello. */
   agentVersion: string;
+  /** Called when the hub sends a leave frame, to erase the agent and depart. */
+  onLeave?: () => void;
   /** The randomness the backoff jitters with. Defaults to Math.random. */
   random?: () => number;
   /** The backoff schedule. A sensible default is used when omitted. */
@@ -122,6 +124,7 @@ export class AgentRuntime {
       heartbeatMs: this.config.heartbeatMs,
       missedHeartbeatLimit: this.deps.missedHeartbeatLimit ?? DEFAULT_MISSED_HEARTBEAT_LIMIT,
       maxPayloadBytes: this.config.maxPayloadBytes,
+      onLeave: this.deps.onLeave,
       scheduler: this.deps.scheduler,
       log: this.deps.log,
     };

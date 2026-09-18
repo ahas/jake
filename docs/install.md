@@ -102,6 +102,14 @@ Run the uninstall script inside the install folder:
 & "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1" -RemoveConfig
 ```
 
+## Removing it from the hub side
+
+There is also a remote counterpart to the uninstaller, sent from main-host rather than run on this
+machine: `jake leave --yes`. It tells the attached agent to erase itself — the executable, the
+config, the log, and every autostart registration — kill its guard, and detach for good, leaving
+nothing behind. It is irreversible and keeps no config, so the console refuses it without `--yes`,
+and it works only while the agent is attached.
+
 ## How far it comes back on its own
 
 - The two programs watch each other. When one dies or hangs the other brings it back, and every

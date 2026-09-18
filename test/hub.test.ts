@@ -406,6 +406,26 @@ describe("exec streaming", () => {
   });
 });
 
+describe("leave", () => {
+  test("relays a leave frame to the attached agent", async () => {
+    const hub = launch();
+    const agent = await attach(hub.agentPort, ["exec"]);
+
+    const response = await control(hub, "/leave", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+
+    await agent.waitFor((f) => f.type === "leave");
+  });
+
+  test("is refused when no agent is attached", async () => {
+    const hub = launch();
+    const response = await control(hub, "/leave", { method: "POST" });
+    expect(response.status).toBe(409);
+    expect((await response.json()).ok).toBe(false);
+  });
+});
+
 describe("the control API carries no capability calls", () => {
   test("a /call request is not a route", async () => {
     const hub = launch();

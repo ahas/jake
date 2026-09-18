@@ -376,6 +376,22 @@ describe("AgentConnection dispatch", () => {
     expect(runner.started[0]!.run.canceled).toBe(1);
   });
 
+  test("a leave frame is handed to the departure handler", () => {
+    let departed = 0;
+    const { conn, log } = buildConn({ onLeave: () => (departed += 1) });
+    conn.run();
+    conn.handleMessage(encodeFrame({ type: "leave", v: V }));
+    expect(departed).toBe(1);
+    expect(log.events.some((e) => e.event === "leave-received")).toBe(true);
+  });
+
+  test("a leave frame with no handler is logged and ignored, not acted on", () => {
+    const { conn, log } = buildConn();
+    conn.run();
+    conn.handleMessage(encodeFrame({ type: "leave", v: V }));
+    expect(log.events.some((e) => e.event === "leave-received")).toBe(true);
+  });
+
   test("a call frame is not part of the vocabulary and is refused without an answer", () => {
     const { conn, transport, log } = buildConn();
     conn.run();

@@ -26,6 +26,7 @@ const everyFrame: Frame[] = [
   { type: "exit", v: V, id: "c1", code: 0, signal: null, canceled: false },
   { type: "exit", v: V, id: "c2", code: null, signal: "SIGTERM", canceled: true },
   { type: "cancel", v: V, id: "c2" },
+  { type: "leave", v: V },
   { type: "error", v: V, id: "c3", code: "spawn-failed", message: "powershell.exe was not found" },
   { type: "ping", v: V, ts: 1_726_600_000_000 },
   { type: "pong", v: V, ts: 1_726_600_000_001 },
@@ -46,7 +47,7 @@ describe("frame round-trip", () => {
   test("covers every frame kind", () => {
     const kinds = new Set(everyFrame.map((f) => f.type));
     expect([...kinds].sort()).toEqual(
-      ["cancel", "error", "exec", "exit", "hello", "ping", "pong", "reject", "stderr", "stdout", "welcome"],
+      ["cancel", "error", "exec", "exit", "hello", "leave", "ping", "pong", "reject", "stderr", "stdout", "welcome"],
     );
   });
 

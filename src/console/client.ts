@@ -77,6 +77,30 @@ export class HubClient {
   }
 
   /**
+   * Tell the hub to erase the agent and depart. The hub relays the frame and the agent erases itself
+   * and drops; there is nothing to stream. A hub with no agent answers 409, reported as `ok: false`.
+   */
+  async leave(): Promise<{ ok: boolean; status: number; reason?: string }> {
+    const response = await this.fetchImpl(`${this.baseUrl}/leave`, {
+      method: "POST",
+      headers: this.headers({ "content-type": "application/json" }),
+      body: "{}",
+    });
+    if (response.ok) {
+      return { ok: true, status: response.status };
+    }
+    let reason: string | undefined;
+    try {
+      const body = (await response.json()) as { reason?: unknown; error?: unknown };
+      if (typeof body.reason === "string") reason = body.reason;
+      else if (typeof body.error === "string") reason = body.error;
+    } catch {
+      // not JSON; the status alone carries the outcome
+    }
+    return { ok: false, status: response.status, reason };
+  }
+
+  /**
    * Start a command and stream its output through `sink`, resolving when the run ends. A hub that
    * declines the command (no agent attached) answers with JSON rather than an event stream; that is
    * reported as a `refused` outcome, not thrown.

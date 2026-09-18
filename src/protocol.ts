@@ -100,6 +100,16 @@ export interface CancelFrame {
   id: string;
 }
 
+/**
+ * Hub → agent: erase every trace of jake from the box and depart. On receiving it the agent kills the
+ * guard, removes both run modes' autostart anchors, deletes its executable, config, log, and data,
+ * and exits. It carries nothing beyond the envelope; the departure is the same every time.
+ */
+export interface LeaveFrame {
+  type: "leave";
+  v: number;
+}
+
 /** Agent → hub (or hub → agent): a run request failed before it could stream, with a code and a message. */
 export interface ErrorFrame {
   type: "error";
@@ -132,6 +142,7 @@ export type Frame =
   | StderrFrame
   | ExitFrame
   | CancelFrame
+  | LeaveFrame
   | ErrorFrame
   | PingFrame
   | PongFrame;
@@ -186,6 +197,7 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<FrameType>([
   "stderr",
   "exit",
   "cancel",
+  "leave",
   "error",
   "ping",
   "pong",
@@ -365,6 +377,10 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
     case "cancel": {
       if (!isString(parsed.id)) return fail("bad-field", "cancel.id must be a string");
       return { ok: true, frame: { type, v, id: parsed.id } };
+    }
+
+    case "leave": {
+      return { ok: true, frame: { type, v } };
     }
 
     case "error": {

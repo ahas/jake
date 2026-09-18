@@ -310,8 +310,8 @@ export class HubCore {
         return;
       }
       default:
-        // hello/welcome/reject/exec/cancel are hub-outbound or handshake frames; if one arrives
-        // from the agent it is not the hub's to act on.
+        // hello/welcome/reject/exec/cancel/leave are hub-outbound or handshake frames; if one
+        // arrives from the agent it is not the hub's to act on.
         return;
     }
   }
@@ -349,6 +349,19 @@ export class HubCore {
       return { ok: false, reason: "unknown command" };
     }
     this.toAgent({ type: "cancel", v: PROTOCOL_VERSION, id });
+    return { ok: true };
+  }
+
+  /**
+   * Tell the agent to erase itself and depart. The hub only relays the signal; the agent does the
+   * erasing and then drops its connection, which is the hub's confirmation it went. There is nothing
+   * to wait for, so this returns as soon as the frame is on its way.
+   */
+  leave(): CancelResult {
+    if (this.current === null) {
+      return { ok: false, reason: "no agent attached" };
+    }
+    this.toAgent({ type: "leave", v: PROTOCOL_VERSION });
     return { ok: true };
   }
 
@@ -437,6 +450,8 @@ export class HubCore {
         return { id: frame.id, code: frame.code, signal: frame.signal, canceled: frame.canceled };
       case "cancel":
         return { id: frame.id };
+      case "leave":
+        return {};
       case "error":
         return { id: frame.id, code: frame.code, message: frame.message };
       case "ping":

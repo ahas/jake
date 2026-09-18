@@ -254,6 +254,11 @@ async function route(core: HubCore, request: Request): Promise<Response> {
     return result.ok ? json({ ok: true }) : json({ ok: false, reason: result.reason }, 409);
   }
 
+  if (method === "POST" && path === "/leave") {
+    const result = core.leave();
+    return result.ok ? json({ ok: true }) : json({ ok: false, reason: result.reason }, 409);
+  }
+
   return json({ error: "not found" }, 404);
 }
 

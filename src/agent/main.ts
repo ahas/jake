@@ -10,27 +10,35 @@ import { dirname } from "node:path";
 import type { AgentConfig } from "../config";
 import { agentFileEnv, loadAgentConfig } from "../config";
 import { JAKE_VERSION } from "../version";
+import { depart } from "./departure";
 import { ShellRunner, windowsSpawner } from "./exec";
 import { acquireInstanceLock, diskLockFs, releaseInstanceLock, systemPidAlive } from "./instance";
-import { agentLogPath } from "./platform";
+import { agentDataDir, agentLogPath } from "./platform";
 import { fileLogger } from "./log";
 import { buildWatchdog, lockPath } from "./persistence";
 import { AgentRuntime } from "./runtime";
 import { systemScheduler, WebSocketDialer } from "./transport";
-import type { Watchdog } from "./watchdog";
+import { bunCommandRunner, type Watchdog } from "./watchdog";
 
 /** This agent build's version, announced to the hub in the hello. Stamped in at compile time. */
 const AGENT_VERSION = JAKE_VERSION;
 
 export function runAgent(): void {
-  const config = loadAgentConfig(agentFileEnv(dirname(process.execPath)));
+  const installDir = dirname(process.execPath);
+  const config = loadAgentConfig(agentFileEnv(installDir));
   const log = fileLogger(agentLogPath(process.platform, process.env));
+
+  // Wired below, once the persistence handle exists: the hub's leave frame calls this to erase the
+  // agent and depart. Until then it is a no-op, and the hub sends leave only over a live connection,
+  // long after startup, so the handler is always in place by the time it can fire.
+  let onLeave = (): void => {};
 
   const runtime = new AgentRuntime(config, {
     dialer: new WebSocketDialer(),
     scheduler: systemScheduler,
     log,
     agentVersion: AGENT_VERSION,
+    onLeave: () => onLeave(),
   });
 
   // The shell runner (exec/cancel) runs PowerShell and WSL commands through the Windows spawner,
@@ -50,6 +58,25 @@ export function runAgent(): void {
   // are no anchors to keep and no duplicate-launch risk, so neither the single-instance guard nor the
   // watchdog is started.
   const persistence = startPersistence(config, log);
+
+  // The leave frame erases jake and departs. jake is a self-healing pair, so the order matters: stop
+  // our own watchdog, kill the guard, remove every anchor, then hand the file deletion to a detached
+  // task before exiting. departure.ts owns that order; main only supplies the real seams.
+  onLeave = () =>
+    depart({
+      installDir,
+      dataDir: agentDataDir(process.platform, process.env),
+      env: process.env,
+      guardLockPath: lockPath(process.platform, process.env, "guard"),
+      readFile: (path) => diskLockFs().read(path),
+      runner: bunCommandRunner(),
+      stopSelf: () => {
+        persistence?.stop();
+        runtime.stop();
+      },
+      exit: () => process.exit(0),
+      log,
+    });
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {

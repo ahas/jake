@@ -160,6 +160,12 @@ describe("parseArgs", () => {
     expect(parseArgs(["tail", "--after", "nope"]).ok).toBe(false);
   });
 
+  test("leave needs --yes and takes no positionals", () => {
+    expect(parseArgs(["leave"])).toEqual({ ok: true, command: { name: "leave", confirmed: false } });
+    expect(parseArgs(["leave", "--yes"])).toEqual({ ok: true, command: { name: "leave", confirmed: true } });
+    expect(parseArgs(["leave", "now"]).ok).toBe(false);
+  });
+
   test("an unknown command is an error", () => {
     expect(parseArgs(["frobnicate"]).ok).toBe(false);
   });
@@ -362,6 +368,48 @@ describe("exec streaming", () => {
     const cap = capture(client, { onExecStart: (id) => started.push(id) });
     await runCli(["exec", "x"], cap.deps);
     expect(started).toEqual(["c9"]);
+  });
+});
+
+// --- leave ----------------------------------------------------------------------------------------
+
+describe("leave", () => {
+  test("without --yes it refuses and never reaches the hub", async () => {
+    const { client, calls } = fakeHub({ "/leave": () => jsonResponse({ ok: true }) });
+    const cap = capture(client);
+    const code = await runCli(["leave"], cap.deps);
+    expect(code).toBe(EXIT_USAGE);
+    expect(cap.err.join("")).toContain("--yes");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("with --yes it sends the leave and reports success", async () => {
+    const { client, calls } = fakeHub({ "/leave": () => jsonResponse({ ok: true }) });
+    const cap = capture(client);
+    const code = await runCli(["leave", "--yes"], cap.deps);
+    expect(code).toBe(EXIT_OK);
+    expect(calls[0]).toMatchObject({ url: expect.stringContaining("/leave"), method: "POST" });
+    expect(cap.out.join("")).toContain("leave signal sent");
+  });
+
+  test("a hub with no agent refuses with the no-agent code", async () => {
+    const { client } = fakeHub({ "/leave": () => jsonResponse({ ok: false, reason: "no agent attached" }, 409) });
+    const cap = capture(client);
+    const code = await runCli(["leave", "--yes"], cap.deps);
+    expect(code).toBe(EXIT_NO_AGENT);
+    expect(cap.err.join("")).toContain("no agent attached");
+  });
+
+  test("a hub that cannot be reached fails", async () => {
+    const { client } = fakeHub({
+      "/leave": () => {
+        throw new Error("connection refused");
+      },
+    });
+    const cap = capture(client);
+    const code = await runCli(["leave", "--yes"], cap.deps);
+    expect(code).toBe(EXIT_FAILED);
+    expect(cap.err.join("")).toContain("could not reach the hub");
   });
 });
 

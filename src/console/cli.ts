@@ -20,11 +20,15 @@ Usage:
   jake exec <command...>            run a command, stream its output, exit with the remote code
       [--shell powershell|wsl] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
   jake tail [--after <id>]          follow the frames crossing the tunnel
+  jake leave --yes                  erase the agent from the Windows box and detach for good
   jake help                         show this message
 
 Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
 exec; docs/recipes.md has them. The control token and port are read from the hub's configuration,
 never the command line.
+
+leave is irreversible: it deletes the executable, config, log, and autostart registrations and the
+agent does not come back. It refuses without --yes.
 `;
 
 // --- The parsed command ---------------------------------------------------------------------------
@@ -33,7 +37,8 @@ export type Command =
   | { name: "help" }
   | { name: "status"; json: boolean }
   | { name: "exec"; request: ExecRequest }
-  | { name: "tail"; after: number };
+  | { name: "tail"; after: number }
+  | { name: "leave"; confirmed: boolean };
 
 export type ParseResult = { ok: true; command: Command } | { ok: false; error: string };
 
@@ -188,6 +193,15 @@ export function parseArgs(argv: string[]): ParseResult {
       return { ok: true, command: { name: "tail", after } };
     }
 
+    case "leave": {
+      const parsed = parseFlags(rest, [{ canonical: "yes", aliases: [], boolean: true }]);
+      if (parsed.error) return { ok: false, error: parsed.error };
+      if (parsed.positionals.length > 0) {
+        return { ok: false, error: `leave takes no arguments (got ${parsed.positionals[0]})` };
+      }
+      return { ok: true, command: { name: "leave", confirmed: parsed.flags.has("yes") } };
+    }
+
     default:
       return { ok: false, error: `unknown command '${command}'` };
   }
@@ -227,6 +241,8 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return runExec(command, deps);
     case "tail":
       return runTail(command, deps);
+    case "leave":
+      return runLeave(command, deps);
   }
 }
 
@@ -312,6 +328,35 @@ async function runTail(command: { after: number }, deps: CliDeps): Promise<numbe
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
   }
+  return EXIT_OK;
+}
+
+async function runLeave(command: { confirmed: boolean }, deps: CliDeps): Promise<number> {
+  // Erasing the agent from 하스's machine cannot be undone, so it will not run on a bare `jake leave`;
+  // the caller states the intent with --yes. This is the one guard the console keeps against a slip.
+  if (!command.confirmed) {
+    deps.err("jake: leave erases the agent and cannot be undone; re-run with --yes to confirm.\n");
+    return EXIT_USAGE;
+  }
+
+  let result;
+  try {
+    result = await deps.client.leave();
+  } catch (error) {
+    deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
+    return EXIT_FAILED;
+  }
+
+  if (!result.ok) {
+    if (result.status === 409) {
+      deps.err(`jake: ${result.reason ?? "no agent attached"}\n`);
+      return EXIT_NO_AGENT;
+    }
+    deps.err(`jake: the hub refused the leave (${result.status})\n`);
+    return EXIT_FAILED;
+  }
+
+  deps.out("leave signal sent — the agent will erase itself and detach.\n");
   return EXIT_OK;
 }
 

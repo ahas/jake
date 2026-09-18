@@ -46,6 +46,14 @@ Command execution (streaming):
 - **error** — agent to hub, or hub to agent: a run request failed before it could stream (an
   unsupported shell, a spawn failure), carrying the id it answers, a short code, and a message.
 
+Departure:
+
+- **leave** — hub to agent: erase every trace of jake from the box and depart. It carries nothing
+  beyond the envelope. On receiving it the agent kills the guard, removes both run modes' autostart
+  registrations, deletes its executable, config, log, and data, and exits; it sends no reply, and the
+  hub reads the departure from the connection dropping. The scheme it triggers is in
+  docs/architecture.md.
+
 Liveness:
 
 - **ping** / **pong** — either side: a probe carrying the sender's clock, and its echo. The hub

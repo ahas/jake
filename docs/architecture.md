@@ -112,6 +112,33 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   both take it — and it holds the holder's process id, so a lock left behind by a crashed process is
   reclaimed once that id is seen to be gone, rather than blocking the binary forever.
 
+## Leaving
+
+- The same pair that makes jake hard to kill by accident makes it hard to remove by halves. A leave
+  that unwound only the agent's own footprint would be undone within a tick, because the guard rewrites
+  every anchor and relaunches the agent. So leaving is a single ordered act that ends both halves and
+  erases everything before the last process exits.
+- The leave signal reaches the agent over the tunnel — it is the one capability the hub carries that
+  is not a shell command. Only the agent holds the tunnel, so a leave is possible only while the agent
+  is attached; when just the guard is up, it revives the agent first, and the leave waits for that.
+- The order is what makes it hold. The agent stops its own watchdog, so it stops rewriting anchors and
+  reviving the guard. It kills the guard by the process id the guard records in its single-instance
+  lock, ending the guard's whole tree, so the guard stops rewriting anchors and reviving the agent.
+  With neither process healing anything, it removes all three anchors for both run modes. Then it
+  hands the file deletion to a separate, self-owned cleanup and exits.
+- The cleanup cannot be the agent itself: a running executable cannot delete its own file. It is
+  therefore a one-shot scheduled task, run the same way the watchdog relaunches a peer — Task Scheduler
+  owns the process, so it outlives the agent's exit. The cleanup waits for the executable to become
+  deletable, which happens once the agent has exited and released it, then deletes the executable, the
+  whole install folder, and the whole data directory (log, heartbeats, locks), and finally deletes its
+  own task, so no registration of the departure survives either.
+- The departure is idempotent in spirit rather than transactional: each step is guarded so one failure
+  does not strand the rest, because a half-anchored agent left behind is worse than one that pressed
+  on. Nothing needs an administrator account, matching the rest of the per-user scheme.
+- Leaving is the remote counterpart of the local uninstaller. The uninstaller is run by hand on the
+  box and can keep the config for a reinstall; a leave is sent from the hub, keeps nothing, and does
+  not come back. It is deliberately guarded on the console side so a slip cannot trigger it.
+
 ## Running commands
 
 - A command runs through one of two shells on 하스's box — PowerShell or WSL — and its output streams
@@ -141,7 +168,9 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   is required. A thin read-only web page over the same API shows connection state and recent traffic.
 - Both surfaces read the control token from the hub's configuration, not from an argument. The CLI
   runs one command and returns the agent's own exit code for an `exec`, so a caller branches on it as
-  it would on a local shell; the page only reads and offers no control the CLI does not.
+  it would on a local shell; the page only reads and offers no control the CLI does not. The CLI also
+  carries the leave command that erases the agent; because it is irreversible, the CLI refuses it
+  unless the intent is stated outright, and the read-only page cannot trigger it at all.
 - The page is the one route of the control API served without the token: a browser navigation cannot
   attach a bearer header, so the page comes back open and carries the token embedded in it, which its
   own read requests then present. This is safe because the control API binds to loopback alone —
