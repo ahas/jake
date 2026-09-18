@@ -1,131 +1,120 @@
-# jake 에이전트 설치 안내
+# Installing the jake agent
 
-jake는 하스의 윈도우 컴퓨터에 설치되어, main-host의 hub로 바깥을 향해 터널을 여는 원격 제어
-에이전트입니다. 붙고 나면 hub 쪽에서 그 컴퓨터의 PowerShell·WSL 명령을 실행하고, 화면을 찍고,
-그 네트워크에서 fetch를 하고, 브라우저를 부릴 수 있습니다. 이 문서는 하스가 자기 컴퓨터에서 직접
-설치·갱신·제거하는 방법입니다.
+- jake is the agent installed on 하스's Windows machine. It opens a tunnel outward to the hub on
+  main-host, and once attached the hub side runs PowerShell and WSL commands on that machine.
+- This guide is how 하스 installs, updates, and removes it on his own machine.
+- No administrator rights are needed. Run everything from a PowerShell window in his own account.
 
-설치는 관리자 권한이 필요 없습니다. 하스 본인 계정의 PowerShell 창에서 그대로 실행하면 됩니다.
+## What you receive
 
-## 받는 것
+One folder produced by the build, containing:
 
-빌드가 만든 폴더 하나입니다. 그 안에 이런 것들이 들어 있습니다.
+- `jake.exe` — the program. Started with no argument it is the agent, which holds the tunnel and runs
+  commands; started with the guard flag it is the small guard that watches the agent and brings it
+  back. One file does both.
+- `agent.env.example` — an example of the config file.
+- `install.ps1` · `uninstall.ps1` — the install and uninstall scripts.
+- `INSTALL.md` — this guide.
 
-- `jake.exe` — 본체. 인자 없이 뜨면 터널과 모든 기능을 가진 에이전트, 감시 플래그를 붙여 뜨면
-  에이전트를 지켜보다 되살리는 작은 감시자입니다. 파일 하나로 두 몫을 합니다.
-- `nircmd.exe` — 화면 캡처가 정책에 막혔을 때 쓰는 예비 도구
-- `agent.env.example` — 설정 파일의 예시
-- `install.ps1` · `uninstall.ps1` — 설치·제거 스크립트
-- `INSTALL.md` — 이 문서
+Unpack the folder anywhere and run the installer from inside it.
 
-이 폴더를 컴퓨터 어디든 풀어 두고, 그 안에서 설치를 실행합니다.
+## Install
 
-## 설치
-
-받은 폴더 안에서 PowerShell 창을 열고 실행합니다.
+Open a PowerShell window inside the received folder and run:
 
 ```powershell
 .\install.ps1
 ```
 
-스크립트를 처음 여는 것이라 실행이 막히면, 그 창에서만 한 번 풀어 주고 다시 실행하세요.
+If script execution is blocked because this is the first script opened, allow it for that window
+only and run it again:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install.ps1
 ```
 
-물어보는 것 없이 한 번에 넣으려면 값을 인자로 줍니다.
+To install in one go without prompts, pass the values as arguments:
 
 ```powershell
-.\install.ps1 -HubUrl wss://jake.example.org -Secret '<공유 비밀>' -AgentName '<이 에이전트 이름>'
+.\install.ps1 -HubUrl wss://jake.example.org -Secret '<shared secret>' -AgentName '<this agent name>'
 ```
 
-설치되는 곳은 기본값이 `%LOCALAPPDATA%\Programs\jake` 입니다. 다른 곳에 넣고 싶으면
-`-InstallDir <경로>` 를 붙입니다. 이미 설치된 위에 다시 실행해도 됩니다 — 앵커가 겹쳐 쌓이지 않고,
-돌고 있던 프로그램은 멈췄다가 새 것으로 다시 뜨며, agent.env 에 손수 바꿔 둔 값은 지켜집니다.
+- The default install location is `%LOCALAPPDATA%\Programs\jake`; add `-InstallDir <path>` to put it
+  elsewhere.
+- Running it again over an existing install is safe: anchors are not stacked, the running programs
+  are stopped and come back up as the new build, and values edited by hand in `agent.env` are kept.
 
-## 무엇을 물어보나
+## What it asks
 
-인자로 주지 않으면 세 가지를 물어봅니다. 이 셋만 있으면 됩니다.
+Without arguments it asks three things, and these three are all it needs:
 
-- **Hub URL** — 붙을 hub 주소. 예: `wss://jake.example.org`
-- **Shared secret** — hub와 맞춰야 하는 공유 비밀. 입력할 때 화면에 보이지 않습니다.
-- **Agent name** — 이 에이전트의 이름. hub는 이 이름의 에이전트 하나만 받습니다.
+- **Hub URL** — the hub to attach to, e.g. `wss://jake.example.org`.
+- **Shared secret** — the secret the hub also holds. It is not shown while typed.
+- **Agent name** — this agent's name. The hub accepts one agent of this name.
 
-여기 넣은 공유 비밀은 그 컴퓨터의 설정 파일(`agent.env`)에만 적힙니다. 저장소에도, 실행 파일
-안에도 들어가지 않습니다.
+The shared secret is written only to that machine's config file (`agent.env`). It is in neither the
+repository nor the executable.
 
-## 잘 됐는지 확인
+## Checking it worked
 
-설치 스크립트가 끝나면 프로그램을 띄우고 hub에 붙는지 잠시 지켜본 뒤 결과를 알려 줍니다.
+The installer starts the programs, watches briefly whether the agent reaches the hub, and reports:
 
-- **초록색 "connected to the hub"** — 붙었습니다. 끝입니다.
-- **노란색 안내** — 아직 못 붙었다는 뜻입니다. 공유 비밀·이름이 틀렸거나(거부됨), 주소가 틀렸거나
-  hub가 꺼져 있으면(닿지 못함) 그렇습니다. 에이전트는 스스로 계속 다시 시도하니, 원인을 고치면
-  붙습니다.
+- **Green "connected to the hub"** — attached. Done.
+- **Yellow notice** — not attached yet. Either the secret or name is wrong (rejected), or the URL is
+  wrong or the hub is down (unreachable). The agent keeps retrying on its own, so it attaches once
+  the cause is fixed.
 
-무슨 일이 있었는지는 로그에서 볼 수 있습니다.
+What happened is in the log:
 
 ```powershell
 Get-Content "$env:LOCALAPPDATA\jake\agent.log" -Tail 20
 ```
 
-hub 쪽 콘솔에서도 이 에이전트가 붙었는지, 명령이 오가는지 볼 수 있습니다(그쪽은 main-host에서
-`jake status` 로 봅니다).
+From the hub side, `jake status` on main-host shows whether this agent is attached and whether
+commands are moving.
 
-## 브라우저 기능
+## Update
 
-브라우저 제어·페이지 소스 읽기·스크린샷·식 평가·페이지 안 fetch는 윈도우에 기본으로 깔린
-Microsoft Edge를 씁니다. 따로 받을 것도, 곁딸린 프로그램도 없습니다. jake가 Edge를 원격 디버깅
-모드로 조용히 띄워 조종하고(창은 뜨지 않습니다), 잠시 안 쓰면 닫습니다.
-
-Edge가 없거나 다른 곳에 있으면, `agent.env` 에 `JAKE_BROWSER_PATH` 로 브라우저 실행 파일 경로를
-직접 정해 줄 수 있습니다(크로미움 계열이면 됩니다). 브라우저를 못 찾으면 hub의 기능 목록에 브라우저
-항목이 뜨지 않고, 그 명령을 부르면 "Edge를 설치하라"는 안내가 돌아옵니다. 나머지 기능(명령
-실행·화면 캡처·fetch)은 브라우저와 무관하게 다 됩니다.
-
-## 갱신(업데이트)
-
-새 빌드 폴더를 받아서, 그 안에서 설치를 다시 실행하면 됩니다.
+Receive the new build folder and run the installer again from inside it:
 
 ```powershell
 .\install.ps1
 ```
 
-돌고 있던 프로그램을 멈추고, 실행 파일을 새 것으로 바꾸고, 앵커를 다시 등록하고, 다시 띄웁니다.
-설정은 그대로 둡니다.
+It stops the running programs, replaces the executable, re-registers the anchors, and starts them
+again. The config is left as it is.
 
-## 제거
+## Uninstall
 
-설치된 폴더 안의 제거 스크립트를 실행합니다.
+Run the uninstall script inside the install folder:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1"
 ```
 
-프로그램을 멈추고, 두 실행 파일의 앵커 세 가지를 모두 지우고, 설치 폴더를 지웁니다. 설정
-파일(`agent.env`)과 로그는 남겨 둡니다 — 다시 설치할 때 주소·비밀을 그대로 쓰기 위해서입니다.
-아무것도 남기지 않으려면 `-RemoveConfig` 를 붙입니다.
+- It stops the programs, removes all three anchors for both run modes, and deletes the install
+  folder.
+- The config file (`agent.env`) and the log are kept, so a reinstall reuses the URL and secret.
+- Add `-RemoveConfig` to leave nothing behind:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1" -RemoveConfig
 ```
 
-## 꺼졌다 다시 살아나는 범위
+## How far it comes back on its own
 
-jake는 꺼지지 않게 두 프로그램이 서로를 지켜봅니다. 하나가 죽거나 멈추면 다른 하나가 되살리고,
-둘 다 매 분(tick)마다 세 가지 자동시작 앵커 — 로그온 예약 작업, 레지스트리 Run 값, 시작프로그램
-바로가기 — 를 다시 써 둡니다. 그래서 앵커 하나가 지워져도 어느 한쪽만 살아 있으면 1분 안에 복구됩니다.
-
-세 앵커는 모두 **이 사용자 계정** 것이라, 관리자 권한 없이 등록되는 대신 **이 계정이 화면에
-로그온할 때** 발동합니다. 부팅 그 자체가 아니라 로그온이 기준입니다. 여기서 하나 분명히 해 둘 것:
-
-- 두 프로그램이 함께 죽고 앵커까지 지워진 뒤라면, 되살아나는 시점은 **이 계정의 다음 로그온**입니다.
-- 자동 로그온이 꺼진 컴퓨터에서는 부팅과 로그온이 다른 사건이고, 켜 두고 아무도 로그인하지 않으면
-  그 사이 시간만큼 jake도 잠들어 있습니다.
-- **자동 로그온을 켜 두면** 부팅이 곧 로그온이 되어, 시스템이 리셋·재부팅된 뒤에도 사람이 손대지
-  않아도 스스로 다시 올라옵니다. 리셋이 잦은 환경이라면 자동 로그온을 켜 두는 편이 복구가 확실합니다.
-
-부팅 시점(로그온 이전)에 뜨는 방식이나 로그인하지 않아도 도는 방식은 관리자 계정이 있어야 하므로,
-관리자 권한 없이 설치되도록 일부러 쓰지 않았습니다.
+- The two programs watch each other. When one dies or hangs the other brings it back, and every
+  minute (one tick) both rewrite the three autostart anchors — a logon scheduled task, a registry Run
+  value, and a Startup-folder shortcut. A deleted anchor is restored within a minute as long as
+  either program is alive.
+- All three anchors belong to **this user account**. They register without administrator rights, and
+  so they fire when **this account logs on**, not at boot itself.
+- If both programs die together and the anchors are wiped as well, jake comes back at **this
+  account's next logon**.
+- On a machine without auto-logon, boot and logon are different events; while the machine sits
+  powered on with nobody logged in, jake stays down for that whole stretch.
+- **With auto-logon on**, boot is logon, so jake comes back on its own after a reset or reboot with no
+  one touching it. On a machine that resets often, auto-logon makes recovery certain.
+- Starting at boot before logon, or running while nobody is logged on, needs an administrator
+  account, and the install stays without administrator rights, so neither is used.

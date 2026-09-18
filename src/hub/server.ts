@@ -1,7 +1,7 @@
 // The two servers that give the hub core a wire. One faces the agent: a WebSocket endpoint the
 // single agent dials out to, authenticated at the HTTP upgrade before the socket is accepted. The
 // other faces the console and 비모: a loopback-only HTTP control API that starts and cancels
-// commands, invokes capabilities, reads status, and streams traffic — the streaming shaped as SSE,
+// commands, reads status, and streams traffic — the streaming shaped as SSE,
 // the same as BMO's control server. This module owns nothing but the plumbing; every decision lives
 // in the core.
 
@@ -25,8 +25,6 @@ interface SocketData {
 }
 
 // A stream sends nothing between events, so the connection's idle limit must outlast one keep-alive.
-// The limit also has to outlast a capability call waiting on the agent, which sends no keep-alive of
-// its own because it is a single response, not a stream.
 const PING_COMMENT_MS = 15_000;
 const IDLE_TIMEOUT_S = 240;
 
@@ -46,8 +44,8 @@ export interface StartHubOptions {
   agentPort?: number;
   /** Override the control-server port. 0 binds an ephemeral port; useful in tests. */
   controlPort?: number;
-  /** Core knobs — ping interval, missed-pong limit, ring size, call timeout. */
-  core?: Pick<HubCoreOptions, "pingIntervalMs" | "missedPongLimit" | "ringSize" | "callTimeoutMs">;
+  /** Core knobs — ping interval, missed-pong limit, ring size. */
+  core?: Pick<HubCoreOptions, "pingIntervalMs" | "missedPongLimit" | "ringSize">;
 }
 
 function linkOf(ws: ServerWebSocket<SocketData>): AgentLink {
@@ -254,18 +252,6 @@ async function route(core: HubCore, request: Request): Promise<Response> {
     }
     const result = core.cancel(body.id);
     return result.ok ? json({ ok: true }) : json({ ok: false, reason: result.reason }, 409);
-  }
-
-  if (method === "POST" && path === "/call") {
-    const body = (await request.json().catch(() => null)) as { method?: unknown; params?: unknown } | null;
-    if (body === null || typeof body.method !== "string") {
-      return json({ error: "method must be a string" }, 400);
-    }
-    const outcome = await core.call(body.method, body.params);
-    if (outcome.ok) {
-      return json({ ok: true, value: outcome.value, blob: outcome.blob });
-    }
-    return json({ ok: false, code: outcome.code, message: outcome.message }, outcome.code === "no-agent" ? 409 : 200);
   }
 
   return json({ error: "not found" }, 404);

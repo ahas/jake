@@ -1,26 +1,21 @@
 // The agent's run mode on 하스's Windows box. It reads the single environment file beside the
 // executable, wires the real seams — a WebSocket dialer, the system clock, a rolling file log —
-// registers whatever capabilities this build carries, and hands control to the reconnect loop, which
-// dials the hub and keeps the connection alive without end. Nothing here is a credential: the hub
+// registers the shell runner, the agent's only capability, and hands control to the reconnect loop,
+// which dials the hub and keeps the connection alive without end. Nothing here is a credential: the hub
 // URL and the shared secret come from the config file. This is one of the two run modes of the single
 // executable the build produces; src/main.ts chooses between this and the guard by the command line.
 
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 import type { AgentConfig } from "../config";
 import { agentFileEnv, loadAgentConfig } from "../config";
 import { JAKE_VERSION } from "../version";
-import { browserHandlers, BrowserEngine } from "./browser";
-import { edgeBackend, realEdgeLauncher } from "./edge";
 import { ShellRunner, windowsSpawner } from "./exec";
-import { FetchHandler } from "./fetch";
 import { acquireInstanceLock, diskLockFs, releaseInstanceLock, systemPidAlive } from "./instance";
 import { agentLogPath } from "./platform";
 import { fileLogger } from "./log";
 import { buildWatchdog, lockPath } from "./persistence";
 import { AgentRuntime } from "./runtime";
-import { bunCaptureSpawner, diskScreenshotFs, ScreenshotHandler, tempPngPath } from "./screenshot";
 import { systemScheduler, WebSocketDialer } from "./transport";
 import type { Watchdog } from "./watchdog";
 
@@ -38,11 +33,8 @@ export function runAgent(): void {
     agentVersion: AGENT_VERSION,
   });
 
-  // Capabilities register here, each contributing its own name to the hello list. The shell runner
-  // (exec/cancel) runs PowerShell and WSL commands through the Windows spawner, holding to the
-  // configured output and time caps. The browser handler is built by its own stage and slotted in
-  // at this point:
-  //   runtime.registerCall(new BrowserHandler(...));
+  // The shell runner (exec/cancel) runs PowerShell and WSL commands through the Windows spawner,
+  // holding to the configured output and time caps, and names those two shells in the hello list.
   runtime.registerExec(
     new ShellRunner({
       spawner: windowsSpawner,
@@ -53,53 +45,6 @@ export function runAgent(): void {
     }),
   );
 
-  // The screenshot handler photographs the desktop through PowerShell, with a bundled nircmd.exe as
-  // its fallback when policy blocks that path. The nircmd binary is laid down beside the executable
-  // by the installer; when it is not there the handler still runs and reports a stated error rather
-  // than a fallback. The fetch handler retrieves a URL from inside 하스's network, holding to the
-  // configured body and redirect bounds.
-  runtime.registerCall(
-    new ScreenshotHandler({
-      spawner: bunCaptureSpawner,
-      fs: diskScreenshotFs(),
-      tempPath: tempPngPath,
-      nircmdPath: resolveNircmdPath(),
-      maxPayloadBytes: config.maxPayloadBytes,
-    }),
-  );
-  runtime.registerCall(
-    new FetchHandler({
-      maxBodyBytes: config.fetchMaxBodyBytes,
-      maxRedirects: config.fetchMaxRedirects,
-      maxPayloadBytes: config.maxPayloadBytes,
-    }),
-  );
-
-  // The browser capability drives Microsoft Edge over CDP. The engine launches Edge lazily on the
-  // first browser call and shuts it down when idle; when Edge is not found on this machine the engine
-  // is unavailable, the browser methods are registered but not advertised, and a call to one comes
-  // back as a stated "install Edge" error instead of a crash.
-  const engine = new BrowserEngine({
-    backend: edgeBackend(
-      realEdgeLauncher({
-        executablePath: config.browserExecutablePath,
-        headless: config.browserHeadless,
-        startupTimeoutMs: config.browserStartupTimeoutMs,
-        log,
-      }),
-    ),
-    scheduler: systemScheduler,
-    log,
-    idleMs: config.browserIdleMs,
-    callTimeoutMs: config.browserCallTimeoutMs,
-    installHint:
-      "Microsoft Edge was not found on this machine; install Edge (or set JAKE_BROWSER_PATH) to enable browser.* capabilities",
-  });
-  const advertiseBrowser = engine.available();
-  for (const handler of browserHandlers(engine, config.maxPayloadBytes)) {
-    runtime.registerCall(handler, { advertise: advertiseBrowser });
-  }
-
   // Staying alive is a Windows-only scheme: its anchors are Windows registrations and its watchdog
   // relaunches through the Task Scheduler. Off Windows — where the agent runs only under test — there
   // are no anchors to keep and no duplicate-launch risk, so neither the single-instance guard nor the
@@ -109,7 +54,6 @@ export function runAgent(): void {
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       persistence?.stop();
-      engine.stop();
       runtime.stop();
       process.exit(0);
     });
@@ -156,13 +100,3 @@ function startPersistence(config: AgentConfig, log: ReturnType<typeof fileLogger
   };
 }
 
-/**
- * Locate the bundled nircmd.exe the screenshot handler falls back to. The installer places it beside
- * the executable; when it is present the handler uses it as a fallback, and when it is absent the
- * handler reports a stated error instead of a capture. Under a plain `bun` run — not the compiled
- * exe — it is not there, so the fallback is simply unavailable in development.
- */
-function resolveNircmdPath(): string | null {
-  const candidate = join(dirname(process.execPath), "nircmd.exe");
-  return existsSync(candidate) ? candidate : null;
-}

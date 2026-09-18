@@ -1,3 +1,5 @@
 # jake
 
-비모가 원격으로 붙는 에이전트. 윈도우 환경에 설치해 터널로 명령 실행, 화면 캡처, 브라우저 제어를 맡는다.
+The agent 비모 attaches to remotely. Installed on a Windows machine, it opens a tunnel outward and
+runs PowerShell and WSL commands sent through it. Screenshots, LAN requests, and Edge are driven as
+shell commands (docs/recipes.md).

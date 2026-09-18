@@ -36,13 +36,6 @@ describe("loadAgentConfig", () => {
     expect(config.maxPayloadBytes).toBe(16 * 1024 * 1024);
     expect(config.execMaxOutputBytes).toBe(8 * 1024 * 1024);
     expect(config.execTimeoutMs).toBe(5 * 60 * 1000);
-    expect(config.fetchMaxBodyBytes).toBe(8 * 1024 * 1024);
-    expect(config.fetchMaxRedirects).toBe(5);
-    expect(config.browserExecutablePath).toBeNull();
-    expect(config.browserHeadless).toBe(true);
-    expect(config.browserStartupTimeoutMs).toBe(20 * 1000);
-    expect(config.browserIdleMs).toBe(5 * 60 * 1000);
-    expect(config.browserCallTimeoutMs).toBe(60 * 1000);
   });
 
   test("honours overrides", () => {
@@ -54,13 +47,6 @@ describe("loadAgentConfig", () => {
       JAKE_MAX_PAYLOAD_BYTES: "1048576",
       JAKE_EXEC_MAX_OUTPUT_BYTES: "2048",
       JAKE_EXEC_TIMEOUT_MS: "1000",
-      JAKE_FETCH_MAX_BODY_BYTES: "4096",
-      JAKE_FETCH_MAX_REDIRECTS: "0",
-      JAKE_BROWSER_PATH: "C:\\Edge\\msedge.exe",
-      JAKE_BROWSER_HEADLESS: "false",
-      JAKE_BROWSER_STARTUP_TIMEOUT_MS: "12000",
-      JAKE_BROWSER_IDLE_MS: "90000",
-      JAKE_BROWSER_CALL_TIMEOUT_MS: "30000",
     });
     expect(config.heartbeatMs).toBe(5000);
     expect(config.tickMs).toBe(30_000);
@@ -68,30 +54,10 @@ describe("loadAgentConfig", () => {
     expect(config.maxPayloadBytes).toBe(1_048_576);
     expect(config.execMaxOutputBytes).toBe(2048);
     expect(config.execTimeoutMs).toBe(1000);
-    expect(config.fetchMaxBodyBytes).toBe(4096);
-    // A redirect bound of zero is a legitimate choice: follow none.
-    expect(config.fetchMaxRedirects).toBe(0);
-    expect(config.browserExecutablePath).toBe("C:\\Edge\\msedge.exe");
-    expect(config.browserHeadless).toBe(false);
-    expect(config.browserStartupTimeoutMs).toBe(12_000);
-    expect(config.browserIdleMs).toBe(90_000);
-    expect(config.browserCallTimeoutMs).toBe(30_000);
   });
 
   test("rejects a non-positive exec cap by name", () => {
     expect(() => loadAgentConfig({ ...fullAgent, JAKE_EXEC_MAX_OUTPUT_BYTES: "0" })).toThrow("JAKE_EXEC_MAX_OUTPUT_BYTES");
-  });
-
-  test("rejects a non-positive fetch body cap by name", () => {
-    expect(() => loadAgentConfig({ ...fullAgent, JAKE_FETCH_MAX_BODY_BYTES: "0" })).toThrow("JAKE_FETCH_MAX_BODY_BYTES");
-  });
-
-  test("rejects a negative redirect bound by name", () => {
-    expect(() => loadAgentConfig({ ...fullAgent, JAKE_FETCH_MAX_REDIRECTS: "-1" })).toThrow("JAKE_FETCH_MAX_REDIRECTS");
-  });
-
-  test("rejects a non-positive browser idle period by name", () => {
-    expect(() => loadAgentConfig({ ...fullAgent, JAKE_BROWSER_IDLE_MS: "0" })).toThrow("JAKE_BROWSER_IDLE_MS");
   });
 
   test("names a missing hub URL", () => {

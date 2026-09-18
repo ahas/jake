@@ -1,11 +1,11 @@
 // A typed client over the hub's loopback control API. Every console surface — the CLI and, through
 // its own inlined copy, the web page — speaks to the hub through this shape: status, a streamed
-// exec, cancel, a capability call, and the traffic tail. The bearer token is carried on every
+// exec, cancel, and the traffic tail. The bearer token is carried on every
 // request; nothing here takes a credential from an argument. The fetch implementation is injectable
 // so a test can drive the client against a fake hub without a socket.
 
 import type { StatusSnapshot, TrafficEntry } from "../hub/core";
-import type { EncodedBlob, ShellKind } from "../protocol";
+import type { ShellKind } from "../protocol";
 import { readSse } from "./sse";
 
 export interface HubClientOptions {
@@ -43,11 +43,6 @@ export type ExecOutcome =
   | { kind: "ended"; reason: string }
   | { kind: "refused"; status: number; message: string };
 
-/** The settled result of a capability call, as the control API reports it. */
-export type CallOutcome =
-  | { ok: true; value: unknown; blob: EncodedBlob | null }
-  | { ok: false; code: string; message: string };
-
 export class HubClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -79,24 +74,6 @@ export class HubClient {
       headers: this.headers({ "content-type": "application/json" }),
       body: JSON.stringify({ id }),
     });
-  }
-
-  /** Invoke a capability by name and await its single result or error. */
-  async call(method: string, params: unknown): Promise<CallOutcome> {
-    const response = await this.fetchImpl(`${this.baseUrl}/call`, {
-      method: "POST",
-      headers: this.headers({ "content-type": "application/json" }),
-      body: JSON.stringify({ method, params }),
-    });
-    const body = (await response.json()) as Record<string, unknown>;
-    if (body.ok === true) {
-      return { ok: true, value: body.value, blob: (body.blob as EncodedBlob | null) ?? null };
-    }
-    return {
-      ok: false,
-      code: typeof body.code === "string" ? body.code : "error",
-      message: typeof body.message === "string" ? body.message : `call failed with ${response.status}`,
-    };
   }
 
   /**

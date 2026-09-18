@@ -13,11 +13,10 @@ import {
 
 // --- Fakes ----------------------------------------------------------------------------------------
 
-// A captured console: what the CLI wrote to each stream, the files it saved, and a fixed clock.
+// A captured console: what the CLI wrote to each stream, and a fixed clock.
 interface Capture {
   out: string[];
   err: string[];
-  files: { path: string; bytes: Uint8Array }[];
   deps: CliDeps;
 }
 
@@ -26,18 +25,14 @@ const NOW = 1_000_000;
 function capture(client: HubClient, extra?: Partial<CliDeps>): Capture {
   const out: string[] = [];
   const err: string[] = [];
-  const files: { path: string; bytes: Uint8Array }[] = [];
   const deps: CliDeps = {
     client,
     out: (text) => out.push(text),
     err: (text) => err.push(text),
-    writeFile: async (path, bytes) => {
-      files.push({ path, bytes });
-    },
     now: () => NOW,
     ...extra,
   };
-  return { out, err, files, deps };
+  return { out, err, deps };
 }
 
 const encoder = new TextEncoder();
@@ -154,28 +149,9 @@ describe("parseArgs", () => {
     expect(parseArgs(["exec", "ls", "--env", "NOEQUALS"]).ok).toBe(false);
   });
 
-  test("fetch needs a URL and parses headers", () => {
-    expect(parseArgs(["fetch"]).ok).toBe(false);
-    const result = parseArgs(["fetch", "http://h/x", "-X", "POST", "-H", "Accept: application/json", "-d", "hi", "-o", "out.bin"]);
-    expect(result).toEqual({
-      ok: true,
-      command: {
-        name: "fetch",
-        url: "http://h/x",
-        method: "POST",
-        headers: { Accept: "application/json" },
-        body: "hi",
-        out: "out.bin",
-      },
-    });
-  });
-
-  test("shot parses --out and --screen", () => {
-    expect(parseArgs(["shot"])).toEqual({ ok: true, command: { name: "shot", out: null, screen: null } });
-    expect(parseArgs(["shot", "-o", "s.png", "--screen", "main"])).toEqual({
-      ok: true,
-      command: { name: "shot", out: "s.png", screen: "main" },
-    });
+  test("shot and fetch are not commands: they are shell recipes sent with exec", () => {
+    expect(parseArgs(["shot"])).toEqual({ ok: false, error: "unknown command 'shot'" });
+    expect(parseArgs(["fetch", "http://h/"])).toEqual({ ok: false, error: "unknown command 'fetch'" });
   });
 
   test("tail parses --after and rejects a bad value", () => {
@@ -215,9 +191,8 @@ describe("status", () => {
   const snapshot = {
     run: "hub-abc",
     attached: true,
-    agent: { name: "hass-desktop", agentVersion: "0.1.0", capabilities: ["exec", "fetch"], connectedAt: NOW - 65_000, lastPongAt: NOW },
+    agent: { name: "hass-desktop", agentVersion: "0.1.0", capabilities: ["exec:powershell", "exec:wsl"], connectedAt: NOW - 65_000, lastPongAt: NOW },
     inFlight: ["c1"],
-    pendingCalls: 0,
   };
 
   test("prints a human-readable summary", async () => {
@@ -228,7 +203,7 @@ describe("status", () => {
     const text = cap.out.join("");
     expect(text).toContain("attached — hass-desktop v0.1.0");
     expect(text).toContain("connected for 1m 5s");
-    expect(text).toContain("exec, fetch");
+    expect(text).toContain("exec:powershell, exec:wsl");
     expect(text).toContain("in-flight commands: c1");
   });
 
@@ -250,6 +225,36 @@ describe("status", () => {
     const code = await runCli(["status"], cap.deps);
     expect(code).toBe(EXIT_FAILED);
     expect(cap.err.join("")).toContain("could not reach the hub");
+  });
+});
+
+// --- The console process: a piped output arrives whole ------------------------------------------
+
+describe("console process", () => {
+  test("a large exec output piped out of the console arrives whole, with the remote exit code", async () => {
+    // Eight 512 KiB chunks of base64 text, the shape a binary result takes when a recipe prints it.
+    const piece = Buffer.alloc(512 * 1024, "QUJD").toString();
+    const blocks = [sseEvent("started", { id: "c1" })];
+    for (let seq = 0; seq < 8; seq++) blocks.push(sseEvent("stdout", { seq, chunk: chunkOf(piece) }));
+    blocks.push(sseEvent("exit", { code: 3, signal: null, canceled: false }));
+    const hub = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => eventStreamResponse(blocks) });
+    try {
+      const proc = Bun.spawn(["bun", "src/console/main.ts", "exec", "print-it"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          JAKE_HUB_ENV: "/nonexistent/hub.env",
+          JAKE_CONTROL_PORT: String(hub.port),
+          JAKE_CONTROL_TOKEN: "T",
+        },
+      });
+      const out = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(3);
+      expect(out.length).toBe(piece.length * 8);
+    } finally {
+      hub.stop(true);
+    }
   });
 });
 
@@ -357,89 +362,6 @@ describe("exec streaming", () => {
     const cap = capture(client, { onExecStart: (id) => started.push(id) });
     await runCli(["exec", "x"], cap.deps);
     expect(started).toEqual(["c9"]);
-  });
-});
-
-// --- shot -----------------------------------------------------------------------------------------
-
-describe("shot", () => {
-  test("saves the returned PNG to a path", async () => {
-    const png = chunkOf("PNGDATA");
-    const { client, calls } = fakeHub({
-      "/call": () => jsonResponse({ ok: true, value: null, blob: { ...png, contentType: "image/png" } }),
-    });
-    const cap = capture(client);
-    const code = await runCli(["shot", "--out", "/tmp/shot.png"], cap.deps);
-    expect(code).toBe(EXIT_OK);
-    expect(calls[0]?.body).toMatchObject({ method: "screenshot" });
-    expect(cap.files).toHaveLength(1);
-    expect(cap.files[0]?.path).toBe("/tmp/shot.png");
-    expect(new TextDecoder().decode(cap.files[0]?.bytes)).toBe("PNGDATA");
-  });
-
-  test("uses a timestamped default filename", async () => {
-    const png = chunkOf("X");
-    const { client } = fakeHub({
-      "/call": () => jsonResponse({ ok: true, value: null, blob: { ...png, contentType: "image/png" } }),
-    });
-    const cap = capture(client);
-    await runCli(["shot"], cap.deps);
-    expect(cap.files[0]?.path).toBe(`shot-${NOW}.png`);
-  });
-
-  test("an agent error is surfaced", async () => {
-    const { client } = fakeHub({
-      "/call": () => jsonResponse({ ok: false, code: "screenshot-blocked", message: "policy" }),
-    });
-    const cap = capture(client);
-    const code = await runCli(["shot"], cap.deps);
-    expect(code).toBe(EXIT_FAILED);
-    expect(cap.err.join("")).toContain("screenshot-blocked");
-  });
-});
-
-// --- fetch ----------------------------------------------------------------------------------------
-
-describe("fetch", () => {
-  test("prints the status and headers to stderr and the body to stdout", async () => {
-    const body = chunkOf("hello world");
-    const { client, calls } = fakeHub({
-      "/call": () =>
-        jsonResponse({
-          ok: true,
-          value: { status: 200, url: "http://192.168.0.9/x", headers: { "content-type": "text/plain" } },
-          blob: { ...body, contentType: "text/plain" },
-        }),
-    });
-    const cap = capture(client);
-    const code = await runCli(["fetch", "http://192.168.0.9/x"], cap.deps);
-    expect(code).toBe(EXIT_OK);
-    expect(calls[0]?.body).toMatchObject({ method: "fetch", params: { url: "http://192.168.0.9/x", method: "GET" } });
-    expect(cap.out.join("")).toBe("hello world");
-    const err = cap.err.join("");
-    expect(err).toContain("200 http://192.168.0.9/x");
-    expect(err).toContain("content-type: text/plain");
-  });
-
-  test("writes the body to a file when --out is given", async () => {
-    const body = chunkOf("filebody");
-    const { client } = fakeHub({
-      "/call": () => jsonResponse({ ok: true, value: { status: 200 }, blob: { ...body, contentType: "application/octet-stream" } }),
-    });
-    const cap = capture(client);
-    const code = await runCli(["fetch", "http://h/", "--out", "/tmp/body.bin"], cap.deps);
-    expect(code).toBe(EXIT_OK);
-    expect(cap.files[0]?.path).toBe("/tmp/body.bin");
-    expect(new TextDecoder().decode(cap.files[0]?.bytes)).toBe("filebody");
-    expect(cap.out.join("")).toBe("");
-  });
-
-  test("an agent error is surfaced", async () => {
-    const { client } = fakeHub({ "/call": () => jsonResponse({ ok: false, code: "fetch-failed", message: "timeout" }) });
-    const cap = capture(client);
-    const code = await runCli(["fetch", "http://h/"], cap.deps);
-    expect(code).toBe(EXIT_FAILED);
-    expect(cap.err.join("")).toContain("fetch-failed");
   });
 });
 

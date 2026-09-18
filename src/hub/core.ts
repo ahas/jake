@@ -1,5 +1,5 @@
 // The hub's heart, with no transport in it. It holds the single agent connection, routes every
-// frame that crosses the tunnel, tracks the commands and calls in flight, probes the agent for
+// frame that crosses the tunnel, tracks the commands in flight, probes the agent for
 // liveness, and keeps a bounded log of recent traffic so a console attaching late sees what just
 // happened. The Bun servers in server.ts feed it raw frames and expose its operations; this module
 // never touches a socket except through the small AgentLink it is handed. docs/architecture.md is
@@ -9,7 +9,6 @@ import {
   PROTOCOL_VERSION,
   decodeFrame,
   encodeFrame,
-  type EncodedBlob,
   type EncodedBytes,
   type Frame,
   type FrameType,
@@ -47,11 +46,6 @@ export interface CommandListener {
   end(): void;
 }
 
-/** The settled result of a capability call. */
-export type CallOutcome =
-  | { ok: true; value: unknown; blob: EncodedBlob | null }
-  | { ok: false; code: string; message: string };
-
 /** The shell-command request a control caller starts. */
 export interface ExecParams {
   shell: ShellKind;
@@ -80,8 +74,6 @@ export interface StatusSnapshot {
   agent: AgentStatus | null;
   /** The ids of the commands still streaming. */
   inFlight: string[];
-  /** How many capability calls are awaiting a result. */
-  pendingCalls: number;
 }
 
 /**
@@ -112,14 +104,11 @@ export interface HubCoreOptions {
   missedPongLimit?: number;
   /** How many recent traffic entries to keep for replay. */
   ringSize?: number;
-  /** How long a capability call waits for a result before it is failed as timed out. */
-  callTimeoutMs?: number;
 }
 
 const DEFAULT_PING_INTERVAL_MS = 15_000;
 const DEFAULT_MISSED_PONG_LIMIT = 3;
 const DEFAULT_RING_SIZE = 200;
-const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 
 // The close code the hub uses when it drops an agent on purpose. 4000–4999 is the range reserved
 // for application use, so it does not collide with a protocol-level close.
@@ -140,10 +129,6 @@ interface Command {
   listener: CommandListener;
 }
 
-interface PendingCall {
-  settle(outcome: CallOutcome): void;
-}
-
 export class HubCore {
   private readonly options: Required<HubCoreOptions>;
   /** A random tag for this process, so a console can detect a hub restart and re-sync its cursor. */
@@ -151,7 +136,6 @@ export class HubCore {
 
   private current: AttachedAgent | null = null;
   private readonly commands = new Map<string, Command>();
-  private readonly calls = new Map<string, PendingCall>();
 
   private readonly traffic: TrafficEntry[] = [];
   private trafficSeq = 0;
@@ -165,7 +149,6 @@ export class HubCore {
       pingIntervalMs: DEFAULT_PING_INTERVAL_MS,
       missedPongLimit: DEFAULT_MISSED_PONG_LIMIT,
       ringSize: DEFAULT_RING_SIZE,
-      callTimeoutMs: DEFAULT_CALL_TIMEOUT_MS,
       ...options,
     };
     this.run = `hub-${Math.random().toString(36).slice(2, 10)}`;
@@ -262,18 +245,13 @@ export class HubCore {
       agent.link.close(CLOSE_HUB_INITIATED, reason);
     }
 
-    // Nothing in flight can outlive the socket it streamed over: end every command and fail every
-    // call rather than leave a control caller hanging.
+    // Nothing in flight can outlive the socket it streamed over: end every command rather than leave
+    // a control caller hanging.
     for (const command of this.commands.values()) {
       command.listener.push({ kind: "ended", reason });
       command.listener.end();
     }
     this.commands.clear();
-
-    for (const call of this.calls.values()) {
-      call.settle({ ok: false, code: "agent-disconnected", message: reason });
-    }
-    this.calls.clear();
   }
 
   private pingTick(): void {
@@ -320,23 +298,9 @@ export class HubCore {
         }
         return;
       }
-      case "result": {
-        const call = this.calls.get(frame.id);
-        if (call !== undefined) {
-          call.settle({ ok: true, value: frame.value, blob: frame.blob });
-          this.calls.delete(frame.id);
-        }
-        return;
-      }
       case "error": {
-        // An error answers whichever request carried its id — a pending call, or a command the
-        // agent refused before it could stream (an unknown shell, say).
-        const call = this.calls.get(frame.id);
-        if (call !== undefined) {
-          call.settle({ ok: false, code: frame.code, message: frame.message });
-          this.calls.delete(frame.id);
-          return;
-        }
+        // An error answers a command the agent refused before it could stream (an unknown shell, a
+        // spawn failure, say).
         const command = this.commands.get(frame.id);
         if (command !== undefined) {
           command.listener.push({ kind: "error", code: frame.code, message: frame.message });
@@ -346,7 +310,7 @@ export class HubCore {
         return;
       }
       default:
-        // hello/welcome/reject/exec/cancel/call are hub-outbound or handshake frames; if one arrives
+        // hello/welcome/reject/exec/cancel are hub-outbound or handshake frames; if one arrives
         // from the agent it is not the hub's to act on.
         return;
     }
@@ -388,30 +352,6 @@ export class HubCore {
     return { ok: true };
   }
 
-  /** Invoke a capability on the agent and await its single result or error. */
-  call(method: string, params: unknown): Promise<CallOutcome> {
-    if (this.current === null) {
-      return Promise.resolve({ ok: false, code: "no-agent", message: "no agent attached" });
-    }
-
-    const id = this.nextId("r");
-    return new Promise<CallOutcome>((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.calls.delete(id)) {
-          resolve({ ok: false, code: "timeout", message: "the agent did not answer in time" });
-        }
-      }, this.options.callTimeoutMs);
-
-      this.calls.set(id, {
-        settle: (outcome) => {
-          clearTimeout(timer);
-          resolve(outcome);
-        },
-      });
-      this.toAgent({ type: "call", v: PROTOCOL_VERSION, id, method, params });
-    });
-  }
-
   status(): StatusSnapshot {
     const agent = this.current;
     return {
@@ -428,7 +368,6 @@ export class HubCore {
               lastPongAt: agent.lastPongAt,
             },
       inFlight: [...this.commands.keys()],
-      pendingCalls: this.calls.size,
     };
   }
 
@@ -447,7 +386,7 @@ export class HubCore {
     };
   }
 
-  /** Stop probing, close the agent socket, and fail everything in flight. For shutdown. */
+  /** Stop probing, close the agent socket, and end every command in flight. For shutdown. */
   shutdown(): void {
     this.detach("hub shutting down", true);
     this.tailSubs.clear();
@@ -498,10 +437,6 @@ export class HubCore {
         return { id: frame.id, code: frame.code, signal: frame.signal, canceled: frame.canceled };
       case "cancel":
         return { id: frame.id };
-      case "call":
-        return { id: frame.id, method: frame.method };
-      case "result":
-        return { id: frame.id, hasBlob: frame.blob !== null, blobBytes: frame.blob?.bytes ?? 0 };
       case "error":
         return { id: frame.id, code: frame.code, message: frame.message };
       case "ping":

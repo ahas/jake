@@ -31,20 +31,6 @@ export interface AgentConfig {
   execMaxOutputBytes: number;
   /** The wall-clock ceiling on a single exec command before jake stops it, in milliseconds. */
   execTimeoutMs: number;
-  /** The largest response body the fetch capability will return, in bytes. */
-  fetchMaxBodyBytes: number;
-  /** How many redirects the fetch capability follows before it refuses to go further. */
-  fetchMaxRedirects: number;
-  /** An explicit path to the browser executable, or null to find Edge in its standard locations. */
-  browserExecutablePath: string | null;
-  /** Whether to run the browser headless. A headless run shows no window and needs no desktop. */
-  browserHeadless: boolean;
-  /** How long to wait for the browser's debugging endpoint to come up before giving up, in milliseconds. */
-  browserStartupTimeoutMs: number;
-  /** How long the browser may sit idle before it is shut down, in milliseconds. */
-  browserIdleMs: number;
-  /** The wall-clock ceiling on one browser call before it is failed, in milliseconds. */
-  browserCallTimeoutMs: number;
 }
 
 /** What the main-host-side hub needs to accept the agent and to be driven by the console. */
@@ -74,11 +60,6 @@ const DEFAULT_WATCHDOG_STALE_MS = 180_000;
 const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_FETCH_MAX_BODY_BYTES = 8 * 1024 * 1024;
-const DEFAULT_FETCH_MAX_REDIRECTS = 5;
-const DEFAULT_BROWSER_STARTUP_TIMEOUT_MS = 20 * 1000;
-const DEFAULT_BROWSER_IDLE_MS = 5 * 60 * 1000;
-const DEFAULT_BROWSER_CALL_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_HUB_HOST = "0.0.0.0";
 const DEFAULT_HUB_PORT = 8790;
 const DEFAULT_CONTROL_PORT = 8791;
@@ -120,34 +101,6 @@ function optionalPositiveIntEnv(env: Env, name: string, fallback: number): numbe
   return value;
 }
 
-function optionalNonNegativeIntEnv(env: Env, name: string, fallback: number): number {
-  const value = optionalIntEnv(env, name, fallback);
-  if (value < 0) {
-    throw new Error(`${name} must be a non-negative integer.`);
-  }
-  return value;
-}
-
-function optionalStringEnv(env: Env, name: string): string | null {
-  const raw = env[name];
-  return raw === undefined || raw === "" ? null : raw;
-}
-
-function optionalBoolEnv(env: Env, name: string, fallback: boolean): boolean {
-  const raw = env[name];
-  if (raw === undefined || raw === "") {
-    return fallback;
-  }
-  const lowered = raw.trim().toLowerCase();
-  if (lowered === "1" || lowered === "true" || lowered === "yes" || lowered === "on") {
-    return true;
-  }
-  if (lowered === "0" || lowered === "false" || lowered === "no" || lowered === "off") {
-    return false;
-  }
-  throw new Error(`${name} must be a boolean (true/false).`);
-}
-
 /** Read the agent's configuration from an environment source. */
 export function loadAgentConfig(env: Env = process.env): AgentConfig {
   return {
@@ -160,13 +113,6 @@ export function loadAgentConfig(env: Env = process.env): AgentConfig {
     maxPayloadBytes: optionalPositiveIntEnv(env, "JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES),
     execMaxOutputBytes: optionalPositiveIntEnv(env, "JAKE_EXEC_MAX_OUTPUT_BYTES", DEFAULT_EXEC_MAX_OUTPUT_BYTES),
     execTimeoutMs: optionalPositiveIntEnv(env, "JAKE_EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS),
-    fetchMaxBodyBytes: optionalPositiveIntEnv(env, "JAKE_FETCH_MAX_BODY_BYTES", DEFAULT_FETCH_MAX_BODY_BYTES),
-    fetchMaxRedirects: optionalNonNegativeIntEnv(env, "JAKE_FETCH_MAX_REDIRECTS", DEFAULT_FETCH_MAX_REDIRECTS),
-    browserExecutablePath: optionalStringEnv(env, "JAKE_BROWSER_PATH"),
-    browserHeadless: optionalBoolEnv(env, "JAKE_BROWSER_HEADLESS", true),
-    browserStartupTimeoutMs: optionalPositiveIntEnv(env, "JAKE_BROWSER_STARTUP_TIMEOUT_MS", DEFAULT_BROWSER_STARTUP_TIMEOUT_MS),
-    browserIdleMs: optionalPositiveIntEnv(env, "JAKE_BROWSER_IDLE_MS", DEFAULT_BROWSER_IDLE_MS),
-    browserCallTimeoutMs: optionalPositiveIntEnv(env, "JAKE_BROWSER_CALL_TIMEOUT_MS", DEFAULT_BROWSER_CALL_TIMEOUT_MS),
   };
 }
 

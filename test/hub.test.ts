@@ -406,53 +406,16 @@ describe("exec streaming", () => {
   });
 });
 
-describe("capability calls", () => {
-  test("relays a call to the agent and returns its result", async () => {
+describe("the control API carries no capability calls", () => {
+  test("a /call request is not a route", async () => {
     const hub = launch();
-    const agent = await attach(hub.agentPort, ["fetch"]);
-
-    const pending = control(hub, "/call", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ method: "fetch", params: { url: "http://192.168.0.9/health" } }),
-    });
-
-    const call = await agent.waitFor((f) => f.type === "call");
-    expect(call).toMatchObject({ method: "fetch" });
-    const callId = (call as { id: string }).id;
-    agent.send({ type: "result", v: V, id: callId, value: { status: 200 }, blob: null });
-
-    const body = await (await pending).json();
-    expect(body).toMatchObject({ ok: true, value: { status: 200 } });
-  });
-
-  test("surfaces an agent's error for a call", async () => {
-    const hub = launch();
-    const agent = await attach(hub.agentPort, ["screenshot"]);
-
-    const pending = control(hub, "/call", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ method: "browser.navigate", params: {} }),
-    });
-
-    const call = await agent.waitFor((f) => f.type === "call");
-    const callId = (call as { id: string }).id;
-    agent.send({ type: "error", v: V, id: callId, code: "sidecar-missing", message: "browser sidecar not installed" });
-
-    const body = await (await pending).json();
-    expect(body).toMatchObject({ ok: false, code: "sidecar-missing" });
-  });
-
-  test("a call with no agent attached is refused", async () => {
-    const hub = launch();
+    await attach(hub.agentPort, ["exec:powershell"]);
     const response = await control(hub, "/call", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ method: "fetch", params: {} }),
+      body: JSON.stringify({ method: "screenshot", params: {} }),
     });
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ ok: false, code: "no-agent" });
+    expect(response.status).toBe(404);
   });
 });
 
@@ -494,16 +457,6 @@ describe("traffic tail", () => {
   test("replays recent frames then follows the live feed", async () => {
     const hub = launch();
     const agent = await attach(hub.agentPort, ["exec"]);
-
-    // Some traffic before the tail opens, to be replayed.
-    const pending = control(hub, "/call", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ method: "noop", params: {} }),
-    });
-    const call = await agent.waitFor((f) => f.type === "call");
-    agent.send({ type: "result", v: V, id: (call as { id: string }).id, value: null, blob: null });
-    await pending;
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/events`, { method: "GET" });
     await reader.ready;

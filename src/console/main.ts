@@ -39,9 +39,6 @@ async function main(): Promise<number> {
     err: (text) => {
       process.stderr.write(text);
     },
-    writeFile: async (path, data) => {
-      await Bun.write(path, data);
-    },
     // Ctrl-C during an exec cancels the remote command, so the run stops like a local one would.
     onExecStart: (id) => {
       process.on("SIGINT", () => {
@@ -51,6 +48,8 @@ async function main(): Promise<number> {
   });
 }
 
+// The exit code is set rather than forced: a forced exit ends the process while piped stdout is
+// still draining, and a large output — a base64 payload piped into a decoder — would arrive cut short.
 main().then((code) => {
-  process.exit(code);
+  process.exitCode = code;
 });

@@ -9,10 +9,9 @@
   autostart anchors for both run modes (the agent and its guard), starts the pair, and then reports
   whether the agent reached the hub.
 
-  jake is one executable run two ways: the agent carries the tunnel and every capability, and the
-  guard is a small supervisor that watches the agent and brings it back. Both run from the same
-  jake.exe, the guard with a flag. The browser capability drives Microsoft Edge, which is already on
-  your machine — nothing extra is downloaded.
+  jake is one executable run two ways: the agent carries the tunnel and runs PowerShell and WSL
+  commands, and the guard is a small supervisor that watches the agent and brings it back. Both run
+  from the same jake.exe, the guard with a flag. Nothing else is installed or downloaded.
 
   It is safe to run again over an existing install: the anchors are overwritten in place rather than
   duplicated, a running pair is stopped before its exe is replaced and started again afterwards, and
@@ -127,7 +126,7 @@ Start-Sleep -Milliseconds 500
 
 Write-Step "installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach ($name in @($Binary, 'nircmd.exe', 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
+foreach ($name in @($Binary, 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
   $src = Join-Path $Payload $name
   if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
 }

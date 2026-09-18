@@ -56,7 +56,6 @@ export function renderConsolePage(token: string): string {
     <dt>connected for</dt><dd id="uptime">—</dd>
     <dt>capabilities</dt><dd id="caps">—</dd>
     <dt>in-flight</dt><dd id="inflight">—</dd>
-    <dt>pending calls</dt><dd id="pending">—</dd>
   </dl>
 </div>
 
@@ -100,7 +99,6 @@ async function poll() {
       document.getElementById("uptime").textContent = fmtDuration(Date.now() - s.agent.connectedAt);
       document.getElementById("caps").textContent = s.agent.capabilities.length ? s.agent.capabilities.join(", ") : "(none)";
       document.getElementById("inflight").textContent = s.inFlight.length ? s.inFlight.join(", ") : "(none)";
-      document.getElementById("pending").textContent = s.pendingCalls;
     } else {
       dot.className = "dot off";
       document.getElementById("stateText").textContent = "detached — no agent connected";

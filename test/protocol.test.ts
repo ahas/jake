@@ -5,7 +5,6 @@ import {
   PROTOCOL_VERSION,
   decodeBytes,
   decodeFrame,
-  encodeBlob,
   encodeBytes,
   encodeFrame,
   type Frame,
@@ -15,10 +14,9 @@ const V = PROTOCOL_VERSION;
 const OPTS = { maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES };
 
 const helloBytes = encodeBytes(new TextEncoder().encode("line of output\n"));
-const pngBlob = encodeBlob(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), "image/png");
 
 const everyFrame: Frame[] = [
-  { type: "hello", v: V, agent: "jake-hass", agentVersion: "0.1.0", capabilities: ["exec", "screenshot", "fetch"] },
+  { type: "hello", v: V, agent: "jake-hass", agentVersion: "0.1.0", capabilities: ["exec:powershell", "exec:wsl"] },
   { type: "welcome", v: V, hubVersion: "0.1.0" },
   { type: "reject", v: V, reason: "secret mismatch" },
   { type: "exec", v: V, id: "c1", shell: "powershell", command: "Get-Date", cwd: null, env: {}, distro: null },
@@ -28,10 +26,7 @@ const everyFrame: Frame[] = [
   { type: "exit", v: V, id: "c1", code: 0, signal: null, canceled: false },
   { type: "exit", v: V, id: "c2", code: null, signal: "SIGTERM", canceled: true },
   { type: "cancel", v: V, id: "c2" },
-  { type: "call", v: V, id: "r1", method: "fetch", params: { url: "http://192.168.0.50/status" } },
-  { type: "result", v: V, id: "r1", value: { status: 200 }, blob: pngBlob },
-  { type: "result", v: V, id: "r2", value: "<html></html>", blob: null },
-  { type: "error", v: V, id: "r3", code: "sidecar-missing", message: "browser sidecar not installed" },
+  { type: "error", v: V, id: "c3", code: "spawn-failed", message: "powershell.exe was not found" },
   { type: "ping", v: V, ts: 1_726_600_000_000 },
   { type: "pong", v: V, ts: 1_726_600_000_001 },
 ];
@@ -51,7 +46,7 @@ describe("frame round-trip", () => {
   test("covers every frame kind", () => {
     const kinds = new Set(everyFrame.map((f) => f.type));
     expect([...kinds].sort()).toEqual(
-      ["call", "cancel", "error", "exec", "exit", "hello", "ping", "pong", "reject", "result", "stderr", "stdout", "welcome"],
+      ["cancel", "error", "exec", "exit", "hello", "ping", "pong", "reject", "stderr", "stdout", "welcome"],
     );
   });
 
@@ -86,6 +81,8 @@ describe("decode rejections", () => {
 
   test("unknown type", () => {
     expect(reject(JSON.stringify({ type: "teleport", v: V }))).toBe("unknown-type");
+    expect(reject(JSON.stringify({ type: "call", v: V, id: "r", method: "screenshot", params: null }))).toBe("unknown-type");
+    expect(reject(JSON.stringify({ type: "result", v: V, id: "r", value: null, blob: null }))).toBe("unknown-type");
   });
 
   test("unknown version", () => {
@@ -98,7 +95,7 @@ describe("decode rejections", () => {
     expect(reject(JSON.stringify({ type: "exec", v: V, id: "c", shell: "powershell", cwd: null, env: {}, distro: null }))).toBe("bad-field");
     expect(reject(JSON.stringify({ type: "hello", v: V, agent: "a", agentVersion: "1", capabilities: [1, 2] }))).toBe("bad-field");
     expect(reject(JSON.stringify({ type: "exit", v: V, id: "c", code: 0, signal: null, canceled: "no" }))).toBe("bad-field");
-    expect(reject(JSON.stringify({ type: "call", v: V, id: "r", method: "fetch" }))).toBe("bad-field");
+    expect(reject(JSON.stringify({ type: "error", v: V, id: "c", code: "x" }))).toBe("bad-field");
     expect(reject(JSON.stringify({ type: "stdout", v: V, id: "c", seq: -1, chunk: helloBytes }))).toBe("bad-field");
   });
 });
@@ -108,15 +105,6 @@ describe("payload size cap", () => {
 
   test("refuses an oversized stdout chunk before decoding", () => {
     const frame = { type: "stdout", v: V, id: "c", seq: 0, chunk: { bytes: 9, base64: "" } };
-    const result = decodeFrame(JSON.stringify(frame), tinyOpts);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error.code).toBe("payload-too-large");
-    }
-  });
-
-  test("refuses an oversized result blob", () => {
-    const frame = { type: "result", v: V, id: "r", value: null, blob: { bytes: 9, base64: "", contentType: "image/png" } };
     const result = decodeFrame(JSON.stringify(frame), tinyOpts);
     expect(result.ok).toBe(false);
     if (!result.ok) {

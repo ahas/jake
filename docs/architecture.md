@@ -18,44 +18,23 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   through. It is reachable from 하스's network through a `*.ahas.io` name fronted by NPM. It holds no
   capability itself; it relays.
 - **agent** — runs on 하스's Windows box from a single executable. It dials the hub, authenticates,
-  and then runs whatever the hub sends: PowerShell and WSL commands with live-streamed output, a
-  screen capture, a fetch from inside 하스's LAN, and browser control. It listens for nothing; it only
-  dials. The same executable also runs as the **guard**, a small supervisor that carries no
-  capability and only keeps the agent alive; the command line chooses which of the two a process is.
-  The staying-alive scheme below is what makes them a pair.
+  and then runs the shell commands the hub sends — PowerShell and WSL, with live-streamed output. The
+  shell is its only capability: it listens for nothing and only dials. The same executable also runs
+  as the **guard**, a small supervisor that carries no capability and only keeps the agent alive; the
+  command line chooses which of the two a process is. The staying-alive scheme below is what makes
+  them a pair.
 
-## The browser: Edge driven over CDP
+## Only a shell
 
-- The browser capability drives Microsoft Edge, already installed on 하스's Windows box, over the
-  Chrome DevTools Protocol. The agent launches Edge with a remote-debugging endpoint and holds one
-  WebSocket to it; every browser operation is a CDP command on that connection. Because nothing is
-  bundled that a compile cannot carry and no browser is downloaded, the whole capability lives inside
-  the agent's own executable — one file, not a file plus a co-located program and a separate browser.
-- Edge is launched headless by default, with a throwaway user-data directory so it never touches
-  하스's own Edge profile, and with the flags that keep an unattended launch from prompting. The OS
-  picks the debugging port, and the agent reads it back from the file Edge writes into that directory,
-  which also carries the browser endpoint's path — so the agent learns the exact loopback WebSocket
-  to dial. No listening port is opened on 하스's machine beyond Edge's own loopback endpoint.
-- Five operations are offered: navigate a page, read its source, screenshot it, evaluate an
-  expression in it, and fetch from inside its context so the page's own origin and cookies apply.
-  Each is its own named capability rather than one browser call switching on a parameter, so the
-  hello list names exactly what the agent can do and each is invoked directly. They share one page:
-  a single Edge, a single page target, created lazily on the first call that needs it.
-  - A navigation reports the page's final URL and the HTTP status of the document response, captured
-    from the network events the page emits and keyed to that navigation. It waits for the page's load
-    (or DOM-content) lifecycle event, bounded by the call's own timeout.
-  - A screenshot's PNG rides back as base64 with its declared byte length, subject to the same frame
-    payload cap every binary result answers to; a full-page shot clips to the page's content size.
-  - An evaluation and a page-context fetch run the expression in the page and return its
-    JSON-serialisable value; an expression that throws is reported as a stated error, not a crash.
-- The engine drives the browser one call at a time — a single page cannot serve two overlapping
-  navigations — holding the browser only as long as calls keep coming. When Edge is not found on the
-  machine the engine is unavailable: the browser methods are still registered, so a call that arrives
-  is answered, but they are kept out of the hello list and the answer is a stated "install Edge"
-  error. When Edge exits mid-call, the waiting call fails with the reason and the next call launches a
-  fresh Edge. A call that never answers is bounded by a wall-clock timeout, and reaching it tears Edge
-  down so the next call starts clean rather than queuing behind a wedged page. Edge is shut down after
-  an idle period and launched again on the next call, so a browser is not left in memory for nothing.
+- The tunnel carries a shell and nothing else. Anything a person at that Windows box could do from a
+  PowerShell or WSL prompt — take a screenshot, make an HTTP request from inside 하스's LAN, launch a
+  program — is done by sending that command, so it needs no capability of its own in the agent.
+- The agent therefore carries no screen-capture helper, no HTTP client, and no browser driver, and
+  the build bundles nothing beside the executable. A new need is met by a new command, not by a new
+  build on 하스's box.
+- The shell's output is text. A binary result crosses as base64 printed by the remote command and is
+  decoded on main-host, bounded by the same output cap as any other command. The command recipes for
+  the common cases are kept in docs/recipes.md.
 
 ## The agent's connection
 
@@ -70,12 +49,11 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and sends its own on an interval, and it treats a stretch of silence from the hub — past a window
   of several intervals — as a dead connection worth redialing, even when the socket has not errored.
 - Nothing in flight survives the socket it streamed over. On any loss every running command is
-  stopped and every pending call is abandoned; a command is never resumed across a broken socket,
-  and a result that arrives from a handler after the loss is dropped rather than sent.
-- What the agent can do is exactly what its build registered. Each capability the build carries
-  registers itself and contributes its own name to the hello list; a capability the build omits is
-  absent from that list rather than a branch the core carries. The core owns the wire — framing,
-  sequence numbers, sending — and a capability owns only its work.
+  stopped; a command is never resumed across a broken socket, and output that a run produces after
+  the loss is dropped rather than sent.
+- The hello list names the shells the agent can run, and the shell runner contributes those names
+  itself. The core owns the wire — framing, sequence numbers, sending — and the runner owns only
+  spawning, streaming, and stopping.
 - The agent keeps a bounded rolling log on its own machine, in a per-user location that needs no
   elevation. Because a failure on 하스's box may be exactly that the hub is unreachable, the record
   of what the agent did has to be readable there without the hub; the log rotates by size and keeps
@@ -99,7 +77,7 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   The agent must come back on its own from a crash, a reboot, and the deletion of any one autostart
   registration.
 - The pair is two processes of one executable. Run with no argument it is the **agent** — the tunnel
-  and every capability; run with the guard-mode flag it is the **guard** — a small supervisor that
+  and the shell; run with the guard-mode flag it is the **guard** — a small supervisor that
   carries none. One deliverable, two run modes: the guard exists so that a failure of the agent
   process is caught and repaired by something that is still running, and the agent returns the favour.
   They are distinct processes with distinct anchors and distinct scheduled tasks, so either can be
@@ -155,38 +133,6 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   timeout stop is jake's own doing, so it is not reported as a caller's cancel. Both ceilings are
   configuration, not constants.
 
-## Screen capture
-
-- A screenshot is taken by a spawned helper, not a native library bound into the agent: a native
-  screen-grab addon carries its own reported instability under the agent's runtime and gains nothing
-  here. The primary helper is a short PowerShell script that copies the screen into a bitmap and
-  saves a PNG to a temp file the agent then reads back and returns.
-- A capture can name the whole desktop or a single monitor by its device name. The whole desktop is
-  the virtual-screen rectangle spanning every monitor; a named monitor is looked up by that name and
-  a name that matches nothing is a stated error rather than a blank image.
-- A bundled nircmd.exe is the fallback for the case where machine policy blocks the PowerShell path.
-  It is laid down beside the executable at install time; when it is absent the handler still runs and
-  reports a stated error instead of falling back. nircmd captures the whole desktop only, so a
-  fallback capture is always every monitor even when one was asked for — the result says both what
-  was requested and what was actually captured.
-- The PNG is subject to the same frame payload cap every binary result is: an image larger than the
-  cap is refused rather than sent, and the temp file is removed whichever way the call ends.
-
-## Fetching from inside the network
-
-- The agent can make an HTTP request from where it runs, so a URL reachable only from 하스's LAN can
-  be retrieved through the tunnel. The request's method, headers, and body go in; the response's
-  status, headers, and body come out, along with the final URL and the chain of any redirects.
-- Redirects are followed by hand up to a bounded count, never silently past it — an over-long chain
-  is a stated error. The method and body are reshaped across a redirect the way a browser does: a
-  see-other continues as a bodyless GET, a moved/found turns a non-GET into a bodyless GET, and a
-  temporary/permanent redirect preserves the method and body exactly.
-- A textual body comes back as a string in the result; a binary body comes back as a base64 blob
-  labelled with its content type, because the two travel differently over the wire. An unlabelled
-  body is treated as binary. The body is read against a cap and a response past it is refused rather
-  than buffered whole, and a binary body past the frame payload cap is refused as well. Both the body
-  cap and the redirect bound are configuration, not constants.
-
 ## The console
 
 - 하스 must be able to see, from a console, whether the agent is attached and whether commands are
@@ -207,10 +153,9 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 - One executable is cross-compiled for Windows from main-host, so no Windows toolchain is needed to
   produce it. It is a single self-contained file with the runtime embedded, and the build version is
   stamped into it at compile time — the agent run mode announces it to the hub and the guard records
-  it in its log. The whole agent, browser capability included, compiles into that one file, because
-  the browser is Edge driven over CDP rather than a bundled library and a downloaded browser. The
-  build's output is a small layout: the executable, the screenshot fallback binary, the example
-  config, and the install scripts.
+  it in its log. The build's output is a small layout: the executable, the example config, the
+  install scripts, and the install guide. Nothing else is bundled, because the agent needs nothing
+  beyond the shells already on the box.
 - The installer runs in 하스's own user session without elevation. It copies the layout to a per-user
   location, and it is what asks for the hub URL, the shared secret, and the agent name and writes
   them into the config file beside the executable — the credential is entered at install time and

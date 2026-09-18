@@ -19,13 +19,12 @@ Usage:
   jake status [--json]              show whether the agent is attached and what is in flight
   jake exec <command...>            run a command, stream its output, exit with the remote code
       [--shell powershell|wsl] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
-  jake shot [--out <path>] [--screen <name>]      save a screenshot of the agent's desktop
-  jake fetch <url>                  fetch a URL from inside the agent's network
-      [--method <M>] [--header 'K: V']... [--body <data>] [--out <path>]
   jake tail [--after <id>]          follow the frames crossing the tunnel
   jake help                         show this message
 
-The control token and port are read from the hub's configuration, never the command line.
+Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
+exec; docs/recipes.md has them. The control token and port are read from the hub's configuration,
+never the command line.
 `;
 
 // --- The parsed command ---------------------------------------------------------------------------
@@ -34,15 +33,6 @@ export type Command =
   | { name: "help" }
   | { name: "status"; json: boolean }
   | { name: "exec"; request: ExecRequest }
-  | { name: "shot"; out: string | null; screen: string | null }
-  | {
-      name: "fetch";
-      url: string;
-      method: string;
-      headers: Record<string, string>;
-      body: string | null;
-      out: string | null;
-    }
   | { name: "tail"; after: number };
 
 export type ParseResult = { ok: true; command: Command } | { ok: false; error: string };
@@ -183,61 +173,6 @@ export function parseArgs(argv: string[]): ParseResult {
       return { ok: true, command: { name: "exec", request } };
     }
 
-    case "shot": {
-      const parsed = parseFlags(rest, [
-        { canonical: "out", aliases: ["o"] },
-        { canonical: "screen", aliases: [] },
-      ]);
-      if (parsed.error) return { ok: false, error: parsed.error };
-      if (parsed.positionals.length > 0) {
-        return { ok: false, error: `shot takes no positional arguments (got ${parsed.positionals[0]})` };
-      }
-      return {
-        ok: true,
-        command: {
-          name: "shot",
-          out: firstFlag(parsed.flags, "out") ?? null,
-          screen: firstFlag(parsed.flags, "screen") ?? null,
-        },
-      };
-    }
-
-    case "fetch": {
-      const parsed = parseFlags(rest, [
-        { canonical: "method", aliases: ["X"] },
-        { canonical: "header", aliases: ["H"], repeatable: true },
-        { canonical: "body", aliases: ["d"] },
-        { canonical: "out", aliases: ["o"] },
-      ]);
-      if (parsed.error) return { ok: false, error: parsed.error };
-      const url = parsed.positionals[0];
-      if (url === undefined) {
-        return { ok: false, error: "fetch needs a URL" };
-      }
-      if (parsed.positionals.length > 1) {
-        return { ok: false, error: `fetch takes one URL (got ${parsed.positionals.length})` };
-      }
-      const headers: Record<string, string> = {};
-      for (const raw of parsed.flags.get("header") ?? []) {
-        const colon = raw.indexOf(":");
-        if (colon === -1) {
-          return { ok: false, error: `--header expects 'Name: value' (got ${raw})` };
-        }
-        headers[raw.slice(0, colon).trim()] = raw.slice(colon + 1).trim();
-      }
-      return {
-        ok: true,
-        command: {
-          name: "fetch",
-          url,
-          method: firstFlag(parsed.flags, "method") ?? "GET",
-          headers,
-          body: firstFlag(parsed.flags, "body") ?? null,
-          out: firstFlag(parsed.flags, "out") ?? null,
-        },
-      };
-    }
-
     case "tail": {
       const parsed = parseFlags(rest, [{ canonical: "after", aliases: [] }]);
       if (parsed.error) return { ok: false, error: parsed.error };
@@ -266,9 +201,7 @@ export interface CliDeps {
   out(text: string): void;
   /** Write to standard error. */
   err(text: string): void;
-  /** Persist bytes to a path — a screenshot or a fetched body. */
-  writeFile(path: string, data: Uint8Array): Promise<void>;
-  /** The current wall clock, for uptime and default filenames. Injectable for tests. */
+  /** The current wall clock, for uptime. Injectable for tests. */
   now?(): number;
   /** Called once the hub assigns an exec an id, so main can bind Ctrl-C to a cancel. */
   onExecStart?(id: string): void;
@@ -292,10 +225,6 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return runStatus(command, deps);
     case "exec":
       return runExec(command, deps);
-    case "shot":
-      return runShot(command, deps);
-    case "fetch":
-      return runFetch(command, deps);
     case "tail":
       return runTail(command, deps);
   }
@@ -372,81 +301,6 @@ async function runExec(command: { request: ExecRequest }, deps: CliDeps): Promis
   }
 }
 
-async function runShot(command: { out: string | null; screen: string | null }, deps: CliDeps): Promise<number> {
-  let outcome;
-  try {
-    outcome = await deps.client.call("screenshot", { screen: command.screen });
-  } catch (error) {
-    deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
-    return EXIT_FAILED;
-  }
-  if (!outcome.ok) {
-    deps.err(`jake: screenshot failed [${outcome.code}]: ${outcome.message}\n`);
-    return outcome.code === "no-agent" ? EXIT_NO_AGENT : EXIT_FAILED;
-  }
-  if (outcome.blob === null) {
-    deps.err("jake: the agent returned no image\n");
-    return EXIT_FAILED;
-  }
-  const bytes = new Uint8Array(Buffer.from(outcome.blob.base64, "base64"));
-  const path = command.out ?? `shot-${nowOf(deps)}.png`;
-  try {
-    await deps.writeFile(path, bytes);
-  } catch (error) {
-    deps.err(`jake: could not write ${path}: ${errorMessage(error)}\n`);
-    return EXIT_FAILED;
-  }
-  deps.out(`saved ${bytes.byteLength} bytes to ${path}\n`);
-  return EXIT_OK;
-}
-
-async function runFetch(
-  command: { url: string; method: string; headers: Record<string, string>; body: string | null; out: string | null },
-  deps: CliDeps,
-): Promise<number> {
-  let outcome;
-  try {
-    outcome = await deps.client.call("fetch", {
-      url: command.url,
-      method: command.method,
-      headers: command.headers,
-      body: command.body,
-    });
-  } catch (error) {
-    deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
-    return EXIT_FAILED;
-  }
-  if (!outcome.ok) {
-    deps.err(`jake: fetch failed [${outcome.code}]: ${outcome.message}\n`);
-    return outcome.code === "no-agent" ? EXIT_NO_AGENT : EXIT_FAILED;
-  }
-
-  // The status line and headers go to stderr so the body alone lands on stdout when it is piped.
-  const value = outcome.value as { status?: unknown; url?: unknown; headers?: unknown };
-  const status = typeof value.status === "number" ? value.status : "?";
-  const finalUrl = typeof value.url === "string" ? value.url : command.url;
-  deps.err(`${status} ${finalUrl}\n`);
-  if (value.headers !== null && typeof value.headers === "object") {
-    for (const [key, headerValue] of Object.entries(value.headers as Record<string, unknown>)) {
-      deps.err(`${key}: ${String(headerValue)}\n`);
-    }
-  }
-
-  const body = outcome.blob === null ? new Uint8Array() : new Uint8Array(Buffer.from(outcome.blob.base64, "base64"));
-  if (command.out !== null) {
-    try {
-      await deps.writeFile(command.out, body);
-    } catch (error) {
-      deps.err(`jake: could not write ${command.out}: ${errorMessage(error)}\n`);
-      return EXIT_FAILED;
-    }
-    deps.err(`wrote ${body.byteLength} bytes to ${command.out}\n`);
-  } else {
-    deps.out(new TextDecoder().decode(body));
-  }
-  return EXIT_OK;
-}
-
 async function runTail(command: { after: number }, deps: CliDeps): Promise<number> {
   try {
     await deps.client.tail(
@@ -485,7 +339,6 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
     `  connected for ${formatDuration(now - agent.connectedAt)}`,
     `  capabilities: ${agent.capabilities.length > 0 ? agent.capabilities.join(", ") : "(none)"}`,
     `  in-flight commands: ${snapshot.inFlight.length > 0 ? snapshot.inFlight.join(", ") : "(none)"}`,
-    `  pending calls: ${snapshot.pendingCalls}`,
   ];
   return `${lines.join("\n")}\n`;
 }

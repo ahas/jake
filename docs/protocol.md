@@ -10,8 +10,7 @@ answers to it.
 - Every frame is a JSON object sent as text. Every frame carries a `type` naming its kind and a `v`
   giving the protocol version. A receiver that sees a version other than the one it speaks refuses
   the frame rather than guessing at it.
-- Binary payloads — a screenshot PNG, a fetched body, a chunk of command output — ride inside a
-  frame as base64, alongside a declared decoded byte length. The length is declared so a receiver
+- Binary payloads — a chunk of command output — ride inside a frame as base64, alongside a declared decoded byte length. The length is declared so a receiver
   can refuse an oversized payload by reading one integer, before it allocates the decoded buffer.
   Each side carries its own size cap in configuration and applies it while decoding.
 
@@ -19,8 +18,6 @@ answers to it.
 
 - An **encoded-bytes** value is a declared byte length together with the base64 of exactly that many
   bytes. Command output chunks carry one.
-- An **encoded-blob** value is an encoded-bytes value that also names the media type of the bytes. A
-  capability result carries one when it returns binary output.
 - Decoding a byte payload re-checks the size cap and verifies that the decoded length equals the
   declared one; a mismatch is rejected as a malformed field.
 
@@ -29,8 +26,8 @@ answers to it.
 Connection handshake:
 
 - **hello** — agent to hub, first on a fresh connection: the agent's identity, its version, and the
-  list of capabilities this build offers. The list is just names; the protocol does not know what
-  they mean.
+  list of shells this build can run. The list is just names; the protocol does not know what they
+  mean.
 - **welcome** — hub to agent, accepting the hello and naming the hub's version.
 - **reject** — hub to agent, refusing the hello with a stated reason.
 
@@ -46,15 +43,8 @@ Command execution (streaming):
   killed, and whether the end came from a cancel rather than a natural finish.
 - **cancel** — hub to agent: stop the run with this id, ending its whole process tree.
 
-Capabilities (non-streaming):
-
-- **call** — hub to agent: invoke a capability by name, with a caller-chosen id and free-form
-  parameters. Screenshot, fetch, and the browser methods are all calls; the protocol carries the
-  name and parameters without knowing them.
-- **result** — agent to hub: a call succeeded, carrying its id, a free-form value, and an optional
-  blob for binary output.
-- **error** — agent to hub, or hub to agent: a call or a run request failed, carrying the id it
-  answers, a short code, and a message.
+- **error** — agent to hub, or hub to agent: a run request failed before it could stream (an
+  unsupported shell, a spawn failure), carrying the id it answers, a short code, and a message.
 
 Liveness:
 

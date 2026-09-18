@@ -1,6 +1,6 @@
-// The agent's outermost layer: the capability registry and the forever reconnect loop. Capabilities
-// are registered before the agent runs, so the hello list is exactly what this build carries and no
-// more. The loop dials the hub, runs one connection over the socket it gets, and when that
+// The agent's outermost layer: the shell-runner registration and the forever reconnect loop. The
+// runner is registered before the agent runs, so the hello list is exactly the shells it can run.
+// The loop dials the hub, runs one connection over the socket it gets, and when that
 // connection ends — for any reason — waits out a backoff and dials again, without end. A connection
 // that stayed up long enough to be worth trusting resets the backoff, so an occasional flap does not
 // push the delay toward its ceiling while a genuine outage still does. The dialer, the clock, and
@@ -8,7 +8,7 @@
 
 import type { AgentConfig } from "../config";
 import { backoffDelay, type BackoffOptions } from "./backoff";
-import type { CallHandler, ExecRunner } from "./capability";
+import type { ExecRunner } from "./capability";
 import { AgentConnection, type ConnectionDeps, type ConnectionOutcome } from "./connection";
 import type { Logger } from "./log";
 import type { Dialer, Scheduler, Transport, TransportEvents } from "./transport";
@@ -41,11 +41,6 @@ export class AgentRuntime {
   private readonly deps: RuntimeDeps;
 
   private execRunner: ExecRunner | null = null;
-  private readonly callHandlers = new Map<string, CallHandler>();
-  // Methods that are handled but kept out of the hello list. A capability whose backing is not
-  // present on this machine — the browser sidecar when it was never installed — still answers a call
-  // that arrives (with a stated error), but is not advertised, so a well-behaved hub never calls it.
-  private readonly unadvertised = new Set<string>();
 
   private stopped = false;
   private currentConnection: AgentConnection | null = null;
@@ -64,33 +59,9 @@ export class AgentRuntime {
     this.execRunner = runner;
   }
 
-  /**
-   * Register one non-streaming capability. Each method name may be registered once. `advertise`
-   * defaults to true; pass false to register a handler that answers a call but is not named in the
-   * hello list — for a capability whose backing is absent on this machine.
-   */
-  registerCall(handler: CallHandler, options: { advertise?: boolean } = {}): void {
-    if (this.callHandlers.has(handler.method)) {
-      throw new Error(`a handler for ${handler.method} is already registered`);
-    }
-    this.callHandlers.set(handler.method, handler);
-    if (options.advertise === false) {
-      this.unadvertised.add(handler.method);
-    }
-  }
-
-  /** The capability names to announce, drawn from whatever was registered and advertised. */
+  /** The capability names to announce: the shells the registered runner can run. */
   capabilities(): string[] {
-    const names: string[] = [];
-    if (this.execRunner !== null) {
-      names.push(...this.execRunner.capabilities);
-    }
-    for (const method of this.callHandlers.keys()) {
-      if (!this.unadvertised.has(method)) {
-        names.push(method);
-      }
-    }
-    return names;
+    return this.execRunner === null ? [] : [...this.execRunner.capabilities];
   }
 
   /** Dial and redial forever, running one connection at a time, until `stop` is called. */
@@ -148,7 +119,6 @@ export class AgentRuntime {
       agentVersion: this.deps.agentVersion,
       capabilities: this.capabilities(),
       execRunner: this.execRunner,
-      callHandlers: this.callHandlers,
       heartbeatMs: this.config.heartbeatMs,
       missedHeartbeatLimit: this.deps.missedHeartbeatLimit ?? DEFAULT_MISSED_HEARTBEAT_LIMIT,
       maxPayloadBytes: this.config.maxPayloadBytes,

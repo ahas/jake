@@ -10,8 +10,8 @@ export const PROTOCOL_VERSION = 1;
 /**
  * The default ceiling on a single frame's declared byte payload. It is a default, not a law: each
  * side reads its own ceiling from configuration and passes it to the decoder. Sixteen mebibytes is
- * large enough for a full-screen PNG and a sizeable fetched body, small enough that one frame
- * cannot exhaust memory on its own.
+ * far above any single chunk of command output, small enough that one frame cannot exhaust memory
+ * on its own.
  */
 export const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
@@ -28,14 +28,9 @@ export interface EncodedBytes {
   base64: string;
 }
 
-/** EncodedBytes that also names what the bytes are — a capability result such as a PNG or a body. */
-export interface EncodedBlob extends EncodedBytes {
-  contentType: string;
-}
-
 // --- Frames ------------------------------------------------------------------------------------
 
-/** Agent → hub, first thing on a fresh connection: who it is and what it can do. */
+/** Agent → hub, first thing on a fresh connection: who it is and which shells it can run. */
 export interface HelloFrame {
   type: "hello";
   v: number;
@@ -105,25 +100,7 @@ export interface CancelFrame {
   id: string;
 }
 
-/** Hub → agent: invoke a non-streaming capability by name. The protocol does not know the names. */
-export interface CallFrame {
-  type: "call";
-  v: number;
-  id: string;
-  method: string;
-  params: unknown;
-}
-
-/** Agent → hub: a capability call succeeded. `blob` carries binary output when there is any. */
-export interface ResultFrame {
-  type: "result";
-  v: number;
-  id: string;
-  value: unknown;
-  blob: EncodedBlob | null;
-}
-
-/** Agent → hub (or hub → agent): a call or a run request failed, with a code and a message. */
+/** Agent → hub (or hub → agent): a run request failed before it could stream, with a code and a message. */
 export interface ErrorFrame {
   type: "error";
   v: number;
@@ -155,8 +132,6 @@ export type Frame =
   | StderrFrame
   | ExitFrame
   | CancelFrame
-  | CallFrame
-  | ResultFrame
   | ErrorFrame
   | PingFrame
   | PongFrame;
@@ -211,8 +186,6 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<FrameType>([
   "stderr",
   "exit",
   "cancel",
-  "call",
-  "result",
   "error",
   "ping",
   "pong",
@@ -255,7 +228,7 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 // The envelope check on an EncodedBytes-shaped field: enough to refuse an oversized or plainly
-// broken payload without decoding it. The actual byte-for-byte decode is decodeBytes/decodeBlob.
+// broken payload without decoding it. The actual byte-for-byte decode is decodeBytes.
 function checkEncodedBytes(
   value: unknown,
   field: string,
@@ -394,27 +367,6 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
       return { ok: true, frame: { type, v, id: parsed.id } };
     }
 
-    case "call": {
-      if (!isString(parsed.id)) return fail("bad-field", "call.id must be a string");
-      if (!isString(parsed.method)) return fail("bad-field", "call.method must be a string");
-      if (!("params" in parsed)) return fail("bad-field", "call.params is required");
-      return { ok: true, frame: { type, v, id: parsed.id, method: parsed.method, params: parsed.params } };
-    }
-
-    case "result": {
-      if (!isString(parsed.id)) return fail("bad-field", "result.id must be a string");
-      if (!("value" in parsed)) return fail("bad-field", "result.value is required");
-      let blob: EncodedBlob | null = null;
-      if (parsed.blob !== null && parsed.blob !== undefined) {
-        const blobError = checkEncodedBytes(parsed.blob, "result.blob", maxPayloadBytes);
-        if (blobError) return { ok: false, error: blobError };
-        const raw = parsed.blob as EncodedBlob;
-        if (!isString(raw.contentType)) return fail("bad-field", "result.blob.contentType must be a string");
-        blob = { bytes: raw.bytes, base64: raw.base64, contentType: raw.contentType };
-      }
-      return { ok: true, frame: { type, v, id: parsed.id, value: parsed.value, blob } };
-    }
-
     case "error": {
       if (!isString(parsed.id)) return fail("bad-field", "error.id must be a string");
       if (!isString(parsed.code)) return fail("bad-field", "error.code must be a string");
@@ -438,11 +390,6 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
 /** Wrap raw bytes for a stdout/stderr chunk. */
 export function encodeBytes(data: Uint8Array): EncodedBytes {
   return { bytes: data.byteLength, base64: Buffer.from(data).toString("base64") };
-}
-
-/** Wrap raw bytes for a capability result, naming their media type. */
-export function encodeBlob(data: Uint8Array, contentType: string): EncodedBlob {
-  return { bytes: data.byteLength, base64: Buffer.from(data).toString("base64"), contentType };
 }
 
 /**

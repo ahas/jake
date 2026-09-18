@@ -10,15 +10,7 @@ import {
   type Frame,
 } from "../src/protocol";
 import { backoffDelay } from "../src/agent/backoff";
-import type {
-  CallContext,
-  CallHandler,
-  CallOutcome,
-  ExecRequest,
-  ExecRun,
-  ExecRunner,
-  ExecSink,
-} from "../src/agent/capability";
+import type { ExecRequest, ExecRun, ExecRunner, ExecSink } from "../src/agent/capability";
 import { AgentConnection, type ConnectionDeps } from "../src/agent/connection";
 import { RollingLog, type LogFileSystem, type LogLevel, type Logger } from "../src/agent/log";
 import { agentDataDir, agentLogPath, heartbeatPath, startupDir } from "../src/agent/platform";
@@ -168,18 +160,6 @@ class FakeRunner implements ExecRunner {
   }
 }
 
-class FakeHandler implements CallHandler {
-  readonly calls: { params: unknown; ctx: CallContext }[] = [];
-  constructor(
-    readonly method: string,
-    private readonly impl: (params: unknown, ctx: CallContext) => Promise<CallOutcome>,
-  ) {}
-  handle(params: unknown, ctx: CallContext): Promise<CallOutcome> {
-    this.calls.push({ params, ctx });
-    return this.impl(params, ctx);
-  }
-}
-
 class FakeFs implements LogFileSystem {
   readonly files = new Map<string, string>();
   size(path: string): number {
@@ -222,7 +202,6 @@ function buildConn(overrides: Partial<ConnectionDeps> = {}): ConnHarness {
     agentVersion: "0.1.0",
     capabilities: [],
     execRunner: null,
-    callHandlers: new Map(),
     heartbeatMs: 1_000,
     missedHeartbeatLimit: 3,
     maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
@@ -248,13 +227,6 @@ function agentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
     execMaxOutputBytes: 8 * 1024 * 1024,
     execTimeoutMs: 300_000,
-    fetchMaxBodyBytes: 8 * 1024 * 1024,
-    fetchMaxRedirects: 5,
-    browserExecutablePath: null,
-    browserHeadless: true,
-    browserStartupTimeoutMs: 20_000,
-    browserIdleMs: 300_000,
-    browserCallTimeoutMs: 60_000,
     ...overrides,
   };
 }
@@ -326,14 +298,14 @@ describe("RollingLog", () => {
 
 describe("AgentConnection handshake", () => {
   test("sends a hello carrying its identity and registered capabilities", () => {
-    const { conn, transport } = buildConn({ capabilities: ["exec:powershell", "screenshot"] });
+    const { conn, transport } = buildConn({ capabilities: ["exec:powershell", "exec:wsl"] });
     conn.run();
     const hello = pick(transport.sent, "hello")[0];
     expect(hello).toMatchObject({
       type: "hello",
       agent: "jake-win",
       agentVersion: "0.1.0",
-      capabilities: ["exec:powershell", "screenshot"],
+      capabilities: ["exec:powershell", "exec:wsl"],
     });
   });
 
@@ -404,22 +376,12 @@ describe("AgentConnection dispatch", () => {
     expect(runner.started[0]!.run.canceled).toBe(1);
   });
 
-  test("call is handed to the handler and its result streams back", async () => {
-    const handler = new FakeHandler("screenshot", () => Promise.resolve({ ok: true, value: { w: 1 }, blob: null }));
-    const { conn, transport } = buildConn({ callHandlers: new Map([[handler.method, handler]]), capabilities: ["screenshot"] });
+  test("a call frame is not part of the vocabulary and is refused without an answer", () => {
+    const { conn, transport, log } = buildConn();
     conn.run();
-    conn.handleMessage(encodeFrame({ type: "call", v: V, id: "r1", method: "screenshot", params: { screen: "all" } }));
-    await flush();
-    expect(handler.calls).toHaveLength(1);
-    expect(handler.calls[0]!.params).toEqual({ screen: "all" });
-    expect(pick(transport.sent, "result")[0]).toMatchObject({ id: "r1", value: { w: 1 } });
-  });
-
-  test("a call for an unknown method is refused", () => {
-    const { conn, transport } = buildConn();
-    conn.run();
-    conn.handleMessage(encodeFrame({ type: "call", v: V, id: "r2", method: "nope", params: null }));
-    expect(pick(transport.sent, "error")[0]).toMatchObject({ id: "r2", code: "unknown-method" });
+    conn.handleMessage(JSON.stringify({ type: "call", v: V, id: "r1", method: "screenshot", params: null }));
+    expect(transport.sent.map((frame) => frame.type)).toEqual(["hello"]);
+    expect(log.events.some((entry) => entry.event === "frame-rejected")).toBe(true);
   });
 });
 
@@ -454,40 +416,44 @@ describe("AgentConnection heartbeat", () => {
 });
 
 describe("AgentConnection abandonment on disconnect", () => {
-  test("cancels every run, aborts every call, and drops a late result", async () => {
+  test("cancels every run and drops output a run pushes afterwards", async () => {
     const runner = new FakeRunner();
-    let captured: AbortSignal | null = null;
-    let settle: ((outcome: CallOutcome) => void) | null = null;
-    const handler = new FakeHandler("slow", (_params, ctx) => {
-      captured = ctx.signal;
-      return new Promise<CallOutcome>((resolve) => {
-        settle = resolve;
-      });
-    });
-    const { conn, transport } = buildConn({
-      execRunner: runner,
-      callHandlers: new Map([[handler.method, handler]]),
-      capabilities: [...runner.capabilities, handler.method],
-    });
+    const { conn, transport } = buildConn({ execRunner: runner, capabilities: [...runner.capabilities] });
     const done = conn.run();
     conn.handleMessage(execFrame("c1"));
-    conn.handleMessage(encodeFrame({ type: "call", v: V, id: "r1", method: "slow", params: null }));
-    await flush();
+    conn.handleMessage(execFrame("c2"));
 
     conn.handleClose("socket dropped");
     const outcome = await done;
     expect(outcome.reason).toContain("socket dropped");
-    expect(runner.started[0]!.run.canceled).toBe(1);
-    expect((captured as AbortSignal | null)?.aborted).toBe(true);
+    expect(runner.started.map((entry) => entry.run.canceled)).toEqual([1, 1]);
 
-    // The handler resolves after the disconnect; its stale result must not be sent.
-    settle!({ ok: true, value: "too late", blob: null });
-    await flush();
-    expect(pick(transport.sent, "result")).toHaveLength(0);
+    // The runs report their end after the disconnect; nothing may be sent on the dead socket.
+    const sentBefore = transport.sent.length;
+    runner.started[0]!.sink.stdout(enc.encode("late"));
+    runner.started[0]!.sink.exit({ code: null, signal: null, canceled: true });
+    expect(transport.sent).toHaveLength(sentBefore);
   });
 });
 
 // --- Runtime: reconnect loop ---------------------------------------------------------------------
+
+describe("AgentRuntime registration", () => {
+  const deps = () => ({ dialer: new FakeDialer([], new FakeScheduler()), scheduler: new FakeScheduler(), log: new CaptureLog(), agentVersion: "0.1.0" });
+
+  test("the hello list is exactly the shells the registered runner can run", () => {
+    const runtime = new AgentRuntime(agentConfig(), deps());
+    expect(runtime.capabilities()).toEqual([]);
+    runtime.registerExec(new FakeRunner());
+    expect(runtime.capabilities()).toEqual(["exec:powershell", "exec:wsl"]);
+  });
+
+  test("a second runner is refused", () => {
+    const runtime = new AgentRuntime(agentConfig(), deps());
+    runtime.registerExec(new FakeRunner());
+    expect(() => runtime.registerExec(new FakeRunner())).toThrow("already registered");
+  });
+});
 
 describe("AgentRuntime reconnect loop", () => {
   test("redials forever with a growing, capped backoff", async () => {

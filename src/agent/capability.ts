@@ -1,14 +1,9 @@
-// The contracts a capability implements so the connection core can dispatch to it. The core owns no
-// capability itself: the modules that run commands, take screenshots, fetch, and drive a browser
-// each implement one of these and register it, and the core routes an inbound frame to whichever is
-// registered. A capability the build leaves out is therefore simply absent from the registry — and
-// so absent from the `hello` list the hub is told about — rather than a branch the core carries.
-// The core supplies the wire (framing, sequence numbers, sending); a handler supplies only its work.
+// The contract the shell runner implements so the connection core can dispatch to it. The shell is
+// the agent's only capability; the core owns none of it, and hands every exec and cancel frame to the
+// one registered runner. The core supplies the wire (framing, sequence numbers, sending); the runner
+// supplies only spawning, streaming, and stopping.
 
-import type { EncodedBlob, ShellKind } from "../protocol";
-import type { Logger } from "./log";
-
-// --- Streaming: the shell runner (exec / cancel) -------------------------------------------------
+import type { ShellKind } from "../protocol";
 
 /** A command to run, as the exec frame carried it. `id` ties every frame the run emits back to it. */
 export interface ExecRequest {
@@ -51,27 +46,3 @@ export interface ExecRunner {
   start(request: ExecRequest, sink: ExecSink): ExecRun;
 }
 
-// --- Non-streaming: the capability calls (call) --------------------------------------------------
-
-/** What a call handler is given besides its parameters: a signal that fires when the work is abandoned. */
-export interface CallContext {
-  /** Aborted when the connection drops, so a handler can stop work that will never be delivered. */
-  signal: AbortSignal;
-  log: Logger;
-}
-
-/** The settled outcome of a capability call: a value with an optional binary blob, or a named error. */
-export type CallOutcome =
-  | { ok: true; value: unknown; blob?: EncodedBlob | null }
-  | { ok: false; code: string; message: string };
-
-/**
- * One non-streaming capability — a screenshot, a fetch, a browser method. Its `method` is both the
- * name it is invoked by and the name it contributes to the hello list. `handle` runs the call and
- * resolves with its outcome; the core turns that into a result or error frame. A handler that throws
- * is reported as a failure rather than crashing the agent.
- */
-export interface CallHandler {
-  readonly method: string;
-  handle(params: unknown, ctx: CallContext): Promise<CallOutcome>;
-}
