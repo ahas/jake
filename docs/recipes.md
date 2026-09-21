@@ -2,9 +2,10 @@
 
 The shell is what the agent runs (docs/architecture.md, "What crosses the tunnel"). Most of what BMO
 needs from the machine is a command sent through `jake exec` from main-host; these are the commands
-for the common cases. Moving a whole file is the exception — the tunnel's own file transfer carries
-it end to end (docs/architecture.md, "Moving files"), so the base64-through-a-command trick below is
-for a binary that a command produces inline, not for transferring a file that already exists.
+for the common cases. Moving a whole file is the exception — `jake upload <local> <remote>` and
+`jake download <remote> <local>` carry it end to end over the tunnel's own frames
+(docs/architecture.md, "Moving files"), so the base64-through-a-command trick below is for a binary
+that a command produces inline, not for transferring a file that already exists.
 
 ## How a binary result crosses
 

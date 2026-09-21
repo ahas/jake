@@ -39,6 +39,26 @@ export type ExecOutcome =
   | { kind: "ended"; reason: string }
   | { kind: "refused"; status: number; message: string };
 
+/**
+ * How a streamed transfer ended. `completed` carries the verified byte total and checksum; `refused`
+ * is the hub declining before any stream opened (no agent, or a missing path).
+ */
+export type TransferOutcome =
+  | { kind: "completed"; total: number; checksum: string }
+  | { kind: "error"; code: string; message: string }
+  | { kind: "ended"; reason: string }
+  | { kind: "refused"; status: number; message: string };
+
+/** The callbacks a streamed download drives as the agent's declared size and bytes arrive. */
+export interface DownloadSink {
+  /** The hub has accepted the transfer and assigned it this id. */
+  onStart?(id: string): void;
+  /** The agent has declared the size and checksum it is about to stream. */
+  onBegin?(total: number, checksum: string): void;
+  /** A chunk of the file's content, already base64-decoded to its bytes. */
+  onChunk(bytes: Uint8Array): void;
+}
+
 export class HubClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -169,6 +189,104 @@ export class HubClient {
     });
 
     return outcome ?? { kind: "ended", reason: "the stream closed without an exit" };
+  }
+
+  /**
+   * Write a local file onto the machine at `path`, streaming its bytes to the hub, which chunks them
+   * over the tunnel and reports the agent's verified acknowledgement. A hub with no agent (or a
+   * missing path) answers with JSON rather than a stream, reported as a `refused` outcome.
+   */
+  async upload(path: string, data: Uint8Array, sink: { onStart?(id: string): void } = {}): Promise<TransferOutcome> {
+    const response = await this.fetchImpl(`${this.baseUrl}/upload?path=${encodeURIComponent(path)}`, {
+      method: "POST",
+      headers: this.headers({ "content-type": "application/octet-stream" }),
+      // slice() copies into a fresh ArrayBuffer-backed view, which the fetch body type requires.
+      body: data.slice(),
+    });
+    return this.consumeTransfer(response, sink);
+  }
+
+  /**
+   * Read the file at `path` back from the machine, delivering the agent's declared size and each chunk
+   * of content through `sink`. The outcome is `completed` only once the hub has verified the assembled
+   * bytes against the declared total and checksum, so a caller writes to disk only on `completed`.
+   */
+  async download(path: string, sink: DownloadSink): Promise<TransferOutcome> {
+    const response = await this.fetchImpl(`${this.baseUrl}/download?path=${encodeURIComponent(path)}`, {
+      method: "POST",
+      headers: this.headers(),
+    });
+    return this.consumeTransfer(response, sink);
+  }
+
+  /** Drive one transfer's SSE stream, delivering begin/chunk events and returning the terminal outcome. */
+  private async consumeTransfer(
+    response: Response,
+    sink: { onStart?(id: string): void; onBegin?(total: number, checksum: string): void; onChunk?(bytes: Uint8Array): void },
+  ): Promise<TransferOutcome> {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (response.body === null || !contentType.startsWith("text/event-stream")) {
+      let message = `the hub refused the transfer (${response.status})`;
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        if (typeof body.error === "string") message = body.error;
+      } catch {
+        // not JSON; keep the status-based message
+      }
+      return { kind: "refused", status: response.status, message };
+    }
+
+    let outcome: TransferOutcome | null = null;
+    await readSse(response.body, (event) => {
+      switch (event.event) {
+        case "started": {
+          const id = (event.data as { id?: unknown } | undefined)?.id;
+          if (typeof id === "string") sink.onStart?.(id);
+          return;
+        }
+        case "begin": {
+          const data = event.data as { total?: unknown; checksum?: unknown };
+          if (typeof data.total === "number" && typeof data.checksum === "string") {
+            sink.onBegin?.(data.total, data.checksum);
+          }
+          return;
+        }
+        case "chunk": {
+          const base64 = (event.data as { chunk?: { base64?: unknown } } | undefined)?.chunk?.base64;
+          if (typeof base64 === "string") {
+            sink.onChunk?.(new Uint8Array(Buffer.from(base64, "base64")));
+          }
+          return;
+        }
+        case "completed": {
+          const data = event.data as { total?: unknown; checksum?: unknown };
+          outcome = {
+            kind: "completed",
+            total: typeof data.total === "number" ? data.total : 0,
+            checksum: typeof data.checksum === "string" ? data.checksum : "",
+          };
+          return;
+        }
+        case "error": {
+          const data = event.data as { code?: unknown; message?: unknown };
+          outcome = {
+            kind: "error",
+            code: typeof data.code === "string" ? data.code : "error",
+            message: typeof data.message === "string" ? data.message : "",
+          };
+          return;
+        }
+        case "ended": {
+          const reason = (event.data as { reason?: unknown } | undefined)?.reason;
+          if (outcome === null) {
+            outcome = { kind: "ended", reason: typeof reason === "string" ? reason : "stream ended" };
+          }
+          return;
+        }
+      }
+    });
+
+    return outcome ?? { kind: "ended", reason: "the stream closed without completing" };
   }
 
   /**

@@ -2,7 +2,7 @@
 
 import { isShellKind, SHELL_KINDS } from "../protocol";
 import type { StatusSnapshot, TrafficEntry } from "../hub/core";
-import type { ExecRequest, HubClient } from "./client";
+import type { ExecRequest, HubClient, TransferOutcome } from "./client";
 
 export const EXIT_OK = 0;
 export const EXIT_USAGE = 2;
@@ -15,9 +15,14 @@ Usage:
   jake status [--json]              show whether the agent is attached and what is in flight
   jake exec <command...>            run a command, stream its output, exit with the remote code
       [--shell powershell|wsl|linux] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
+  jake upload <local> <remote>      copy a local file to <remote> on the machine
+  jake download <remote> <local>    copy <remote> from the machine to a local file
   jake tail [--after <id>]          follow the frames crossing the tunnel
   jake leave --yes                  erase the agent from the machine and detach for good
   jake help                         show this message
+
+upload and download move a whole file over the tunnel's own frames — no scp — and verify the bytes
+against a checksum before reporting success; a download is written to <local> only once verified.
 
 Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
 exec; docs/recipes.md has them. The control token and port are read from the hub's configuration,
@@ -33,6 +38,8 @@ export type Command =
   | { name: "help" }
   | { name: "status"; json: boolean }
   | { name: "exec"; request: ExecRequest }
+  | { name: "upload"; local: string; remote: string }
+  | { name: "download"; remote: string; local: string }
   | { name: "tail"; after: number }
   | { name: "leave"; confirmed: boolean };
 
@@ -174,6 +181,24 @@ export function parseArgs(argv: string[]): ParseResult {
       return { ok: true, command: { name: "exec", request } };
     }
 
+    case "upload": {
+      const parsed = parseFlags(rest, []);
+      if (parsed.error) return { ok: false, error: parsed.error };
+      if (parsed.positionals.length !== 2) {
+        return { ok: false, error: "upload needs a local path and a remote path: jake upload <local> <remote>" };
+      }
+      return { ok: true, command: { name: "upload", local: parsed.positionals[0]!, remote: parsed.positionals[1]! } };
+    }
+
+    case "download": {
+      const parsed = parseFlags(rest, []);
+      if (parsed.error) return { ok: false, error: parsed.error };
+      if (parsed.positionals.length !== 2) {
+        return { ok: false, error: "download needs a remote path and a local path: jake download <remote> <local>" };
+      }
+      return { ok: true, command: { name: "download", remote: parsed.positionals[0]!, local: parsed.positionals[1]! } };
+    }
+
     case "tail": {
       const parsed = parseFlags(rest, [{ canonical: "after", aliases: [] }]);
       if (parsed.error) return { ok: false, error: parsed.error };
@@ -215,6 +240,10 @@ export interface CliDeps {
   now?(): number;
   /** Called once the hub assigns an exec an id, so main can bind Ctrl-C to a cancel. */
   onExecStart?(id: string): void;
+  /** Read a local file's bytes, for an upload. Defaults to the Bun file API; a test injects a fake. */
+  readFile?(path: string): Promise<Uint8Array>;
+  /** Write a local file's bytes, for a download. Defaults to the Bun file API; a test injects a fake. */
+  writeFile?(path: string, data: Uint8Array): Promise<void>;
 }
 
 /** Run one command from the argument vector and return the process exit code. */
@@ -235,6 +264,10 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return runStatus(command, deps);
     case "exec":
       return runExec(command, deps);
+    case "upload":
+      return runUpload(command, deps);
+    case "download":
+      return runDownload(command, deps);
     case "tail":
       return runTail(command, deps);
     case "leave":
@@ -311,6 +344,90 @@ async function runExec(command: { request: ExecRequest }, deps: CliDeps): Promis
       }
       return clampExit(outcome.code);
   }
+}
+
+function readFileOf(deps: CliDeps): (path: string) => Promise<Uint8Array> {
+  return deps.readFile ?? ((path) => Bun.file(path).bytes());
+}
+
+function writeFileOf(deps: CliDeps): (path: string, data: Uint8Array) => Promise<void> {
+  return deps.writeFile ?? (async (path, data) => void (await Bun.write(path, data)));
+}
+
+/** Report a transfer that did not complete, mapping its outcome to an exit code. */
+function reportTransferFailure(outcome: Exclude<TransferOutcome, { kind: "completed" }>, deps: CliDeps): number {
+  switch (outcome.kind) {
+    case "refused":
+      deps.err(`jake: ${outcome.message}\n`);
+      return outcome.status === 409 ? EXIT_NO_AGENT : EXIT_FAILED;
+    case "error":
+      deps.err(`jake: the transfer failed [${outcome.code}]: ${outcome.message}\n`);
+      return EXIT_FAILED;
+    case "ended":
+      deps.err(`jake: connection ended: ${outcome.reason}\n`);
+      return EXIT_FAILED;
+  }
+}
+
+async function runUpload(command: { local: string; remote: string }, deps: CliDeps): Promise<number> {
+  let data: Uint8Array;
+  try {
+    data = await readFileOf(deps)(command.local);
+  } catch (error) {
+    deps.err(`jake: could not read ${command.local}: ${errorMessage(error)}\n`);
+    return EXIT_FAILED;
+  }
+
+  let outcome: TransferOutcome;
+  try {
+    outcome = await deps.client.upload(command.remote, data);
+  } catch (error) {
+    deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
+    return EXIT_FAILED;
+  }
+
+  if (outcome.kind !== "completed") {
+    return reportTransferFailure(outcome, deps);
+  }
+  deps.out(`uploaded ${command.local} -> ${command.remote} (${outcome.total} bytes)\n`);
+  return EXIT_OK;
+}
+
+async function runDownload(command: { remote: string; local: string }, deps: CliDeps): Promise<number> {
+  const chunks: Uint8Array[] = [];
+
+  let outcome: TransferOutcome;
+  try {
+    outcome = await deps.client.download(command.remote, { onChunk: (bytes) => chunks.push(bytes) });
+  } catch (error) {
+    deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
+    return EXIT_FAILED;
+  }
+
+  // A download is written to disk only once the hub has verified the assembled bytes, so a failed or
+  // partial transfer never leaves a half-written file behind.
+  if (outcome.kind !== "completed") {
+    return reportTransferFailure(outcome, deps);
+  }
+  try {
+    await writeFileOf(deps)(command.local, concatChunks(chunks));
+  } catch (error) {
+    deps.err(`jake: downloaded but could not write ${command.local}: ${errorMessage(error)}\n`);
+    return EXIT_FAILED;
+  }
+  deps.out(`downloaded ${command.remote} -> ${command.local} (${outcome.total} bytes)\n`);
+  return EXIT_OK;
+}
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 async function runTail(command: { after: number }, deps: CliDeps): Promise<number> {

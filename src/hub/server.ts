@@ -11,6 +11,9 @@ import {
   type ExecEvent,
   type ExecParams,
   type HubCoreOptions,
+  type StartResult,
+  type TransferEvent,
+  type TransferListener,
 } from "./core";
 import { renderConsolePage } from "./page";
 
@@ -73,6 +76,11 @@ function execEventFrame(event: ExecEvent): string {
   return sseFrame(kind, rest);
 }
 
+function transferEventFrame(event: TransferEvent): string {
+  const { kind, ...rest } = event;
+  return sseFrame(kind, rest);
+}
+
 function parseExecBody(body: unknown): ExecParams | { error: string } {
   if (typeof body !== "object" || body === null) {
     return { error: "body must be an object" };
@@ -108,9 +116,15 @@ function parseExecBody(body: unknown): ExecParams | { error: string } {
   return { shell, command: b.command, cwd, env, distro };
 }
 
-// --- The exec SSE stream -------------------------------------------------------------------------
+// --- The SSE streams: exec and transfer ----------------------------------------------------------
 
-function execStream(core: HubCore, params: ExecParams): Response {
+/**
+ * Build an SSE response driven by `begin`, which wires the stream's events to `write` and closes it
+ * with `finish`; if `begin` declines (no agent), the stream states the reason and ends. A keep-alive
+ * comment holds the control connection open through a stretch with no real events — a long command,
+ * or a large transfer between chunks — past its idle limit.
+ */
+function sseStream(begin: (write: (chunk: string) => void, finish: () => void) => StartResult): Response {
   const encoder = new TextEncoder();
   let keepAlive: ReturnType<typeof setInterval> | null = null;
   const stream = new ReadableStream<Uint8Array>({
@@ -142,20 +156,13 @@ function execStream(core: HubCore, params: ExecParams): Response {
         }
       };
 
-      const listener: CommandListener = {
-        push: (event) => write(execEventFrame(event)),
-        end: finish,
-      };
-
-      const started = core.startExec(params, listener);
+      const started = begin(write, finish);
       if (!started.ok) {
         write(sseFrame("ended", { reason: started.reason }));
         finish();
         return;
       }
 
-      // A command may run for a long stretch with no output; a keep-alive holds the control
-      // connection open past its idle limit until real events resume.
       keepAlive = setInterval(() => write(": ping\n\n"), PING_COMMENT_MS);
     },
     cancel() {
@@ -167,6 +174,27 @@ function execStream(core: HubCore, params: ExecParams): Response {
   });
 
   return new Response(stream, { headers: sseHeaders() });
+}
+
+function execStream(core: HubCore, params: ExecParams): Response {
+  return sseStream((write, finish) => {
+    const listener: CommandListener = { push: (event) => write(execEventFrame(event)), end: finish };
+    return core.startExec(params, listener);
+  });
+}
+
+function uploadStream(core: HubCore, path: string, data: Uint8Array): Response {
+  return sseStream((write, finish) => {
+    const listener: TransferListener = { push: (event) => write(transferEventFrame(event)), end: finish };
+    return core.startUpload({ path, data }, listener);
+  });
+}
+
+function downloadStream(core: HubCore, path: string): Response {
+  return sseStream((write, finish) => {
+    const listener: TransferListener = { push: (event) => write(transferEventFrame(event)), end: finish };
+    return core.startDownload({ path }, listener);
+  });
 }
 
 // --- The traffic tail SSE stream -----------------------------------------------------------------
@@ -238,6 +266,21 @@ async function route(core: HubCore, request: Request): Promise<Response> {
       return json({ error: "no agent attached" }, 409);
     }
     return execStream(core, params);
+  }
+
+  if (method === "POST" && (path === "/upload" || path === "/download")) {
+    const target = url.searchParams.get("path");
+    if (target === null || target === "") {
+      return json({ error: "the path query parameter is required" }, 400);
+    }
+    if (!core.status().attached) {
+      return json({ error: "no agent attached" }, 409);
+    }
+    if (path === "/upload") {
+      const data = new Uint8Array(await request.arrayBuffer());
+      return uploadStream(core, target, data);
+    }
+    return downloadStream(core, target);
   }
 
   if (method === "POST" && path === "/cancel") {

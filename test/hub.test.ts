@@ -4,11 +4,14 @@ import type { HubConfig } from "../src/config";
 import {
   DEFAULT_MAX_PAYLOAD_BYTES,
   PROTOCOL_VERSION,
+  checksum,
   decodeFrame,
+  encodeBytes,
   encodeFrame,
   type Frame,
 } from "../src/protocol";
 import { startHub, type RunningHub, type StartHubOptions } from "../src/hub/server";
+import { HubClient } from "../src/console/client";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -403,6 +406,83 @@ describe("exec streaming", () => {
       body: JSON.stringify({ shell: "powershell", command: "echo hi" }),
     });
     expect(response.status).toBe(409);
+  });
+});
+
+describe("file transfer over the control API", () => {
+  function hubClient(hub: RunningHub): HubClient {
+    return new HubClient({ baseUrl: `http://127.0.0.1:${hub.controlPort}`, token: CONTROL });
+  }
+
+  test("upload: the hub chunks the file to the agent, which acknowledges the verified write", async () => {
+    const hub = launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const client = hubClient(hub);
+
+    // Past the fixed chunk size, so more than one chunk frame must cross.
+    const content = new Uint8Array(300 * 1024).map((_, i) => i % 251);
+    const uploadP = client.upload("/remote/out.bin", content);
+
+    const begin = await agent.waitFor((f) => f.type === "transfer-begin");
+    const end = await agent.waitFor((f) => f.type === "transfer-end");
+    if (begin.type !== "transfer-begin" || end.type !== "transfer-end") throw new Error("unexpected frames");
+    expect(begin.direction).toBe("upload");
+    expect(begin.total).toBe(content.byteLength);
+    expect(begin.checksum).toBe(checksum(content));
+    expect(agent.received.filter((f) => f.type === "transfer-chunk").length).toBeGreaterThan(1);
+
+    // The agent verified and moved the file into place; it acknowledges by echoing an end frame.
+    agent.send({ type: "transfer-end", v: V, id: begin.id, total: begin.total ?? 0, checksum: begin.checksum ?? "" });
+
+    expect(await uploadP).toMatchObject({ kind: "completed", total: content.byteLength });
+  });
+
+  test("download: the agent streams the file and the hub verifies it before completing", async () => {
+    const hub = launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const client = hubClient(hub);
+
+    const content = new Uint8Array(300 * 1024).map((_, i) => (i * 7) % 251);
+    const sum = checksum(content);
+    const received: Uint8Array[] = [];
+    const downloadP = client.download("/remote/in.bin", { onChunk: (bytes) => received.push(bytes) });
+
+    const req = await agent.waitFor((f) => f.type === "transfer-begin");
+    if (req.type !== "transfer-begin") throw new Error("unexpected frame");
+    expect(req.direction).toBe("download");
+
+    agent.send({ type: "transfer-begin", v: V, id: req.id, direction: "download", path: req.path, total: content.byteLength, checksum: sum });
+    const half = content.byteLength >> 1;
+    agent.send({ type: "transfer-chunk", v: V, id: req.id, seq: 0, chunk: encodeBytes(content.subarray(0, half)) });
+    agent.send({ type: "transfer-chunk", v: V, id: req.id, seq: 1, chunk: encodeBytes(content.subarray(half)) });
+    agent.send({ type: "transfer-end", v: V, id: req.id, total: content.byteLength, checksum: sum });
+
+    expect(await downloadP).toMatchObject({ kind: "completed", total: content.byteLength, checksum: sum });
+
+    const assembled = new Uint8Array(received.reduce((n, c) => n + c.byteLength, 0));
+    let offset = 0;
+    for (const chunk of received) {
+      assembled.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    expect(assembled).toEqual(content);
+  });
+
+  test("a transfer with no path is a bad request", async () => {
+    const hub = launch();
+    await attach(hub.agentPort, ["transfer"]);
+    const up = await control(hub, "/upload", { method: "POST", body: new Blob([new Uint8Array([1])]) });
+    expect(up.status).toBe(400);
+    const down = await control(hub, "/download", { method: "POST" });
+    expect(down.status).toBe(400);
+  });
+
+  test("a transfer against a hub with no agent is refused", async () => {
+    const hub = launch();
+    const up = await control(hub, "/upload?path=/x", { method: "POST", body: new Blob([new Uint8Array([1])]) });
+    expect(up.status).toBe(409);
+    const down = await control(hub, "/download?path=/x", { method: "POST" });
+    expect(down.status).toBe(409);
   });
 });
 

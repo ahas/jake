@@ -245,7 +245,10 @@ give very different footing for keeping a per-user process running.
 - Both surfaces read the control token from the hub's configuration, not from an argument. The CLI
   runs one command and returns the agent's own exit code for an `exec`, so a caller branches on it as
   it would on a local shell; the page only reads and offers no control the CLI does not. The CLI also
-  carries the leave command that uninstalls the agent remotely; because it is irreversible, the CLI refuses it
+  moves a whole file across the tunnel in either direction — an upload of a local file onto the
+  machine, a download of a file on the machine back to main-host — each verified against its checksum
+  before it is reported done, and a download written to its local path only once that check passes. It
+  also carries the leave command that uninstalls the agent remotely; because it is irreversible, the CLI refuses it
   unless the intent is stated outright, and the read-only page cannot trigger it at all.
 - The page is the one route of the control API served without the token: a browser navigation cannot
   attach a bearer header, so the page comes back open and carries the token embedded in it, which its

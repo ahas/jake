@@ -154,6 +154,24 @@ describe("parseArgs", () => {
     expect(parseArgs(["fetch", "http://h/"])).toEqual({ ok: false, error: "unknown command 'fetch'" });
   });
 
+  test("upload needs exactly a local and a remote path", () => {
+    expect(parseArgs(["upload", "./a.txt", "C:/b.txt"])).toEqual({
+      ok: true,
+      command: { name: "upload", local: "./a.txt", remote: "C:/b.txt" },
+    });
+    expect(parseArgs(["upload", "only-one"]).ok).toBe(false);
+    expect(parseArgs(["upload", "a", "b", "c"]).ok).toBe(false);
+  });
+
+  test("download needs exactly a remote and a local path", () => {
+    expect(parseArgs(["download", "C:/r.bin", "./l.bin"])).toEqual({
+      ok: true,
+      command: { name: "download", remote: "C:/r.bin", local: "./l.bin" },
+    });
+    expect(parseArgs(["download"]).ok).toBe(false);
+    expect(parseArgs(["download", "one", "two", "three"]).ok).toBe(false);
+  });
+
   test("tail parses --after and rejects a bad value", () => {
     expect(parseArgs(["tail"])).toEqual({ ok: true, command: { name: "tail", after: 0 } });
     expect(parseArgs(["tail", "--after", "42"])).toEqual({ ok: true, command: { name: "tail", after: 42 } });
@@ -368,6 +386,87 @@ describe("exec streaming", () => {
     const cap = capture(client, { onExecStart: (id) => started.push(id) });
     await runCli(["exec", "x"], cap.deps);
     expect(started).toEqual(["c9"]);
+  });
+});
+
+// --- file transfer --------------------------------------------------------------------------------
+
+describe("upload", () => {
+  test("reads the local file, sends it to the remote path, and reports the byte total", async () => {
+    const { client, calls } = fakeHub({
+      "/upload": () => eventStreamResponse([sseEvent("started", { id: "u1" }), sseEvent("completed", { total: 5, checksum: "abc" })]),
+    });
+    const reads: string[] = [];
+    const cap = capture(client, {
+      readFile: async (path) => {
+        reads.push(path);
+        return encoder.encode("hello");
+      },
+    });
+    const code = await runCli(["upload", "./local.txt", "C:/remote.txt"], cap.deps);
+    expect(code).toBe(EXIT_OK);
+    expect(reads).toEqual(["./local.txt"]);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toContain("/upload?path=");
+    expect(calls[0]?.url).toContain(encodeURIComponent("C:/remote.txt"));
+    expect(cap.out.join("")).toContain("uploaded ./local.txt -> C:/remote.txt (5 bytes)");
+  });
+
+  test("a missing local file fails before reaching the hub", async () => {
+    const { client, calls } = fakeHub({ "/upload": () => eventStreamResponse([]) });
+    const cap = capture(client, {
+      readFile: async () => {
+        throw new Error("ENOENT");
+      },
+    });
+    const code = await runCli(["upload", "nope.txt", "C:/x"], cap.deps);
+    expect(code).toBe(EXIT_FAILED);
+    expect(calls).toHaveLength(0);
+    expect(cap.err.join("")).toContain("could not read nope.txt");
+  });
+
+  test("a hub with no agent refuses with the no-agent code", async () => {
+    const { client } = fakeHub({ "/upload": () => jsonResponse({ error: "no agent attached" }, 409) });
+    const cap = capture(client, { readFile: async () => encoder.encode("x") });
+    const code = await runCli(["upload", "a", "b"], cap.deps);
+    expect(code).toBe(EXIT_NO_AGENT);
+    expect(cap.err.join("")).toContain("no agent attached");
+  });
+});
+
+describe("download", () => {
+  test("assembles the streamed chunks in order and writes them once the transfer is verified", async () => {
+    const { client, calls } = fakeHub({
+      "/download": () =>
+        eventStreamResponse([
+          sseEvent("started", { id: "d1" }),
+          sseEvent("begin", { total: 6, checksum: "sum" }),
+          sseEvent("chunk", { seq: 0, chunk: chunkOf("abc") }),
+          sseEvent("chunk", { seq: 1, chunk: chunkOf("def") }),
+          sseEvent("completed", { total: 6, checksum: "sum" }),
+        ]),
+    });
+    const written: { path: string; data: Uint8Array }[] = [];
+    const cap = capture(client, { writeFile: async (path, data) => void written.push({ path, data }) });
+    const code = await runCli(["download", "C:/remote.bin", "./out.bin"], cap.deps);
+    expect(code).toBe(EXIT_OK);
+    expect(calls[0]?.url).toContain(encodeURIComponent("C:/remote.bin"));
+    expect(written).toHaveLength(1);
+    expect(written[0]?.path).toBe("./out.bin");
+    expect(new TextDecoder().decode(written[0]!.data)).toBe("abcdef");
+    expect(cap.out.join("")).toContain("downloaded C:/remote.bin -> ./out.bin (6 bytes)");
+  });
+
+  test("a failed transfer writes nothing and fails", async () => {
+    const { client } = fakeHub({
+      "/download": () => eventStreamResponse([sseEvent("started", { id: "d1" }), sseEvent("error", { code: "not-found", message: "no such file" })]),
+    });
+    const written: unknown[] = [];
+    const cap = capture(client, { writeFile: async () => void written.push(1) });
+    const code = await runCli(["download", "C:/missing", "./out"], cap.deps);
+    expect(code).toBe(EXIT_FAILED);
+    expect(written).toHaveLength(0);
+    expect(cap.err.join("")).toContain("not-found");
   });
 });
 
