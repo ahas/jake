@@ -4,9 +4,9 @@ The hub is the main-host side of the tunnel: the agent dials into it, and 비모
 the agent through it. This is the procedure that makes it run permanently on main-host and reachable
 from 하스's network as `jake.example.org`. The commands are given in the order they must run.
 
-Nothing here is run as part of building the hub. Creating the DNS record, writing the NPM proxy host
-and reloading nginx, and enabling the service all change live infrastructure, so they belong to a
-deployment turn, not to a build. Run them from main-host unless a step says otherwise.
+Nothing here is run as part of building the hub. Opening the firewall port, creating the DNS record,
+writing the NPM proxy host and reloading nginx, and enabling the service all change live
+infrastructure, so they belong to a deployment turn, not to a build. Run them from main-host unless a step says otherwise.
 
 The four committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
 config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, and this document.
@@ -29,7 +29,7 @@ chmod 600 ~/.local/share/jake/hub.env
 `JAKE_SECRET` and `JAKE_CONTROL_TOKEN` are required and have no default; leave the others commented to
 take their defaults. The hub listens on `JAKE_HUB_PORT` (8790 by default) bound to `JAKE_HUB_HOST`
 (0.0.0.0, so it accepts the connection NPM forwards). If you change the port here, change it in the
-nginx template in step 4 too — the two must agree. Record the same `JAKE_SECRET` in the agent's
+nginx template in step 5 too — the two must agree. Record the same `JAKE_SECRET` in the agent's
 `agent.env` on 하스's box so the agent authenticates.
 
 ## 2. The systemd user service
@@ -52,7 +52,20 @@ The unit will not start until the config file from step 1 exists — that is wha
 systemctl --user status jake-hub
 ```
 
-## 3. The DNS record
+## 3. The firewall opening
+
+main-host runs ufw, which drops every inbound port it has no rule for. NPM reaches the hub from its
+LXC at 192.168.0.101, so open the hub's port to that address alone; nothing else needs to reach it,
+because every agent comes in through NPM.
+
+```sh
+sudo ufw allow from 192.168.0.101 to any port 8790 proto tcp comment 'jake hub via NPM'
+```
+
+Without this rule the hub answers on loopback but NPM's connection hangs, and a request to
+`jake.example.org` times out rather than failing outright.
+
+## 4. The DNS record
 
 Add a CNAME `jake.example.org` -> `home.example.org`, DNS only (not proxied), in the `ahas.io` zone with the
 Cloudflare API token.
@@ -65,7 +78,7 @@ curl -s -X POST \
   --data '{"type":"CNAME","name":"jake","content":"home.example.org","proxied":false,"ttl":1}'
 ```
 
-## 4. The NPM proxy host
+## 5. The NPM proxy host
 
 A proxy host is two things that must agree: a row in the `proxy_host` table of NPM's database, and the
 generated nginx config. Write the row first, read back the id it was assigned, then write the config
@@ -86,7 +99,7 @@ db.run(
       forward_port, access_list_id, certificate_id, ssl_forced, caching_enabled, block_exploits,
       advanced_config, meta, allow_websocket_upgrade, http2_support, forward_scheme, enabled,
       locations, hsts_enabled, hsts_subdomains)
-   VALUES (?,?,1,0,?,?,?,0,76,1,0,0,?,?,1,1,"http",1,"[]",0,0)`,
+   VALUES (?,?,1,0,?,?,?,0,76,1,0,0,?,?,1,1,'http',1,'[]',0,0)`,
   [
     now, now,
     JSON.stringify(["jake.example.org"]),
@@ -113,19 +126,24 @@ sed "s/HOSTID/$ID/g" ~/repos/ahas/infra/jake/deploy/jake.example.org.conf \
 ssh mm "pct exec 109 -- sh -c 'nginx -t && nginx -s reload'"
 ```
 
-The port in the template must equal `JAKE_HUB_PORT` from step 1. The certificate needs nothing new: 76
-is the live `ahas.io, *.ahas.io` wildcard, and `jake.example.org` is covered by it.
+The port in the template must equal `JAKE_HUB_PORT` from step 1 and the port opened in step 3. The
+certificate needs nothing new: 76 is the live `ahas.io, *.ahas.io` wildcard, and `jake.example.org` is
+covered by it.
 
-## 5. Verify
+## 6. Verify
 
 ```sh
 systemctl --user status jake-hub                 # active (running)
-curl -sI https://jake.example.org/                   # HTTP 426 — the hub answers, expecting a WS upgrade
+curl -sI https://jake.example.org/                   # HTTP 401 — the hub answers, and wants the secret
+curl -sI -H "Authorization: Bearer $(grep '^JAKE_SECRET=' ~/.local/share/jake/hub.env | cut -d= -f2)" \
+  https://jake.example.org/                          # HTTP 426 — authorized, expecting a WS upgrade
 bun ~/repos/ahas/infra/jake/src/console/main.ts status   # whether the agent is attached
 ```
 
-A plain request to `jake.example.org` reaching the hub returns 426 (the agent server accepts only a
-WebSocket upgrade); that 426 is the proof the DNS -> router -> NPM -> hub path is whole. A 502 instead
-means NPM cannot reach the hub — recheck the port and that the service is running. The console's
-`status` runs against the loopback control API, which is never exposed through NPM; it is how you see,
-on main-host, whether 하스's agent has dialed in.
+The agent server checks the secret before anything else, so a plain request reaching the hub returns
+401, and the same request carrying the secret returns 426 because the server accepts only a WebSocket
+upgrade. Either code is the proof the DNS -> router -> NPM -> hub path is whole; the 426 also proves
+the secret in `hub.env` is the one the hub loaded. A 502 means NPM cannot reach the hub — recheck the
+port and that the service is running — and a timeout means the firewall rule from step 3 is missing.
+The console's `status` runs against the loopback control API, which is never exposed through NPM; it
+is how you see, on main-host, whether 하스's agent has dialed in.
