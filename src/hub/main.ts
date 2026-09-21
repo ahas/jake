@@ -1,6 +1,4 @@
-// The hub's entry point. It reads the single environment file, starts both servers, and stays up.
-// The systemd user unit that runs it permanently on main-host, and the config file it reads, are
-// laid down at deployment; nothing here is compiled into a binary.
+// The hub's entry point.
 
 import { hubFileEnv, loadHubConfig } from "../config";
 import { startHub } from "./server";

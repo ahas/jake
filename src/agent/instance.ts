@@ -1,14 +1,4 @@
-// The single-instance guard. Each binary is anchored three ways — a Run value, a Startup shortcut,
-// and a scheduled task — and all three fire at the same logon, so without a guard one logon would
-// start three copies of the same process, and a watchdog pair that multiplies itself is not staying
-// alive but multiplying. The guard lets exactly one copy of a binary run: the first to take the lock
-// proceeds, and a later copy that finds a live holder exits.
-//
-// The lock is a file created atomically — the OS lets exactly one exclusive create win, so even the
-// near-simultaneous copies a logon fires cannot both take it. The file holds the holder's pid, so a
-// lock left behind by a crashed process (its pid no longer alive) is reclaimed rather than blocking
-// the binary forever. The filesystem and the liveness check are seams, so every case is driven on
-// this machine by fakes. docs/architecture.md is the canonical statement of the staying-alive scheme.
+// The single-instance lock that lets one copy of a binary run.
 
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";

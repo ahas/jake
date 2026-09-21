@@ -1,11 +1,4 @@
-// The build step. It cross-compiles the single Windows executable from main-host — no Windows
-// toolchain is needed to produce it — and assembles the install layout the installer copies into
-// place. Run it with `bun scripts/build.ts`.
-//
-// The layout is one executable plus the example config, the install scripts, and the install guide;
-// the agent and the guard are two run modes of the same executable, so there is one binary, not two.
-// Nothing else is bundled: the agent's only capability is the shell already on 하스's box
-// (docs/architecture.md states this).
+// Cross-compiles the agent for Windows and Linux and assembles the install layout.
 
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
@@ -16,7 +9,12 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..");
 const distDir = join(repoRoot, "dist");
 const layoutDir = join(distDir, "jake");
-const target = "bun-windows-x64";
+
+/** The per-platform executables the layout ships: a bun compile target and the name it lands under. */
+const BINARIES: ReadonlyArray<{ target: string; outName: string }> = [
+  { target: "bun-windows-x64", outName: "jake.exe" },
+  { target: "bun-linux-x64", outName: "jake" },
+];
 
 /** Derive the build version: the package version, plus the git short hash and a dirty marker. */
 async function readVersion(): Promise<string> {
@@ -40,8 +38,8 @@ function git(args: string[]): string | null {
   return result.stdout.trim();
 }
 
-/** Cross-compile one entry point to a Windows exe in the layout, stamping the version in. */
-function compile(entry: string, outName: string, version: string): void {
+/** Cross-compile one entry point for one target into the layout, stamping the version in. */
+function compile(entry: string, target: string, outName: string, version: string): void {
   const out = join(layoutDir, outName);
   const result = spawnSync(
     "bun",
@@ -58,7 +56,7 @@ function compile(entry: string, outName: string, version: string): void {
     { cwd: repoRoot, stdio: "inherit" },
   );
   if (result.status !== 0) {
-    throw new Error(`compile failed for ${entry} (exit ${result.status ?? "signal"})`);
+    throw new Error(`compile failed for ${entry} → ${target} (exit ${result.status ?? "signal"})`);
   }
   if (!existsSync(out)) {
     throw new Error(`compile reported success but ${out} is missing`);
@@ -84,19 +82,26 @@ async function main(): Promise<void> {
   rmSync(layoutDir, { recursive: true, force: true });
   mkdirSync(layoutDir, { recursive: true });
 
-  console.log("· compiling jake.exe");
-  compile("src/main.ts", "jake.exe", version);
+  for (const { target, outName } of BINARIES) {
+    console.log(`· compiling ${outName} (${target})`);
+    compile("src/main.ts", target, outName, version);
+  }
 
-  console.log("· placing the example config and the install scripts");
+  console.log("· placing the example config, the install scripts, and the systemd unit");
   place("agent.env.example", "agent.env.example");
   place("scripts/install.ps1", "install.ps1");
   place("scripts/uninstall.ps1", "uninstall.ps1");
+  place("scripts/install.sh", "install.sh");
+  place("scripts/uninstall.sh", "uninstall.sh");
+  place("jake-agent.service", "jake-agent.service");
   place("docs/install.md", "INSTALL.md");
 
   console.log("\nlayout:");
-  console.log(`  jake.exe  ${sizeOf(join(layoutDir, "jake.exe"))}`);
-  console.log(`  agent.env.example, install.ps1, uninstall.ps1, INSTALL.md`);
-  console.log(`\ndone. version ${version} stamped into the executable.`);
+  for (const { outName } of BINARIES) {
+    console.log(`  ${outName}  ${sizeOf(join(layoutDir, outName))}`);
+  }
+  console.log(`  agent.env.example, install.ps1, uninstall.ps1, install.sh, uninstall.sh, jake-agent.service, INSTALL.md`);
+  console.log(`\ndone. version ${version} stamped into each executable.`);
 }
 
 void main().catch((error) => {

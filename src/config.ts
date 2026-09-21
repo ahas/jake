@@ -1,8 +1,4 @@
-// The config each side reads at startup. Nothing here is compiled into a binary: the agent and the
-// hub each read a single environment file — the agent's beside its exe, the hub's under its data
-// directory, outside the git tree, exactly as BMO keeps its own. The repo carries only the example
-// files. A missing or malformed key is reported by name and stops the process; a credential never
-// falls back to a built-in default.
+// The config each side reads from its environment file at startup.
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";

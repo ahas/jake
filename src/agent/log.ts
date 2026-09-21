@@ -1,8 +1,4 @@
-// A local rolling log. When something fails on 하스's machine, the hub may be exactly what is
-// unreachable, so the record of what the agent did has to live on the machine itself. The log is
-// bounded: it rotates by size and keeps a fixed number of old files, so a long-running agent cannot
-// fill the disk. The filesystem is injected, so rotation is exercised on Linux against an in-memory
-// stand-in without touching a real disk.
+// A local, size-bounded rolling log.
 
 import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname } from "node:path";

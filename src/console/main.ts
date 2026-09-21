@@ -1,8 +1,4 @@
-// The `jake` console entry point. It finds the hub's control port and token — from the hub's
-// environment file, the same one the hub reads, never from an argument — builds a client against the
-// loopback control API, and runs one command. It stays this thin: the parsing and every command live
-// in cli.ts, so they can be tested without a process. The compiled agent has nothing to do with this;
-// the console runs on main-host beside the hub.
+// The jake console entry point.
 
 import { hubFileEnv, loadConsoleConfig, type ConsoleConfig } from "../config";
 import { HubClient } from "./client";

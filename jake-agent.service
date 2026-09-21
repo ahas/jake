@@ -1,0 +1,23 @@
+[Unit]
+Description=jake agent — the bmo agent proxy on one of 하스's own machines
+After=network-online.target
+Wants=network-online.target
+# The agent reads its hub URL, shared secret, and name from the config file beside its binary; without
+# it the process could only crash-loop, so it does not start until the installer has written the file.
+# The file lives with the runtime data rather than in a git tree, where an untracked secret is one
+# `git clean` from gone.
+ConditionPathExists=%h/.local/share/jake/agent.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+WorkingDirectory=%h/.local/share/jake
+ExecStart=%h/.local/share/jake/jake
+Restart=always
+RestartSec=5
+# The same PATH BMO's units carry, so the shells and tools a command reaches for are found the same way
+# whether the agent was started by systemd or from a shell.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target

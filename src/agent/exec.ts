@@ -1,14 +1,4 @@
-// The exec capability: turning an exec frame into a running PowerShell or WSL command on 하스's
-// Windows box and streaming its output back through the tunnel as it is produced. Both shells are the
-// same primitive — a child process with piped stdout and stderr, read incrementally — so this module
-// is one runner over a spawner seam, and the two shells differ only in how their command line is
-// built. That construction is a pure function (buildWindowsInvocation), so it is checked without a
-// Windows machine; the streaming, cancellation, output cap, and timeout are checked on Linux by
-// pointing the runner at a POSIX stand-in shell through the same spawner seam.
-//
-// The connection core owns the wire: it assigns each chunk its sequence number, encodes the bytes,
-// and sends the frame. This runner only spawns, pushes raw bytes as they arrive, and reports once how
-// the run ended. docs/architecture.md is the canonical statement of the agent's shape.
+// The exec capability: running a command on the machine and streaming its output back.
 
 import type { ShellKind } from "../protocol";
 import type { ExecRequest, ExecRun, ExecRunner, ExecSink } from "./capability";
@@ -105,9 +95,24 @@ export function buildWslInvocation(request: ExecRequest): Invocation {
   return { file: "wsl.exe", args, cwd: null, env };
 }
 
-/** Build the invocation for whichever shell the request names. Pure, so both shapes are testable. */
+/** Build the invocation for whichever shell a Windows host names. Pure, so both shapes are testable. */
 export function buildWindowsInvocation(request: ExecRequest): Invocation {
   return request.shell === "wsl" ? buildWslInvocation(request) : buildPowerShellInvocation(request);
+}
+
+/**
+ * Build the invocation for a Linux run. The command runs through a login shell (`bash -lc`) so a
+ * `.bashrc`/`.profile` PATH and the like are in place, matching what a person gets at an interactive
+ * prompt. Unlike WSL there is no launcher and no `WSLENV` bridge — the shell is the host's own, so the
+ * working directory and the environment overlay apply directly at spawn, and `distro` has no meaning.
+ */
+export function buildLinuxInvocation(request: ExecRequest): Invocation {
+  return {
+    file: "bash",
+    args: ["-lc", request.command],
+    cwd: request.cwd,
+    env: request.env,
+  };
 }
 
 // --- The spawner seam ----------------------------------------------------------------------------
@@ -165,6 +170,56 @@ export const windowsSpawner: Spawner = {
   },
 };
 
+/**
+ * How long a Linux process group is given to exit on the polite signal before it is forced, in
+ * milliseconds. A tree that heeds SIGTERM leaves in far less; the forceful signal is the backstop.
+ */
+export const LINUX_TERM_GRACE_MS = 2_000;
+
+/**
+ * The production spawner on a Linux host. The command is launched under `setsid` so it leads a new
+ * process group; ending the tree then signals the whole group by its negative pid — SIGTERM first,
+ * escalating to SIGKILL if the group has not exited within the grace. That two-step is the Linux
+ * equivalent of `taskkill /T /F`: a shell that started something else does not leave it orphaned. The
+ * environment overlay is merged over the real environment rather than replacing it.
+ */
+export const linuxSpawner: Spawner = {
+  spawn(invocation) {
+    const proc = Bun.spawn(["setsid", invocation.file, ...invocation.args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: invocation.cwd ?? undefined,
+      env: { ...process.env, ...invocation.env },
+    });
+    return {
+      stdout: proc.stdout as ReadableStream<Uint8Array>,
+      stderr: proc.stderr as ReadableStream<Uint8Array>,
+      exited: proc.exited.then(() => ({ code: proc.exitCode, signal: proc.signalCode })),
+      killTree() {
+        if (proc.pid === undefined) {
+          return;
+        }
+        const group = -proc.pid;
+        try {
+          process.kill(group, "SIGTERM");
+        } catch {
+          return; // the group is already gone
+        }
+        const force = setTimeout(() => {
+          try {
+            process.kill(group, "SIGKILL");
+          } catch {
+            // the group left on the polite signal
+          }
+        }, LINUX_TERM_GRACE_MS);
+        // The escalation must not hold the process open, and it is moot once the group has exited.
+        force.unref?.();
+        void proc.exited.then(() => clearTimeout(force));
+      },
+    };
+  },
+};
+
 // --- The runner ----------------------------------------------------------------------------------
 
 /** What the shell runner needs: the spawner, a clock for the timeout, the two caps, and a log. */
@@ -178,7 +233,11 @@ export interface ShellRunnerOptions {
   timeoutMs: number;
   /** How each shell's command line is built. Defaults to the Windows construction. */
   buildInvocation?: (request: ExecRequest) => Invocation;
+  /** The shells this runner advertises and can run. Defaults to the Windows pair. */
+  shells?: readonly ShellKind[];
 }
+
+const DEFAULT_SHELLS: readonly ShellKind[] = ["powershell", "wsl"];
 
 // Why a run ended on jake's initiative, kept apart from a natural exit. Only "cancel" — an operator
 // stop — sets the exit frame's `canceled`; "cap" and "timeout" are jake stopping a runaway, and each
@@ -195,7 +254,8 @@ const NOOP_RUN: ExecRun = { cancel() {} };
  * a run that starts always ends through `exit`.
  */
 export class ShellRunner implements ExecRunner {
-  readonly capabilities: readonly string[] = [execCapability("powershell"), execCapability("wsl")];
+  /** The capability names announced in the hello: one per shell this runner's platform can run. */
+  readonly capabilities: readonly string[];
 
   private readonly spawner: Spawner;
   private readonly scheduler: Scheduler;
@@ -211,6 +271,7 @@ export class ShellRunner implements ExecRunner {
     this.maxOutputBytes = options.maxOutputBytes;
     this.timeoutMs = options.timeoutMs;
     this.buildInvocation = options.buildInvocation ?? buildWindowsInvocation;
+    this.capabilities = (options.shells ?? DEFAULT_SHELLS).map(execCapability);
   }
 
   start(request: ExecRequest, sink: ExecSink): ExecRun {

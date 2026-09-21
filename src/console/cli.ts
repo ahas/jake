@@ -1,10 +1,6 @@
-// The `jake` command line: the primary console surface and the handle a headless session on
-// main-host drives the agent through. It parses an argument vector into one command, runs it against
-// the hub client, and returns a process exit code — an exec propagates the remote command's code so
-// a caller can branch on it exactly as it would on a local shell. Nothing here reads a credential
-// from an argument; the token comes from the hub's config, wired in by main.
+// The jake command line: the primary console surface.
 
-import type { ShellKind } from "../protocol";
+import { isShellKind, SHELL_KINDS } from "../protocol";
 import type { StatusSnapshot, TrafficEntry } from "../hub/core";
 import type { ExecRequest, HubClient } from "./client";
 
@@ -13,14 +9,14 @@ export const EXIT_USAGE = 2;
 export const EXIT_NO_AGENT = 3;
 export const EXIT_FAILED = 4;
 
-export const USAGE = `jake — operator console for the remote-control agent
+export const USAGE = `jake — operator console for the bmo agent proxy
 
 Usage:
   jake status [--json]              show whether the agent is attached and what is in flight
   jake exec <command...>            run a command, stream its output, exit with the remote code
-      [--shell powershell|wsl] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
+      [--shell powershell|wsl|linux] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
   jake tail [--after <id>]          follow the frames crossing the tunnel
-  jake leave --yes                  erase the agent from the Windows box and detach for good
+  jake leave --yes                  erase the agent from the machine and detach for good
   jake help                         show this message
 
 Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
@@ -157,8 +153,8 @@ export function parseArgs(argv: string[]): ParseResult {
         return { ok: false, error: "exec needs a command to run" };
       }
       const shellRaw = firstFlag(parsed.flags, "shell") ?? "powershell";
-      if (shellRaw !== "powershell" && shellRaw !== "wsl") {
-        return { ok: false, error: `--shell must be 'powershell' or 'wsl' (got ${shellRaw})` };
+      if (!isShellKind(shellRaw)) {
+        return { ok: false, error: `--shell must be one of ${SHELL_KINDS.join("|")} (got ${shellRaw})` };
       }
       const env: Record<string, string> = {};
       for (const pair of parsed.flags.get("env") ?? []) {
@@ -169,7 +165,7 @@ export function parseArgs(argv: string[]): ParseResult {
         env[pair.slice(0, eq)] = pair.slice(eq + 1);
       }
       const request: ExecRequest = {
-        shell: shellRaw as ShellKind,
+        shell: shellRaw,
         command: commandText,
         cwd: firstFlag(parsed.flags, "cwd") ?? null,
         env,

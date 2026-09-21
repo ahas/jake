@@ -1,16 +1,35 @@
-// Every string that differs by operating system is produced here, by a pure function of the
-// platform name and an environment record, so it can be exercised on Linux even though it names
-// Windows locations. The agent runs on 하스's Windows box; these tests run on main-host. Keeping the
-// derivation pure is what lets the two coexist. docs/architecture.md is the canonical statement of
-// where the agent keeps its own files.
+// Every string and choice that differs by operating system, as pure functions.
 
 import nodePath from "node:path";
+
+import type { ShellKind } from "../protocol";
 
 /** The operating-system tag, as `process.platform` reports it. */
 export type Platform = string;
 
 /** A read-only view of environment variables, so the derivation takes no ambient dependency. */
 export type PlatformEnv = Record<string, string | undefined>;
+
+/**
+ * The shells a host can run a command through, by platform: a Windows host offers PowerShell and WSL,
+ * any other host its own Linux shell. The agent advertises only these, so the hub never offers a
+ * shell the machine cannot serve. Pure, so the platform gate is exercised on either OS under test.
+ */
+export function execShells(platform: Platform): ShellKind[] {
+  return platform === "win32" ? ["powershell", "wsl"] : ["linux"];
+}
+
+/** How the agent is kept alive on a host: the Windows self-healing pair, or a systemd user unit. */
+export type PersistenceKind = "windows-pair" | "systemd-user";
+
+/**
+ * Which staying-alive scheme a host uses. Windows has no per-user, boot-capable service manager, so
+ * it runs the agent/guard pair; every other host has systemd and runs the agent as a `systemd --user`
+ * unit. Pure, so the selection is exercised on either OS under test.
+ */
+export function persistenceKind(platform: Platform): PersistenceKind {
+  return platform === "win32" ? "windows-pair" : "systemd-user";
+}
 
 // Windows paths are built with the win32 flavour and POSIX paths with the posix flavour explicitly,
 // rather than the host's `path`, so a Windows path comes out with backslashes even when derived on
@@ -75,4 +94,43 @@ export function startupDir(env: PlatformEnv): string {
       ? appData
       : win.join(env.USERPROFILE !== undefined && env.USERPROFILE !== "" ? env.USERPROFILE : "C:\\", "AppData", "Roaming");
   return win.join(base, "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
+}
+
+/** The name of the agent's systemd user unit, as `systemctl --user` and `journalctl --user -u` use it. */
+export const SYSTEMD_UNIT_NAME = "jake-agent.service";
+
+/**
+ * Where the agent's systemd user unit file is written. systemd reads user units from under the XDG
+ * config home; XDG_CONFIG_HOME gives it directly, and $HOME/.config is the fallback. Always a POSIX
+ * path, so it is built with the posix flavour even when derived on Windows under test.
+ */
+export function systemdUnitPath(env: PlatformEnv): string {
+  const xdg = env.XDG_CONFIG_HOME;
+  const configHome =
+    xdg !== undefined && xdg !== ""
+      ? xdg
+      : posix.join(env.HOME !== undefined && env.HOME !== "" ? env.HOME : "/root", ".config");
+  return posix.join(configHome, "systemd", "user", SYSTEMD_UNIT_NAME);
+}
+
+/** Whether a systemd user unit can be managed on this host, or the reason it cannot. */
+export type SystemdAvailability = { available: true } | { available: false; reason: string };
+
+/**
+ * Decide whether `systemctl --user` can supervise the agent, given whether systemd is running as this
+ * system's init. A WSL distribution started without systemd has no user service manager, so a unit
+ * would never run — the caller fails loudly with the returned reason rather than registering one.
+ * Pure over the one fact, so the decision is exercised on any host under test.
+ */
+export function systemdUserAvailability(facts: { systemdAsInit: boolean }): SystemdAvailability {
+  if (facts.systemdAsInit) {
+    return { available: true };
+  }
+  return {
+    available: false,
+    reason:
+      "systemd is not running as this system's init, so `systemctl --user` cannot supervise the agent. " +
+      "On WSL, enable systemd (set `[boot] systemd=true` in /etc/wsl.conf, then run `wsl.exe --shutdown` " +
+      "from Windows) and try again.",
+  };
 }

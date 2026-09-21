@@ -1,14 +1,9 @@
-// The two servers that give the hub core a wire. One faces the agent: a WebSocket endpoint the
-// single agent dials out to, authenticated at the HTTP upgrade before the socket is accepted. The
-// other faces the console and 비모: a loopback-only HTTP control API that starts and cancels
-// commands, reads status, and streams traffic — the streaming shaped as SSE,
-// the same as BMO's control server. This module owns nothing but the plumbing; every decision lives
-// in the core.
+// The two servers that give the hub core a wire: one faces the agent, one the console.
 
 import type { Server, ServerWebSocket } from "bun";
 
 import type { HubConfig } from "../config";
-import type { ShellKind } from "../protocol";
+import { isShellKind, SHELL_KINDS } from "../protocol";
 import {
   HubCore,
   type AgentLink,
@@ -84,8 +79,8 @@ function parseExecBody(body: unknown): ExecParams | { error: string } {
   }
   const b = body as Record<string, unknown>;
   const shell = b.shell;
-  if (shell !== "powershell" && shell !== "wsl") {
-    return { error: "shell must be 'powershell' or 'wsl'" };
+  if (!isShellKind(shell)) {
+    return { error: `shell must be one of ${SHELL_KINDS.join(", ")}` };
   }
   if (typeof b.command !== "string") {
     return { error: "command must be a string" };
@@ -110,7 +105,7 @@ function parseExecBody(body: unknown): ExecParams | { error: string } {
   if (distro !== null && typeof distro !== "string") {
     return { error: "distro must be a string or null" };
   }
-  return { shell: shell as ShellKind, command: b.command, cwd, env, distro };
+  return { shell, command: b.command, cwd, env, distro };
 }
 
 // --- The exec SSE stream -------------------------------------------------------------------------

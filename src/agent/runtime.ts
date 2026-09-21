@@ -1,16 +1,11 @@
-// The agent's outermost layer: the shell-runner registration and the forever reconnect loop. The
-// runner is registered before the agent runs, so the hello list is exactly the shells it can run.
-// The loop dials the hub, runs one connection over the socket it gets, and when that
-// connection ends — for any reason — waits out a backoff and dials again, without end. A connection
-// that stayed up long enough to be worth trusting resets the backoff, so an occasional flap does not
-// push the delay toward its ceiling while a genuine outage still does. The dialer, the clock, and
-// the randomness are injected, so the whole loop is driven on Linux by fakes.
+// The agent's forever reconnect loop and shell-runner registration.
 
 import type { AgentConfig } from "../config";
 import { backoffDelay, type BackoffOptions } from "./backoff";
 import type { ExecRunner } from "./capability";
 import { AgentConnection, type ConnectionDeps, type ConnectionOutcome } from "./connection";
 import type { Logger } from "./log";
+import type { TransferRunner } from "./transfer";
 import type { Dialer, Scheduler, Transport, TransportEvents } from "./transport";
 
 /** The injected seams and knobs the runtime needs beyond the agent's own config. */
@@ -43,6 +38,7 @@ export class AgentRuntime {
   private readonly deps: RuntimeDeps;
 
   private execRunner: ExecRunner | null = null;
+  private transferRunner: TransferRunner | null = null;
 
   private stopped = false;
   private currentConnection: AgentConnection | null = null;
@@ -61,9 +57,20 @@ export class AgentRuntime {
     this.execRunner = runner;
   }
 
-  /** The capability names to announce: the shells the registered runner can run. */
+  /** Register the file-transfer runner. Exactly one may be registered. */
+  registerTransfer(runner: TransferRunner): void {
+    if (this.transferRunner !== null) {
+      throw new Error("a transfer runner is already registered");
+    }
+    this.transferRunner = runner;
+  }
+
+  /** The capability names to announce: the shells the exec runner can run, and file transfer if present. */
   capabilities(): string[] {
-    return this.execRunner === null ? [] : [...this.execRunner.capabilities];
+    return [
+      ...(this.execRunner === null ? [] : this.execRunner.capabilities),
+      ...(this.transferRunner === null ? [] : this.transferRunner.capabilities),
+    ];
   }
 
   /** Dial and redial forever, running one connection at a time, until `stop` is called. */
@@ -121,6 +128,7 @@ export class AgentRuntime {
       agentVersion: this.deps.agentVersion,
       capabilities: this.capabilities(),
       execRunner: this.execRunner,
+      transferRunner: this.transferRunner,
       heartbeatMs: this.config.heartbeatMs,
       missedHeartbeatLimit: this.deps.missedHeartbeatLimit ?? DEFAULT_MISSED_HEARTBEAT_LIMIT,
       maxPayloadBytes: this.config.maxPayloadBytes,

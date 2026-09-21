@@ -1,17 +1,18 @@
 <#
 .SYNOPSIS
-  Install the jake remote-control agent for the current user, non-elevated.
+  Install the jake agent (a bmo agent proxy) for the current user, non-elevated.
 
 .DESCRIPTION
-  Run this from inside the folder it ships in (the build layout), in your own PowerShell session —
-  no administrator rights are needed. It copies the executable to a per-user location, writes the hub
-  URL and shared secret you give it into the config file beside it, registers the three per-user
-  autostart anchors for both run modes (the agent and its guard), starts the pair, and then reports
-  whether the agent reached the hub.
+  Two ways in, one script. The one-liner `powershell -c "irm <base>/install.ps1 | iex"` downloads the
+  executable from the same base and installs it; run from inside the build folder it ships in it
+  installs the executable sitting beside it. Either way it copies the executable to a per-user
+  location, writes the hub URL and shared secret you give it into the config file beside it, registers
+  the three per-user autostart anchors for both run modes (the agent and its guard), starts the pair,
+  and then reports whether the agent reached the hub. No administrator rights are needed.
 
   jake is one executable run two ways: the agent carries the tunnel and runs PowerShell and WSL
-  commands, and the guard is a small supervisor that watches the agent and brings it back. Both run
-  from the same jake.exe, the guard with a flag. Nothing else is installed or downloaded.
+  commands and moves files, and the guard is a small supervisor that watches the agent and brings it
+  back. Both run from the same jake.exe, the guard with a flag. Nothing else is installed.
 
   It is safe to run again over an existing install: the anchors are overwritten in place rather than
   duplicated, a running pair is stopped before its exe is replaced and started again afterwards, and
@@ -45,8 +46,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Payload = $PSScriptRoot
 
+$Base = 'https://ai.example.org/bmo/jake'
 $Binary = 'jake.exe'
 $AgentAnchor = 'JakeAgent'
 $GuardAnchor = 'JakeGuard'
@@ -106,8 +107,24 @@ function Resolve-Value($current, $key, $prompt, [switch]$secret) {
 }
 
 Write-Host "jake agent installer" -ForegroundColor White
+
+# Resolve the payload: the build folder this script sits in, or a temp folder downloaded from the base
+# when the script is run through the one-liner (irm | iex), where there is no build folder beside it.
+$TempPayload = $null
+if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $Binary))) {
+  $Payload = $PSScriptRoot
+} else {
+  Write-Step "downloading the agent from $Base"
+  $TempPayload = Join-Path ([System.IO.Path]::GetTempPath()) ("jake-install-" + [System.Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Force -Path $TempPayload | Out-Null
+  Invoke-WebRequest -Uri "$Base/$Binary" -OutFile (Join-Path $TempPayload $Binary) -UseBasicParsing
+  foreach ($name in @('uninstall.ps1', 'agent.env.example', 'INSTALL.md')) {
+    try { Invoke-WebRequest -Uri "$Base/$name" -OutFile (Join-Path $TempPayload $name) -UseBasicParsing } catch { }
+  }
+  $Payload = $TempPayload
+}
 if (-not (Test-Path (Join-Path $Payload $Binary))) {
-  throw "Run this from the folder that contains $Binary."
+  throw "Could not find or download $Binary."
 }
 
 $HubUrl    = Resolve-Value $HubUrl    'JAKE_HUB_URL'    'Hub URL (e.g. wss://jake.example.org)'
@@ -132,6 +149,10 @@ foreach ($name in @($Binary, 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')
 }
 $Exe = Join-Path $InstallDir $Binary
 Write-Ok "executable in place"
+
+if ($TempPayload -and (Test-Path $TempPayload)) {
+  Remove-Item -LiteralPath $TempPayload -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # --- write agent.env, preserving any existing tuning keys ---------------------------------------
 

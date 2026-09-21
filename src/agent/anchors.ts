@@ -1,14 +1,4 @@
-// The three autostart anchors, built as pure command and value construction so they can be checked
-// without a Windows machine. All three are per-user and need no elevation: a value under the
-// per-user registry Run key, a shortcut in the per-user Startup folder, and a scheduled task with a
-// logon trigger and no stored credentials. A running process rewrites every anchor on each watchdog
-// tick, so the wipe of any one is repaired within a tick as long as either process of the pair is
-// alive. docs/architecture.md is the canonical statement of the staying-alive scheme.
-//
-// The consequence of staying per-user is stated there and holds here: every anchor fires at this
-// user's interactive logon, never at raw boot, because a boot-time or run-whether-logged-on-or-not
-// registration would need an administrator account the install may not have. Recovery after a kill
-// that ends both processes is therefore bound to the next interactive logon.
+// The three per-user Windows autostart anchors, as pure command and value construction.
 
 import nodePath from "node:path";
 

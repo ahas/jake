@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Remove the jake agent (a bmo agent proxy) and its systemd user service for the current user.
+
+set -euo pipefail
+
+DATA_DIR="$HOME/.local/share/jake"
+BIN="$DATA_DIR/jake"
+UNIT_NAME="jake-agent.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT="$UNIT_DIR/$UNIT_NAME"
+
+step() { printf '\033[36m· %s\033[0m\n' "$1"; }
+die()  { printf '\033[31mjake uninstall failed: %s\033[0m\n' "$1" >&2; exit 1; }
+
+REMOVE_CONFIG=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remove-config) REMOVE_CONFIG=1; shift ;;
+    -h|--help)
+      cat <<EOF
+Remove the jake agent for the current user (Linux/WSL).
+
+  ./uninstall.sh                  keep agent.env and the log for a later reinstall
+  ./uninstall.sh --remove-config  delete the whole per-user tree, leaving nothing behind
+EOF
+      exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+done
+
+echo "jake agent uninstaller"
+
+# Disable and stop the unit so nothing restarts it, then remove it and have systemd forget it. Absence
+# of the service is not an error — the point is that none remains afterwards.
+step "stopping and disabling the user service"
+systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+
+step "removing the unit"
+rm -f "$UNIT"
+systemctl --user daemon-reload 2>/dev/null || true
+
+step "deleting the install layout"
+if [ "$REMOVE_CONFIG" -eq 1 ]; then
+  rm -rf "$DATA_DIR"
+else
+  # Keep agent.env and the log; drop only the binary and the uninstaller copy.
+  rm -f "$BIN" "$DATA_DIR/jake.new" "$DATA_DIR/uninstall.sh"
+fi
+
+echo ""
+if [ "$REMOVE_CONFIG" -eq 1 ]; then
+  echo "Removed. Nothing is left behind."
+else
+  echo "Removed. Your config is kept at $DATA_DIR/agent.env and the log at $DATA_DIR/agent.log."
+  echo "Pass --remove-config to delete those too."
+fi

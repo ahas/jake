@@ -1,8 +1,4 @@
-// The seams the agent core reaches the outside world through. The socket it dials over and the
-// timers it schedules on are both injected here rather than reached for directly, so the core's
-// reconnect, heartbeat, and dispatch can be driven on Linux by a fake socket and a fake clock. The
-// real implementations at the bottom of this file are the only place a live WebSocket or the global
-// timers are touched.
+// The injected socket and timer seams the agent core reaches the outside world through.
 
 /** One open connection to the hub, from the agent's side. The core sends over it and closes it. */
 export interface Transport {

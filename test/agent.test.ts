@@ -202,6 +202,7 @@ function buildConn(overrides: Partial<ConnectionDeps> = {}): ConnHarness {
     agentVersion: "0.1.0",
     capabilities: [],
     execRunner: null,
+    transferRunner: null,
     heartbeatMs: 1_000,
     missedHeartbeatLimit: 3,
     maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,

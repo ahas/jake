@@ -1,9 +1,4 @@
-// Wiring for the staying-alive scheme, shared by the two binaries so each builds its watchdog the
-// same way and only names differ. Each binary watches the other: the agent (tunnel carrier) watches
-// the guard, and the guard (the small supervisor with no capabilities) watches the agent. Both
-// rewrite every anchor and both relaunch a stale peer, so neither is privileged and either alone
-// keeps the pair and its anchors intact. This module only assembles the real seams; the decision it
-// serves lives in Watchdog, which is tested against fakes. docs/architecture.md is canonical.
+// Wiring for the Windows staying-alive scheme, shared by the two binaries.
 
 import type { AgentConfig } from "../config";
 import {

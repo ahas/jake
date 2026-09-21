@@ -1,7 +1,4 @@
-// A minimal Server-Sent Events reader for the console's streaming endpoints. The hub emits SSE for
-// the exec stream and the traffic tail; this turns a Response body into parsed events and drops the
-// keep-alive comments the hub sends to hold an idle connection open. It is the console's mirror of
-// the same wire the hub's control server writes.
+// A minimal Server-Sent Events reader for the console's streaming endpoints.
 
 export interface SseEvent {
   event: string;

@@ -1,11 +1,14 @@
 # jake shell recipes
 
-The agent's only capability is the shell (docs/architecture.md, "Only a shell"). Everything else is a
-command sent through `jake exec` from main-host. These are the commands for the common cases.
+The shell is what the agent runs (docs/architecture.md, "What crosses the tunnel"). Most of what BMO
+needs from the machine is a command sent through `jake exec` from main-host; these are the commands
+for the common cases. Moving a whole file is the exception — the tunnel's own file transfer carries
+it end to end (docs/architecture.md, "Moving files"), so the base64-through-a-command trick below is
+for a binary that a command produces inline, not for transferring a file that already exists.
 
 ## How a binary result crosses
 
-- The console prints a command's stdout as text, so a binary result — a PNG, a downloaded file — is
+- The console prints a command's stdout as text, so a binary result — a PNG, an inline blob — is
   printed as base64 by the remote command and decoded on main-host with `base64 -d`.
 - The output cap (`JAKE_EXEC_MAX_OUTPUT_BYTES`, 8 MiB by default) counts the base64 text, which is a
   third larger than the bytes. A result past it is cut off and the command is stopped. The reason

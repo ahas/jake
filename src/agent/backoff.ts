@@ -1,8 +1,4 @@
-// The delay between one failed dial and the next. The agent redials forever — a hub that is down
-// for a day must not leave the agent permanently quiet — so the delay grows with each consecutive
-// failure but is capped, and it is jittered so that a fleet of agents (or one agent retrying fast)
-// does not fall into a lockstep of identical retries. This is a pure function of the attempt number
-// and a random source, so it is checked directly.
+// Jittered exponential backoff for the agent's redial loop.
 
 export interface BackoffOptions {
   /** The base delay, used for the first retry, in milliseconds. */

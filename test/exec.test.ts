@@ -5,17 +5,20 @@ import { join } from "node:path";
 
 import type { ExecRequest, ExecSink } from "../src/agent/capability";
 import {
+  buildLinuxInvocation,
   buildWindowsInvocation,
   buildPowerShellInvocation,
   buildWslInvocation,
   encodePowerShellScript,
   execCapability,
+  linuxSpawner,
   ShellRunner,
   treeKillCommand,
   type Invocation,
   type Spawner,
 } from "../src/agent/exec";
 import { nullLogger } from "../src/agent/log";
+import { execShells } from "../src/agent/platform";
 import { systemScheduler } from "../src/agent/transport";
 
 // --- A request builder and a capturing sink -------------------------------------------------------
@@ -124,6 +127,21 @@ function posixRunner(overrides: { maxOutputBytes?: number; timeoutMs?: number } 
   });
 }
 
+// The production Linux seams themselves: the real linuxSpawner (setsid + process-group signalling) and
+// the real buildLinuxInvocation (bash login shell). main-host is Linux, so this exercises the shipped
+// Linux path directly rather than through the POSIX stand-in the Windows tests use.
+function linuxRunner(overrides: { maxOutputBytes?: number; timeoutMs?: number } = {}): ShellRunner {
+  return new ShellRunner({
+    spawner: linuxSpawner,
+    scheduler: systemScheduler,
+    log: nullLogger,
+    maxOutputBytes: overrides.maxOutputBytes ?? 1024 * 1024,
+    timeoutMs: overrides.timeoutMs ?? 30_000,
+    shells: ["linux"],
+    buildInvocation: buildLinuxInvocation,
+  });
+}
+
 // --- Command-line construction (pure) ------------------------------------------------------------
 
 describe("buildWindowsInvocation — PowerShell", () => {
@@ -203,6 +221,49 @@ describe("buildWindowsInvocation — dispatch and helpers", () => {
     const runner = posixRunner();
     expect([...runner.capabilities]).toEqual(["exec:powershell", "exec:wsl"]);
     expect(execCapability("wsl")).toBe("exec:wsl");
+  });
+});
+
+describe("buildLinuxInvocation", () => {
+  test("runs the command through a login shell", () => {
+    const inv = buildLinuxInvocation(request({ shell: "linux", command: "ls -la" }));
+    expect(inv.file).toBe("bash");
+    expect(inv.args).toEqual(["-lc", "ls -la"]);
+  });
+
+  test("passes the working directory and env overlay through directly", () => {
+    const inv = buildLinuxInvocation(request({ shell: "linux", cwd: "/home/hass", env: { FOO: "bar" } }));
+    expect(inv.cwd).toBe("/home/hass");
+    expect(inv.env).toEqual({ FOO: "bar" });
+  });
+
+  test("carries no WSLENV bridge and does not read the distro", () => {
+    const inv = buildLinuxInvocation(request({ shell: "linux", command: "env", env: { A: "1" }, distro: "Ubuntu" }));
+    expect(inv.env).toEqual({ A: "1" });
+    expect(inv.env.WSLENV).toBeUndefined();
+  });
+});
+
+describe("platform-gated shells", () => {
+  test("a Windows host offers PowerShell and WSL; any other host its own Linux shell", () => {
+    expect(execShells("win32")).toEqual(["powershell", "wsl"]);
+    expect(execShells("linux")).toEqual(["linux"]);
+    expect(execShells("darwin")).toEqual(["linux"]);
+  });
+
+  test("a runner announces exactly the capabilities of the shells it is built for", () => {
+    expect([...linuxRunner().capabilities]).toEqual(["exec:linux"]);
+
+    const windows = new ShellRunner({
+      spawner: posixSpawner,
+      scheduler: systemScheduler,
+      log: nullLogger,
+      maxOutputBytes: 1024,
+      timeoutMs: 1000,
+      shells: execShells("win32"),
+    });
+    expect([...windows.capabilities]).toEqual(["exec:powershell", "exec:wsl"]);
+    expect(execCapability("linux")).toBe("exec:linux");
   });
 });
 
@@ -379,4 +440,52 @@ describe("ShellRunner failure to start", () => {
     await sink.done;
     expect(sink.failure?.code).toBe("build-failed");
   });
+});
+
+// The shipped Linux seams end to end: buildLinuxInvocation feeding the real linuxSpawner. This is what
+// proves the Linux runner round-trips and that its platform-aware termination — a process-group
+// signal, not Windows taskkill — actually reaps a whole tree.
+describe("ShellRunner on the production Linux spawner", () => {
+  test(
+    "a Linux shell round-trips a command's output and exit code",
+    async () => {
+      const sink = new CaptureSink();
+      linuxRunner().start(request({ shell: "linux", command: "echo hi" }), sink);
+      await sink.done;
+      expect(sink.text("stdout")).toContain("hi");
+      expect(sink.exitOutcome).toEqual({ code: 0, signal: null, canceled: false });
+    },
+    10_000,
+  );
+
+  test(
+    "a cancel ends the whole process tree, not just the immediate child",
+    async () => {
+      const marker = join(realpathSync(mkdtempSync(join(tmpdir(), "jake-exec-"))), "alive");
+      const sink = new CaptureSink();
+      const ready = new Promise<void>((resolve) => {
+        sink.onFirst = resolve;
+      });
+      // The immediate child echoes `ready`, then a grandchild touches the marker forever; `wait` keeps
+      // the child alive so the tree — reached only through the process group — is what must be killed.
+      const command = `sh -c 'while true; do sleep 0.1; touch ${marker}; done' & echo ready; wait`;
+      const run = linuxRunner().start(request({ shell: "linux", command }), sink);
+
+      await ready;
+      for (let i = 0; i < 40 && !existsSync(marker); i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(existsSync(marker)).toBe(true);
+
+      run.cancel();
+      await sink.done;
+      expect(sink.exitOutcome?.canceled).toBe(true);
+
+      // The grandchild must have died with the group: the marker stops being touched.
+      const before = statSync(marker).mtimeMs;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(statSync(marker).mtimeMs).toBe(before);
+    },
+    10_000,
+  );
 });

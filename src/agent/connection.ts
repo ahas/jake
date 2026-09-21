@@ -1,10 +1,4 @@
-// One connection to the hub, from the agent's side, with no dialing or reconnecting in it. It sends
-// the hello, dispatches every inbound frame to the handler its type belongs to, streams command
-// output back, keeps the connection alive with a heartbeat, and — the property that matters most
-// when a socket drops — abandons every run in flight rather than leaving one streaming into a
-// socket that is gone. The transport and the clock are injected, so all of this is driven on Linux
-// by a fake. The reconnect loop that feeds it one transport after another is in
-// runtime.ts; docs/architecture.md is the canonical statement of the agent's shape.
+// One agent-side connection to the hub, with no dialing or reconnecting in it.
 
 import {
   PROTOCOL_VERSION,
@@ -18,10 +12,15 @@ import {
   type FrameType,
   type PingFrame,
   type RejectFrame,
+  type TransferBeginFrame,
+  type TransferChunkFrame,
+  type TransferDirection,
+  type TransferEndFrame,
   type WelcomeFrame,
 } from "../protocol";
 import type { ExecRun, ExecRunner, ExecSink } from "./capability";
 import type { Logger } from "./log";
+import type { TransferRunner, TransferSink } from "./transfer";
 import type { Scheduler, TimerHandle, Transport } from "./transport";
 
 const V = PROTOCOL_VERSION;
@@ -34,6 +33,8 @@ export interface ConnectionDeps {
   capabilities: string[];
   /** The shell runner, or null when this build has no exec capability. */
   execRunner: ExecRunner | null;
+  /** The file-transfer runner, or null when this build has no transfer capability. */
+  transferRunner: TransferRunner | null;
   /** How often to send a ping and check the hub for silence. */
   heartbeatMs: number;
   /** How many heartbeat windows of silence mark the connection dead and worth redialing. */
@@ -148,6 +149,9 @@ export class AgentConnection {
       cancel: (frame) => this.onCancel(frame),
       leave: () => this.onLeave(),
       error: (frame) => this.onInboundError(frame),
+      "transfer-begin": (frame) => this.onTransferBegin(frame),
+      "transfer-chunk": (frame) => this.onTransferChunk(frame),
+      "transfer-end": (frame) => this.onTransferEnd(frame),
       hello: ignore,
       stdout: ignore,
       stderr: ignore,
@@ -201,6 +205,37 @@ export class AgentConnection {
     // The agent makes no requests of the hub, so an inbound error answers nothing here; it is only
     // recorded, so the reason is legible afterwards in the local log.
     this.deps.log.log("warn", "hub-error", { id: frame.id, code: frame.code, message: frame.message });
+  }
+
+  // --- File transfer ----------------------------------------------------------------------------
+
+  private onTransferBegin(frame: TransferBeginFrame): void {
+    const runner = this.deps.transferRunner;
+    if (runner === null) {
+      this.send({ type: "error", v: V, id: frame.id, code: "unsupported", message: "this agent has no transfer capability" });
+      return;
+    }
+    const sink = this.makeTransferSink(frame.id, frame.direction, frame.path);
+    runner.begin({ id: frame.id, direction: frame.direction, path: frame.path, total: frame.total, checksum: frame.checksum }, sink);
+  }
+
+  private onTransferChunk(frame: TransferChunkFrame): void {
+    this.deps.transferRunner?.chunk(frame.id, frame.seq, frame.chunk);
+  }
+
+  private onTransferEnd(frame: TransferEndFrame): void {
+    this.deps.transferRunner?.end(frame.id, frame.total, frame.checksum);
+  }
+
+  // The outbound side of one transfer. The runner supplies data and outcomes; the core owns the wire,
+  // so it closes over the id, direction, and path and turns each call into the frame it belongs to.
+  private makeTransferSink(id: string, direction: TransferDirection, path: string): TransferSink {
+    return {
+      begin: (total, checksum) => this.send({ type: "transfer-begin", v: V, id, direction, path, total, checksum }),
+      chunk: (seq, bytes) => this.send({ type: "transfer-chunk", v: V, id, seq, chunk: encodeBytes(bytes) }),
+      end: (total, checksum) => this.send({ type: "transfer-end", v: V, id, total, checksum }),
+      fail: (code, message) => this.send({ type: "error", v: V, id, code, message }),
+    };
   }
 
   // --- The per-run output sink ------------------------------------------------------------------
@@ -263,6 +298,14 @@ export class AgentConnection {
       }
     }
     this.runs.clear();
+
+    // A transfer in flight is dropped the same way: a download stops streaming, and an upload's
+    // half-written temp is discarded rather than left behind.
+    try {
+      this.deps.transferRunner?.abandon();
+    } catch (error) {
+      this.deps.log.log("warn", "transfer-abandon-threw", { error: error instanceof Error ? error.message : String(error) });
+    }
 
     try {
       this.transport.close();

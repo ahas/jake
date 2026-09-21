@@ -1,19 +1,22 @@
-// The hub's heart, with no transport in it. It holds the single agent connection, routes every
-// frame that crosses the tunnel, tracks the commands in flight, probes the agent for
-// liveness, and keeps a bounded log of recent traffic so a console attaching late sees what just
-// happened. The Bun servers in server.ts feed it raw frames and expose its operations; this module
-// never touches a socket except through the small AgentLink it is handed. docs/architecture.md is
-// the canonical statement of the hub's role.
+// The hub's core: it holds the agent connection and routes every frame, with no transport in it.
+
+import { createHash } from "node:crypto";
 
 import {
+  CHECKSUM_ALGORITHM,
   PROTOCOL_VERSION,
+  TRANSFER_CHUNK_BYTES,
+  checksum,
+  decodeBytes,
   decodeFrame,
+  encodeBytes,
   encodeFrame,
   type EncodedBytes,
   type Frame,
   type FrameType,
   type HelloFrame,
   type ShellKind,
+  type TransferDirection,
 } from "../protocol";
 
 /**
@@ -53,6 +56,39 @@ export interface ExecParams {
   cwd: string | null;
   env: Record<string, string>;
   distro: string | null;
+}
+
+/**
+ * One event in a transfer's life, delivered to whichever control caller owns it. A download reports
+ * `begin` (the agent's declared size and checksum) then a run of `chunk`; both directions end in a
+ * terminal `completed` (verified), `error`, or `ended`.
+ */
+export type TransferEvent =
+  | { kind: "started"; id: string }
+  | { kind: "begin"; total: number; checksum: string }
+  | { kind: "chunk"; seq: number; chunk: EncodedBytes }
+  | { kind: "completed"; total: number; checksum: string }
+  | { kind: "error"; code: string; message: string }
+  | { kind: "ended"; reason: string };
+
+/**
+ * What a control caller supplies to receive a transfer's events. The hub pushes each event and then
+ * calls `end` exactly once, after a terminal event. A caller that has gone away makes `push` a no-op.
+ */
+export interface TransferListener {
+  push(event: TransferEvent): void;
+  end(): void;
+}
+
+/** An upload a control caller starts: the bytes to write and the path to write them to on the machine. */
+export interface UploadParams {
+  path: string;
+  data: Uint8Array;
+}
+
+/** A download a control caller starts: the path to read back from the machine. */
+export interface DownloadParams {
+  path: string;
 }
 
 export type StartResult = { ok: true; id: string } | { ok: false; reason: string };
@@ -129,6 +165,18 @@ interface Command {
   listener: CommandListener;
 }
 
+// One transfer in flight. On an upload the hub is the sender and only waits for the agent's ack; on a
+// download the hub is the receiver, so it advances a running hash and byte count as chunks arrive and
+// checks them against the agent's declared total and checksum when the transfer closes.
+interface Transfer {
+  id: string;
+  direction: TransferDirection;
+  listener: TransferListener;
+  expectedSeq: number;
+  received: number;
+  hash: ReturnType<typeof createHash> | null;
+}
+
 export class HubCore {
   private readonly options: Required<HubCoreOptions>;
   /** A random tag for this process, so a console can detect a hub restart and re-sync its cursor. */
@@ -136,6 +184,7 @@ export class HubCore {
 
   private current: AttachedAgent | null = null;
   private readonly commands = new Map<string, Command>();
+  private readonly transfers = new Map<string, Transfer>();
 
   private readonly traffic: TrafficEntry[] = [];
   private trafficSeq = 0;
@@ -245,13 +294,18 @@ export class HubCore {
       agent.link.close(CLOSE_HUB_INITIATED, reason);
     }
 
-    // Nothing in flight can outlive the socket it streamed over: end every command rather than leave
-    // a control caller hanging.
+    // Nothing in flight can outlive the socket it streamed over: end every command and every transfer
+    // rather than leave a control caller hanging.
     for (const command of this.commands.values()) {
       command.listener.push({ kind: "ended", reason });
       command.listener.end();
     }
     this.commands.clear();
+    for (const transfer of this.transfers.values()) {
+      transfer.listener.push({ kind: "ended", reason });
+      transfer.listener.end();
+    }
+    this.transfers.clear();
   }
 
   private pingTick(): void {
@@ -300,13 +354,71 @@ export class HubCore {
       }
       case "error": {
         // An error answers a command the agent refused before it could stream (an unknown shell, a
-        // spawn failure, say).
+        // spawn failure, say), or a transfer that failed (a missing file, a bad checksum).
         const command = this.commands.get(frame.id);
         if (command !== undefined) {
           command.listener.push({ kind: "error", code: frame.code, message: frame.message });
           command.listener.end();
           this.commands.delete(frame.id);
+          return;
         }
+        const transfer = this.transfers.get(frame.id);
+        if (transfer !== undefined) {
+          this.failTransfer(transfer, frame.code, frame.message);
+        }
+        return;
+      }
+      case "transfer-begin": {
+        // A download's begin from the agent: the size and checksum it is about to stream.
+        const transfer = this.transfers.get(frame.id);
+        if (transfer !== undefined && transfer.direction === "download" && frame.total !== null && frame.checksum !== null) {
+          transfer.listener.push({ kind: "begin", total: frame.total, checksum: frame.checksum });
+        }
+        return;
+      }
+      case "transfer-chunk": {
+        const transfer = this.transfers.get(frame.id);
+        if (transfer === undefined || transfer.direction !== "download") {
+          return;
+        }
+        if (frame.seq !== transfer.expectedSeq) {
+          this.failTransfer(transfer, "out-of-order", `expected chunk ${transfer.expectedSeq}, got ${frame.seq}`);
+          return;
+        }
+        const decoded = decodeBytes(frame.chunk, { maxPayloadBytes: this.options.maxPayloadBytes });
+        if (!decoded.ok) {
+          this.failTransfer(transfer, "bad-chunk", decoded.error.message);
+          return;
+        }
+        transfer.expectedSeq += 1;
+        transfer.received += decoded.data.byteLength;
+        transfer.hash?.update(decoded.data);
+        transfer.listener.push({ kind: "chunk", seq: frame.seq, chunk: frame.chunk });
+        return;
+      }
+      case "transfer-end": {
+        const transfer = this.transfers.get(frame.id);
+        if (transfer === undefined) {
+          return;
+        }
+        if (transfer.direction === "upload") {
+          // The agent's acknowledgement: it verified the bytes and moved the file into place.
+          transfer.listener.push({ kind: "completed", total: frame.total, checksum: frame.checksum });
+        } else {
+          // A download closes: accept it only if what we assembled matches the declared total and checksum.
+          const verified = transfer.received === frame.total && transfer.hash !== null && transfer.hash.digest("hex") === frame.checksum;
+          if (verified) {
+            transfer.listener.push({ kind: "completed", total: frame.total, checksum: frame.checksum });
+          } else {
+            transfer.listener.push({
+              kind: "error",
+              code: "integrity",
+              message: `assembled ${transfer.received} bytes did not match the declared transfer`,
+            });
+          }
+        }
+        transfer.listener.end();
+        this.transfers.delete(frame.id);
         return;
       }
       default:
@@ -350,6 +462,57 @@ export class HubCore {
     }
     this.toAgent({ type: "cancel", v: PROTOCOL_VERSION, id });
     return { ok: true };
+  }
+
+  /**
+   * Write a file onto the machine, streaming it as chunk frames the agent assembles and verifies. The
+   * hub is the sender: it declares the total and checksum up front, sends the content in fixed chunks
+   * held below either side's payload cap, and closes with the same total and checksum. The transfer
+   * completes when the agent acknowledges the verified write.
+   */
+  startUpload(params: UploadParams, listener: TransferListener): StartResult {
+    if (this.current === null) {
+      return { ok: false, reason: "no agent attached" };
+    }
+
+    const id = this.nextId("u");
+    const total = params.data.byteLength;
+    const sum = checksum(params.data);
+    this.transfers.set(id, { id, direction: "upload", listener, expectedSeq: 0, received: 0, hash: null });
+    listener.push({ kind: "started", id });
+
+    this.toAgent({ type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path: params.path, total, checksum: sum });
+    let seq = 0;
+    for (let offset = 0; offset < total; offset += TRANSFER_CHUNK_BYTES) {
+      const slice = params.data.subarray(offset, Math.min(offset + TRANSFER_CHUNK_BYTES, total));
+      this.toAgent({ type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) });
+    }
+    this.toAgent({ type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum });
+    return { ok: true, id };
+  }
+
+  /**
+   * Read a file back from the machine. The hub is the receiver: it requests the path, the agent
+   * answers with the size and checksum it will stream, and the hub advances a running hash over the
+   * chunks so it can verify the whole content against that declared total and checksum when the
+   * transfer closes.
+   */
+  startDownload(params: DownloadParams, listener: TransferListener): StartResult {
+    if (this.current === null) {
+      return { ok: false, reason: "no agent attached" };
+    }
+
+    const id = this.nextId("d");
+    this.transfers.set(id, { id, direction: "download", listener, expectedSeq: 0, received: 0, hash: createHash(CHECKSUM_ALGORITHM) });
+    listener.push({ kind: "started", id });
+    this.toAgent({ type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "download", path: params.path, total: null, checksum: null });
+    return { ok: true, id };
+  }
+
+  private failTransfer(transfer: Transfer, code: string, message: string): void {
+    transfer.listener.push({ kind: "error", code, message });
+    transfer.listener.end();
+    this.transfers.delete(transfer.id);
   }
 
   /**
@@ -454,6 +617,12 @@ export class HubCore {
         return {};
       case "error":
         return { id: frame.id, code: frame.code, message: frame.message };
+      case "transfer-begin":
+        return { id: frame.id, direction: frame.direction, path: frame.path, total: frame.total };
+      case "transfer-chunk":
+        return { id: frame.id, seq: frame.seq, bytes: frame.chunk.bytes };
+      case "transfer-end":
+        return { id: frame.id, total: frame.total };
       case "ping":
       case "pong":
         return { ts: frame.ts };

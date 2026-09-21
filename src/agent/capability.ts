@@ -1,7 +1,4 @@
-// The contract the shell runner implements so the connection core can dispatch to it. The shell is
-// the agent's only capability; the core owns none of it, and hands every exec and cancel frame to the
-// one registered runner. The core supplies the wire (framing, sequence numbers, sending); the runner
-// supplies only spawning, streaming, and stopping.
+// The contract the shell runner implements for the connection core to dispatch to.
 
 import type { ShellKind } from "../protocol";
 

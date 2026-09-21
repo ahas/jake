@@ -1,14 +1,4 @@
-// The self-healing watchdog. This is the part that answers "꺼지지 않아야 한다". Each binary of the
-// pair runs one Watchdog against its peer: on a fixed tick it refreshes its own heartbeat, rewrites
-// every autostart anchor, and — finding the peer's heartbeat stale past a threshold — relaunches it.
-// Liveness is judged by the heartbeat a peer refreshes rather than by its exit alone, so a hung peer
-// that never exited is still treated as dead and brought back.
-//
-// The decision — write, rewrite, and (only if the peer is stale) relaunch — is the whole of the
-// logic worth testing, so the store, the anchor registrar, the peer launcher, and the clock are all
-// seams. On this machine a fake clock, a fake heartbeat store, and a fake launcher drive every case;
-// the real seams at the bottom of this file are the only place a disk or a spawned process is
-// touched. docs/architecture.md is the canonical statement of the staying-alive scheme.
+// The self-healing watchdog each binary of the pair runs against its peer.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";

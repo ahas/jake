@@ -1,8 +1,6 @@
-// The wire protocol both sides of the tunnel import. The agent dials the hub and holds one
-// connection open; over it, frames travel in both directions as text. This module owns the frame
-// vocabulary, their on-the-wire encoding, and a decoder that turns an arbitrary string into a
-// validated frame or a named rejection — never a raw throw. docs/protocol.md is the canonical
-// statement of the vocabulary; this code answers to it.
+// The wire protocol both sides import: the frame vocabulary, its encoding, and the decoder.
+
+import { createHash } from "node:crypto";
 
 /** The version every frame carries. A peer that speaks another version is refused, not guessed at. */
 export const PROTOCOL_VERSION = 1;
@@ -15,8 +13,44 @@ export const PROTOCOL_VERSION = 1;
  */
 export const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 
-/** The two shells the agent can run a command through on the Windows box. */
-export type ShellKind = "powershell" | "wsl";
+/** The shells the agent can run a command through; which of them a host offers depends on its platform. */
+export const SHELL_KINDS = ["powershell", "wsl", "linux"] as const;
+
+/** One of the shells this build knows. */
+export type ShellKind = (typeof SHELL_KINDS)[number];
+
+/** Whether an arbitrary value names a shell this build knows, so every validator checks one source. */
+export function isShellKind(value: unknown): value is ShellKind {
+  return typeof value === "string" && (SHELL_KINDS as readonly string[]).includes(value);
+}
+
+/** The two directions a file transfer runs: an upload writes a file on the machine, a download reads one. */
+export const TRANSFER_DIRECTIONS = ["upload", "download"] as const;
+
+/** One of the transfer directions this build knows. */
+export type TransferDirection = (typeof TRANSFER_DIRECTIONS)[number];
+
+/** Whether an arbitrary value names a transfer direction, so every validator checks one source. */
+export function isTransferDirection(value: unknown): value is TransferDirection {
+  return typeof value === "string" && (TRANSFER_DIRECTIONS as readonly string[]).includes(value);
+}
+
+/**
+ * The fixed size of a file-transfer chunk's decoded payload, in bytes. It is held far below the
+ * 16 MiB default cap — and below any smaller cap a deployment is likely to set — because the two
+ * sides do not negotiate their caps on the wire: a frame over the receiver's cap is dropped
+ * silently while the connection stays open. Holding the chunk this small keeps a transfer from ever
+ * approaching a cap, so no chunk is lost to one and no gap goes unseen.
+ */
+export const TRANSFER_CHUNK_BYTES = 256 * 1024;
+
+/** The hash a transfer's content checksum is computed with, so both sides agree byte-for-byte. */
+export const CHECKSUM_ALGORITHM = "sha256";
+
+/** The content checksum a file transfer declares and verifies its assembled bytes against, as lowercase hex. */
+export function checksum(data: Uint8Array): string {
+  return createHash(CHECKSUM_ALGORITHM).update(data).digest("hex");
+}
 
 /**
  * A run of bytes carried inside a text frame. `bytes` is the decoded length, declared up front so a
@@ -119,6 +153,48 @@ export interface ErrorFrame {
   message: string;
 }
 
+/**
+ * Opens a file transfer. `id` is the caller's handle every later frame of the transfer echoes,
+ * `direction` says which way the bytes flow (an upload writes a file on the machine, a download reads
+ * one from it), and `path` is the file on the machine. The side about to send the bytes also carries
+ * the total decoded byte length and a content checksum: an upload's begin comes from the hub with
+ * both up front, while a download's begin comes from the hub as a request naming only the path — with
+ * `total` and `checksum` null — and the agent answers with its own begin carrying the size and
+ * checksum it is about to stream.
+ */
+export interface TransferBeginFrame {
+  type: "transfer-begin";
+  v: number;
+  id: string;
+  direction: TransferDirection;
+  path: string;
+  total: number | null;
+  checksum: string | null;
+}
+
+/** One chunk of a transfer's content, in order by `seq`, its bytes carried as an encoded-bytes value. */
+export interface TransferChunkFrame {
+  type: "transfer-chunk";
+  v: number;
+  id: string;
+  seq: number;
+  chunk: EncodedBytes;
+}
+
+/**
+ * Closes a transfer with the verifiable total the receiver checks its assembled bytes against: the
+ * count of bytes sent and the content checksum. The sender emits it to end the stream; on an upload
+ * the agent emits it back once the assembled bytes matched and the file was moved into place, so it is
+ * at once the completion and the success acknowledgement.
+ */
+export interface TransferEndFrame {
+  type: "transfer-end";
+  v: number;
+  id: string;
+  total: number;
+  checksum: string;
+}
+
 /** Either side: a liveness probe carrying the sender's clock. */
 export interface PingFrame {
   type: "ping";
@@ -144,6 +220,9 @@ export type Frame =
   | CancelFrame
   | LeaveFrame
   | ErrorFrame
+  | TransferBeginFrame
+  | TransferChunkFrame
+  | TransferEndFrame
   | PingFrame
   | PongFrame;
 
@@ -199,6 +278,9 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<FrameType>([
   "cancel",
   "leave",
   "error",
+  "transfer-begin",
+  "transfer-chunk",
+  "transfer-end",
   "ping",
   "pong",
 ]);
@@ -332,10 +414,15 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
 
     case "exec": {
       if (!isString(parsed.id)) return fail("bad-field", "exec.id must be a string");
-      if (parsed.shell !== "powershell" && parsed.shell !== "wsl") {
-        return fail("bad-field", "exec.shell must be 'powershell' or 'wsl'");
+      if (!isShellKind(parsed.shell)) {
+        return fail("bad-field", `exec.shell must be one of ${SHELL_KINDS.join(", ")}`);
       }
       if (!isString(parsed.command)) return fail("bad-field", "exec.command must be a string");
+      // The command text is bounded by the same cap as a byte payload, so an embedded-content command
+      // cannot carry more than one chunk past the ceiling that guards every stdout/stderr frame.
+      if (Buffer.byteLength(parsed.command, "utf8") > maxPayloadBytes) {
+        return fail("payload-too-large", `exec.command exceeds cap ${maxPayloadBytes}`);
+      }
       if (parsed.cwd !== null && !isString(parsed.cwd)) return fail("bad-field", "exec.cwd must be a string or null");
       if (!isStringRecord(parsed.env)) return fail("bad-field", "exec.env must be a string map");
       if (parsed.distro !== null && !isString(parsed.distro)) {
@@ -388,6 +475,40 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
       if (!isString(parsed.code)) return fail("bad-field", "error.code must be a string");
       if (!isString(parsed.message)) return fail("bad-field", "error.message must be a string");
       return { ok: true, frame: { type, v, id: parsed.id, code: parsed.code, message: parsed.message } };
+    }
+
+    case "transfer-begin": {
+      if (!isString(parsed.id)) return fail("bad-field", "transfer-begin.id must be a string");
+      if (!isTransferDirection(parsed.direction)) {
+        return fail("bad-field", `transfer-begin.direction must be one of ${TRANSFER_DIRECTIONS.join(", ")}`);
+      }
+      if (!isString(parsed.path)) return fail("bad-field", "transfer-begin.path must be a string");
+      if (parsed.total !== null && (!isInt(parsed.total) || parsed.total < 0)) {
+        return fail("bad-field", "transfer-begin.total must be a non-negative integer or null");
+      }
+      if (parsed.checksum !== null && !isString(parsed.checksum)) {
+        return fail("bad-field", "transfer-begin.checksum must be a string or null");
+      }
+      return {
+        ok: true,
+        frame: { type, v, id: parsed.id, direction: parsed.direction, path: parsed.path, total: parsed.total, checksum: parsed.checksum },
+      };
+    }
+
+    case "transfer-chunk": {
+      if (!isString(parsed.id)) return fail("bad-field", "transfer-chunk.id must be a string");
+      if (!isInt(parsed.seq) || parsed.seq < 0) return fail("bad-field", "transfer-chunk.seq must be a non-negative integer");
+      const chunkError = checkEncodedBytes(parsed.chunk, "transfer-chunk.chunk", maxPayloadBytes);
+      if (chunkError) return { ok: false, error: chunkError };
+      const chunk = parsed.chunk as EncodedBytes;
+      return { ok: true, frame: { type, v, id: parsed.id, seq: parsed.seq, chunk: { bytes: chunk.bytes, base64: chunk.base64 } } };
+    }
+
+    case "transfer-end": {
+      if (!isString(parsed.id)) return fail("bad-field", "transfer-end.id must be a string");
+      if (!isInt(parsed.total) || parsed.total < 0) return fail("bad-field", "transfer-end.total must be a non-negative integer");
+      if (!isString(parsed.checksum)) return fail("bad-field", "transfer-end.checksum must be a string");
+      return { ok: true, frame: { type, v, id: parsed.id, total: parsed.total, checksum: parsed.checksum } };
     }
 
     case "ping":

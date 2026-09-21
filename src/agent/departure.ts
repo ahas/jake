@@ -1,13 +1,4 @@
-// The agent's departure: erase every trace of jake from 하스's box and leave. This is what the
-// "leave" frame triggers. jake is a self-healing pair — the agent and the guard each rewrite all the
-// autostart anchors and relaunch the other — so a departure that unwound only the agent's own
-// footprint would be undone within a tick by the guard. Departing therefore proceeds in order: it
-// stops this process's own watchdog, so it stops rewriting anchors and reviving the guard; it kills
-// the guard, so it does the same; it removes every anchor for both run modes; it hands the file
-// deletion to a detached one-shot task that outlives this process, so the executable can be removed
-// once the pair has let go of it; and it exits. Everything but the final spawn and exit is pure
-// command construction or a seam, so the ordering is driven on Linux by fakes. docs/architecture.md
-// is the canonical statement of the leaving scheme.
+// The agent's departure: remove jake from the machine and exit.
 
 import nodePath from "node:path";
 

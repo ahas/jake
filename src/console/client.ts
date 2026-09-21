@@ -1,8 +1,4 @@
-// A typed client over the hub's loopback control API. Every console surface — the CLI and, through
-// its own inlined copy, the web page — speaks to the hub through this shape: status, a streamed
-// exec, cancel, and the traffic tail. The bearer token is carried on every
-// request; nothing here takes a credential from an argument. The fetch implementation is injectable
-// so a test can drive the client against a fake hub without a socket.
+// A typed client over the hub's loopback control API.
 
 import type { StatusSnapshot, TrafficEntry } from "../hub/core";
 import type { ShellKind } from "../protocol";

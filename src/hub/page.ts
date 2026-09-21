@@ -1,12 +1,4 @@
-// The hub's read-only status page. It is the console's web surface: a single self-contained page
-// the hub serves over its loopback control API, showing whether the agent is attached and the
-// frames crossing the tunnel. It carries no control the CLI does not already have.
-//
-// A browser navigating to a page cannot attach an Authorization header, so the page route is the one
-// unauthenticated corner of the control API, and the token is embedded in the page it returns so the
-// page's own calls to /status and /events carry it. This is safe because the control API binds to
-// loopback alone: anyone who can load the page is already on the machine and could read the token
-// from the hub's config file just as easily. The page makes only read requests.
+// The hub's read-only status page, served over its loopback control API.
 
 /** Render the status page, embedding the control token so the page can call the API on its own. */
 export function renderConsolePage(token: string): string {
