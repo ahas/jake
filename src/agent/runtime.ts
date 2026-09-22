@@ -6,7 +6,7 @@ import type { ExecRunner } from "./capability";
 import { AgentConnection, type ConnectionDeps, type ConnectionOutcome } from "./connection";
 import type { Logger } from "./log";
 import type { TransferRunner } from "./transfer";
-import type { Dialer, Scheduler, Transport, TransportEvents } from "./transport";
+import { HubRefusedError, type Dialer, type Scheduler, type Transport, type TransportEvents } from "./transport";
 
 /** The injected seams and knobs the runtime needs beyond the agent's own config. */
 export interface RuntimeDeps {
@@ -119,7 +119,11 @@ export class AgentRuntime {
     try {
       transport = await this.deps.dialer.dial(this.config.hubUrl, this.config.secret, events);
     } catch (error) {
-      this.deps.log.log("warn", "dial-failed", { error: error instanceof Error ? error.message : String(error) });
+      if (error instanceof HubRefusedError) {
+        this.deps.log.log("warn", "rejected", { status: error.status, reason: "the hub refused the shared secret" });
+      } else {
+        this.deps.log.log("warn", "dial-failed", { error: error instanceof Error ? error.message : String(error) });
+      }
       return null;
     }
 

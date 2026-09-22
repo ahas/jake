@@ -80,6 +80,16 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 - One shared secret authenticates the agent to the hub, presented as a Bearer credential at the
   connection's upgrade. A separate token guards the hub's loopback control API. The two are distinct
   so that the console's reach and the agent's reach are not the same key.
+- A refused credential and an unreachable hub are told apart. The hub answers an upgrade with a
+  missing or wrong secret with 401 before any socket opens, and writes one line saying where the
+  attempt came from and whether the credential was missing or wrong — never the value presented.
+  A plain request refused the same way is not an agent's attempt and leaves no line.
+  A WebSocket client learns only that the upgrade failed, not its status, so when a dial fails
+  before opening the agent asks the same address once more over plain HTTP with the same
+  credential: a 401 there is logged as `rejected`, and anything else as `dial-failed`. A name the
+  hub turns away arrives after the socket opens, as a rejected frame, and is logged as `rejected`
+  too. The installer reads those two events to say whether the secret or name is wrong or the hub
+  cannot be reached.
 
 ## Staying alive
 

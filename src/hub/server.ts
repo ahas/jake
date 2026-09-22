@@ -44,6 +44,17 @@ export interface StartHubOptions {
   controlPort?: number;
   /** Core knobs — ping interval, missed-pong limit, ring size. */
   core?: Pick<HubCoreOptions, "pingIntervalMs" | "missedPongLimit" | "ringSize">;
+  /** Where the hub writes its one-line notices, such as a refused agent. Defaults to stderr. */
+  log?: (line: string) => void;
+}
+
+/**
+ * Where an agent's upgrade came from: the address the proxy in front of the hub forwarded, else the
+ * socket's own peer.
+ */
+function peerOf(request: Request, server: Server<SocketData>): string {
+  const forwarded = request.headers.get("x-real-ip") ?? request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  return forwarded || server.requestIP(request)?.address || "unknown";
 }
 
 function linkOf(ws: ServerWebSocket<SocketData>): AgentLink {
@@ -315,12 +326,21 @@ export function startHub(config: HubConfig, options: StartHubOptions = {}): Runn
     hubVersion: "0.1.0",
     ...options.core,
   });
+  const log = options.log ?? ((line: string) => console.warn(line));
 
   const agentServer = Bun.serve<SocketData>({
     hostname: config.host,
     port: options.agentPort ?? config.port,
     fetch(request, server) {
-      if (!core.authorizeAgent(request.headers.get("authorization"))) {
+      const credential = request.headers.get("authorization");
+      if (!core.authorizeAgent(credential)) {
+        // Only an upgrade is an agent's attempt; a plain request — the agent's own follow-up probe,
+        // or a passer-by — is answered the same and left out. The line says whether a credential
+        // came at all, and never what it was.
+        if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          const what = credential === null ? "no credential" : "a wrong credential";
+          log(`jake hub: refused an agent connection from ${peerOf(request, server)} (${what})`);
+        }
         return json({ error: "unauthorized" }, 401);
       }
       if (server.upgrade(request, { data: { socketId: core.nextSocketId() } })) {

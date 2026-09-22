@@ -22,7 +22,7 @@
   the repository and never compiled into the executable.
 
 .PARAMETER HubUrl
-  The hub to dial, e.g. wss://jake.example.org . Prompted for if omitted.
+  The hub to dial. Prompted for if omitted; an empty answer takes the default, wss://jake.example.org .
 
 .PARAMETER Secret
   The shared secret, matching the hub's JAKE_SECRET. Prompted for (hidden) if omitted.
@@ -34,7 +34,8 @@
   Where to install. Defaults to %LOCALAPPDATA%\Programs\jake (a per-user, space-free location).
 
 .PARAMETER NonInteractive
-  Never prompt. Requires HubUrl, Secret, and AgentName to be passed as arguments.
+  Never prompt. Requires Secret and AgentName to be passed as arguments or already in agent.env;
+  HubUrl falls back to the default.
 #>
 [CmdletBinding()]
 param(
@@ -48,6 +49,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Base = 'https://ai.example.org/bmo/jake'
+$DefaultHubUrl = 'wss://jake.example.org'
 $Binary = 'jake.exe'
 $AgentAnchor = 'JakeAgent'
 $GuardAnchor = 'JakeGuard'
@@ -83,11 +85,12 @@ function Get-EnvValue($path, $key) {
 
 $existingEnv = Join-Path $InstallDir 'agent.env'
 
-function Resolve-Value($current, $key, $prompt, [switch]$secret) {
+function Resolve-Value($current, $key, $prompt, [switch]$secret, $fallback) {
   if ($current) { return $current }
   $default = Get-EnvValue $existingEnv $key
   if ($NonInteractive) {
     if ($default) { return $default }
+    if ($fallback) { return $fallback }
     throw "$key was not provided and -NonInteractive was set. Pass it as an argument."
   }
   if ($secret) {
@@ -99,10 +102,11 @@ function Resolve-Value($current, $key, $prompt, [switch]$secret) {
     if ($default) { return $default }
     throw "$key is required."
   }
-  $label = if ($default) { "$prompt [$default]" } else { $prompt }
+  $label = if ($default) { "$prompt [$default]" } elseif ($fallback) { "$prompt [default: $fallback]" } else { $prompt }
   $answer = Read-Host -Prompt $label
   if ($answer) { return $answer }
   if ($default) { return $default }
+  if ($fallback) { return $fallback }
   throw "$key is required."
 }
 
@@ -127,7 +131,7 @@ if (-not (Test-Path (Join-Path $Payload $Binary))) {
   throw "Could not find or download $Binary."
 }
 
-$HubUrl    = Resolve-Value $HubUrl    'JAKE_HUB_URL'    'Hub URL (e.g. wss://jake.example.org)'
+$HubUrl    = Resolve-Value $HubUrl    'JAKE_HUB_URL'    'Hub URL' -fallback $DefaultHubUrl
 $Secret    = Resolve-Value $Secret    'JAKE_SECRET'     'Shared secret' -secret
 $AgentName = Resolve-Value $AgentName 'JAKE_AGENT_NAME' 'Agent name'
 
@@ -241,7 +245,7 @@ for ($i = 0; $i -lt 15; $i++) {
     $tail = $reader.ReadToEnd()
   } finally { $fs.Close() }
   if ($tail -match '"event":"welcomed"') { $reached = $true; break }
-  elseif ($tail -match '"event":"rejected"') { $failure = "the hub rejected the agent (check the shared secret and agent name)"; break }
+  elseif ($tail -match '"event":"rejected"') { $failure = "the hub rejected the agent (the shared secret or the agent name is wrong)"; break }
   elseif ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
 }
 

@@ -18,10 +18,19 @@ export interface TransportEvents {
   onError(error: unknown): void;
 }
 
+/** A dial the hub answered and refused: the upgrade came back with this HTTP status. */
+export class HubRefusedError extends Error {
+  constructor(readonly status: number) {
+    super(`the hub refused the connection (HTTP ${status})`);
+    this.name = "HubRefusedError";
+  }
+}
+
 /**
  * Opens one outbound connection to the hub. It resolves with a live transport once the connection
- * is open and authenticated at the upgrade, and rejects if the connection never opens. Every frame
- * that arrives afterwards is delivered through the `events` the caller passed.
+ * is open and authenticated at the upgrade, and rejects if the connection never opens — with a
+ * `HubRefusedError` when the hub answered and turned the credential away, and a plain error when no
+ * answer came. Every frame that arrives afterwards is delivered through the `events` the caller passed.
  */
 export interface Dialer {
   dial(url: string, secret: string, events: TransportEvents): Promise<Transport>;
@@ -50,19 +59,34 @@ export const systemScheduler: Scheduler = {
   clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
 };
 
+const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+
 /**
  * The dialer backed by a real WebSocket client. The shared secret rides as a Bearer credential on
  * the upgrade request, which is the hub authenticates before it accepts the socket. The promise
  * settles on the first of open (resolve) or a pre-open error/close (reject); once open, messages,
  * a later error, and the close all flow to the caller's events.
+ *
+ * A WebSocket client is told only that the upgrade failed, never the status it failed with, so a
+ * pre-open failure is followed by one plain HTTP request to the same address with the same
+ * credential. A 401 there means the hub is up and refused the secret; anything else leaves the
+ * original failure standing.
  */
 export class WebSocketDialer implements Dialer {
+  constructor(private readonly probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS) {}
+
   dial(url: string, secret: string, events: TransportEvents): Promise<Transport> {
     return new Promise<Transport>((resolve, reject) => {
       // Bun's WebSocket accepts per-connection headers through a second argument the DOM lib does not
       // type; the cast is the same one the hub's tests use to send the Authorization header.
       const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${secret}` } } as never);
       let opened = false;
+      let failed = false;
+      const fail = (error: Error) => {
+        if (failed) return;
+        failed = true;
+        void this.probe(url, secret).then((status) => reject(status === 401 ? new HubRefusedError(status) : error));
+      };
 
       ws.addEventListener("open", () => {
         opened = true;
@@ -78,16 +102,32 @@ export class WebSocketDialer implements Dialer {
         if (opened) {
           events.onError(event);
         } else {
-          reject(new Error("the connection failed before it opened"));
+          fail(new Error("the connection failed before it opened"));
         }
       });
       ws.addEventListener("close", (event) => {
         if (opened) {
           events.onClose(event.code, event.reason);
         } else {
-          reject(new Error(`the connection closed before it opened (code ${event.code})`));
+          fail(new Error(`the connection closed before it opened (code ${event.code})`));
         }
       });
     });
+  }
+
+  /** The status a plain HTTP request to the hub's address answers with, or null when none came. */
+  private async probe(url: string, secret: string): Promise<number | null> {
+    try {
+      const target = new URL(url);
+      target.protocol = target.protocol === "wss:" ? "https:" : "http:";
+      const response = await fetch(target, {
+        headers: { Authorization: `Bearer ${secret}` },
+        signal: AbortSignal.timeout(this.probeTimeoutMs),
+      });
+      await response.body?.cancel();
+      return response.status;
+    } catch {
+      return null;
+    }
   }
 }

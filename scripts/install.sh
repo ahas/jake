@@ -10,6 +10,7 @@ ENV_FILE="$DATA_DIR/agent.env"
 UNIT_NAME="jake-agent.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="$UNIT_DIR/$UNIT_NAME"
+DEFAULT_HUB_URL="wss://jake.example.org"
 
 step() { printf '\033[36m· %s\033[0m\n' "$1"; }
 ok()   { printf '\033[32m  %s\033[0m\n' "$1"; }
@@ -21,14 +22,15 @@ usage() {
 Install the jake agent for the current user (Linux/WSL).
 
   curl -fsSL $BASE/install.sh | bash
-  curl -fsSL $BASE/install.sh | bash -s -- --hub-url wss://jake.example.org --secret '<secret>' --agent-name '<name>'
+  curl -fsSL $BASE/install.sh | bash -s -- --secret '<secret>' --agent-name '<name>'
   ./install.sh                 (from a build folder)
 
 Options:
-  --hub-url <url>       the hub to attach to, e.g. wss://jake.example.org
+  --hub-url <url>       the hub to attach to (default: $DEFAULT_HUB_URL)
   --secret <secret>     the shared secret, matching the hub's JAKE_SECRET
   --agent-name <name>   this agent's name
-  --non-interactive     never prompt; the three values above must be passed or already in agent.env
+  --non-interactive     never prompt; the secret and name must be passed or already in agent.env
+  --print-config        resolve the values, print the hub URL and agent name, and install nothing
   -h, --help            show this help
 EOF
 }
@@ -39,6 +41,7 @@ HUB_URL=""
 SECRET=""
 AGENT_NAME=""
 NON_INTERACTIVE=0
+PRINT_CONFIG=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --hub-url) HUB_URL="${2:-}"; shift 2 ;;
@@ -48,6 +51,7 @@ while [ $# -gt 0 ]; do
     --agent-name) AGENT_NAME="${2:-}"; shift 2 ;;
     --agent-name=*) AGENT_NAME="${1#*=}"; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -121,15 +125,18 @@ env_value() { # file key  → prints the value, or nothing
   return 0
 }
 
-resolve() { # current key prompt secret  → prints the resolved value
-  local current="$1" key="$2" prompt="$3" secret="${4:-0}" def answer label
+resolve() { # current key prompt secret fallback  → prints the resolved value
+  local current="$1" key="$2" prompt="$3" secret="${4:-0}" fallback="${5:-}" def answer label
   if [ -n "$current" ]; then printf '%s' "$current"; return 0; fi
   def="$(env_value "$ENV_FILE" "$key")"
   if [ "$NON_INTERACTIVE" -eq 1 ] || [ ! -r /dev/tty ]; then
     if [ -n "$def" ]; then printf '%s' "$def"; return 0; fi
-    die "$key was not provided and no terminal is available to prompt. Re-run with the three values, e.g. curl -fsSL $BASE/install.sh | bash -s -- --hub-url wss://jake.example.org --secret '<secret>' --agent-name '<name>'"
+    if [ -n "$fallback" ]; then printf '%s' "$fallback"; return 0; fi
+    die "$key was not provided and no terminal is available to prompt. Re-run with the values, e.g. curl -fsSL $BASE/install.sh | bash -s -- --secret '<secret>' --agent-name '<name>'"
   fi
-  if [ -n "$def" ]; then label="$prompt [Enter to keep the current one]: "; else label="$prompt: "; fi
+  if [ -n "$def" ]; then label="$prompt [Enter to keep the current one]: "
+  elif [ -n "$fallback" ]; then label="$prompt [default: $fallback]: "
+  else label="$prompt: "; fi
   if [ "$secret" -eq 1 ]; then
     printf '%s' "$label" > /dev/tty
     read -rs answer < /dev/tty
@@ -140,12 +147,18 @@ resolve() { # current key prompt secret  → prints the resolved value
   fi
   if [ -n "$answer" ]; then printf '%s' "$answer"; return 0; fi
   if [ -n "$def" ]; then printf '%s' "$def"; return 0; fi
+  if [ -n "$fallback" ]; then printf '%s' "$fallback"; return 0; fi
   die "$key is required."
 }
 
-HUB_URL="$(resolve "$HUB_URL" JAKE_HUB_URL 'Hub URL (e.g. wss://jake.example.org)' 0)"
+HUB_URL="$(resolve "$HUB_URL" JAKE_HUB_URL 'Hub URL' 0 "$DEFAULT_HUB_URL")"
 SECRET="$(resolve "$SECRET" JAKE_SECRET 'Shared secret' 1)"
 AGENT_NAME="$(resolve "$AGENT_NAME" JAKE_AGENT_NAME 'Agent name' 0)"
+
+if [ "$PRINT_CONFIG" -eq 1 ]; then
+  printf 'JAKE_HUB_URL=%s\nJAKE_AGENT_NAME=%s\n' "$HUB_URL" "$AGENT_NAME"
+  exit 0
+fi
 
 # --- stop any running unit so its binary can be replaced -----------------------------------------
 
@@ -209,21 +222,25 @@ systemctl --user daemon-reload
 if ! loginctl enable-linger "$(id -un)" 2>/dev/null; then
   warn "could not enable linger; the agent starts at login but may not at boot. Run: loginctl enable-linger $(id -un)"
 fi
+log_file="$DATA_DIR/agent.log"
+log_mark=0
+[ -f "$log_file" ] && log_mark="$(wc -c < "$log_file")"
 systemctl --user enable --now "$UNIT_NAME"
 ok "service enabled and started"
 
-# --- wait briefly for the agent to reach the hub, reading its own local log ----------------------
+# --- wait briefly for the agent to reach the hub, reading only what its log gained since the start --
 
 step "waiting for the agent to reach the hub"
 reached=0
 failure=""
 for _ in $(seq 1 15); do
   sleep 1
-  [ -f "$DATA_DIR/agent.log" ] || continue
-  log_tail="$(tail -n 50 "$DATA_DIR/agent.log" 2>/dev/null || true)"
+  [ -f "$log_file" ] || continue
+  [ "$(wc -c < "$log_file")" -ge "$log_mark" ] || log_mark=0
+  log_tail="$(tail -c +"$((log_mark + 1))" "$log_file" 2>/dev/null || true)"
   case "$log_tail" in
     *'"event":"welcomed"'*) reached=1; break ;;
-    *'"event":"rejected"'*) failure="the hub rejected the agent (check the shared secret and agent name)"; break ;;
+    *'"event":"rejected"'*) failure="the hub rejected the agent (the shared secret or the agent name is wrong)"; break ;;
     *'"event":"dial-failed"'*) failure="the agent could not reach the hub (check the hub URL and that the hub is running)" ;;
   esac
 done

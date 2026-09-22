@@ -12,6 +12,7 @@ import {
 } from "../src/protocol";
 import { startHub, type RunningHub, type StartHubOptions } from "../src/hub/server";
 import { HubClient } from "../src/console/client";
+import { HubRefusedError, WebSocketDialer } from "../src/agent/transport";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -277,14 +278,36 @@ describe("agent authentication", () => {
     expect(agent.received.some((f) => f.type === "welcome")).toBe(true);
   });
 
-  test("rejects an agent presenting the wrong secret at the upgrade", async () => {
-    const hub = launch();
+  test("rejects an agent presenting the wrong secret at the upgrade, logging it without the value", async () => {
+    const lines: string[] = [];
+    const hub = launch({ log: (line) => lines.push(line) });
     const agent = new FakeAgent(hub.agentPort, "wrong-secret");
     agents.push(agent);
     expect(await agent.outcome()).toBe("error");
 
     const status = await (await control(hub, "/status")).json();
     expect(status.attached).toBe(false);
+
+    const plain = await fetch(`http://127.0.0.1:${hub.agentPort}/`, { headers: { Authorization: "Bearer nope" } });
+    expect(plain.status).toBe(401);
+    expect(lines).toEqual(["jake hub: refused an agent connection from 127.0.0.1 (a wrong credential)"]);
+  });
+
+  test("the agent's dialer tells a refused secret apart from a hub that does not answer", async () => {
+    const hub = launch({ log: () => {} });
+    const events = { onMessage() {}, onClose() {}, onError() {} };
+    const dialer = new WebSocketDialer(1_000);
+
+    const refused = await dialer.dial(`ws://127.0.0.1:${hub.agentPort}`, "wrong-secret", events).catch((e) => e);
+    expect(refused).toBeInstanceOf(HubRefusedError);
+    expect(refused.status).toBe(401);
+
+    const vacant = Bun.serve({ port: 0, fetch: () => new Response() });
+    const deadPort = vacant.port;
+    vacant.stop(true);
+    const unreachable = await dialer.dial(`ws://127.0.0.1:${deadPort}`, SECRET, events).catch((e) => e);
+    expect(unreachable).toBeInstanceOf(Error);
+    expect(unreachable).not.toBeInstanceOf(HubRefusedError);
   });
 
   test("rejects a control request without the control token", async () => {

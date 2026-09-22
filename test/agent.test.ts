@@ -15,7 +15,7 @@ import { AgentConnection, type ConnectionDeps } from "../src/agent/connection";
 import { RollingLog, type LogFileSystem, type LogLevel, type Logger } from "../src/agent/log";
 import { agentDataDir, agentLogPath, heartbeatPath, startupDir } from "../src/agent/platform";
 import { AgentRuntime } from "../src/agent/runtime";
-import type { Dialer, Scheduler, TimerHandle, Transport, TransportEvents } from "../src/agent/transport";
+import { HubRefusedError, type Dialer, type Scheduler, type TimerHandle, type Transport, type TransportEvents } from "../src/agent/transport";
 
 const V = PROTOCOL_VERSION;
 const OPTS = { maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES };
@@ -126,7 +126,7 @@ class FakeDialer implements Dialer {
   lastEvents: TransportEvents | null = null;
 
   constructor(
-    private readonly behaviors: ("reject" | "accept")[],
+    private readonly behaviors: ("reject" | "refuse" | "accept")[],
     private readonly scheduler: FakeScheduler,
   ) {}
 
@@ -135,6 +135,9 @@ class FakeDialer implements Dialer {
     const behavior = this.behaviors.shift() ?? "reject";
     if (behavior === "reject") {
       return Promise.reject(new Error("connection refused"));
+    }
+    if (behavior === "refuse") {
+      return Promise.reject(new HubRefusedError(401));
     }
     const transport = new FakeTransport();
     this.lastTransport = transport;
@@ -558,5 +561,31 @@ describe("AgentRuntime reconnect loop", () => {
     scheduler.advance(100_000);
     await flush();
     expect(dialer.dials).toHaveLength(dialsAtStop);
+  });
+
+  test("a refused secret is logged as rejected and an unreachable hub as dial-failed", async () => {
+    const scheduler = new FakeScheduler();
+    const log = new CaptureLog();
+    const dialer = new FakeDialer(["refuse", "reject"], scheduler);
+    const runtime = new AgentRuntime(agentConfig(), {
+      dialer,
+      scheduler,
+      log,
+      agentVersion: "0.1.0",
+      random: () => 1,
+      backoff: { baseMs: 100, capMs: 400, factor: 2 },
+    });
+
+    const running = runtime.run();
+    await flush(); // dial 1 refused with 401
+    scheduler.advance(100);
+    await flush(); // dial 2 finds nobody
+    runtime.stop();
+    await flush();
+    await running;
+
+    const outcomes = log.events.filter((e) => e.event === "rejected" || e.event === "dial-failed");
+    expect(outcomes.map((e) => e.event)).toEqual(["rejected", "dial-failed"]);
+    expect(outcomes[0]!.detail.status).toBe(401);
   });
 });

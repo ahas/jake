@@ -33,11 +33,14 @@ running, and starts it. What it needs is below.
 
 The install needs three values, and nothing more:
 
-- **Hub URL** — the hub to attach to, e.g. `wss://jake.example.org`.
+- **Hub URL** — the hub to attach to. An empty answer takes the default, `wss://jake.example.org`.
 - **Shared secret** — the secret the hub also holds. It is not shown while typed.
 - **Agent name** — this agent's name. The hub accepts one agent of this name.
 
-Run interactively, the script asks for the three. To install without prompts, pass them as arguments:
+Run interactively, the script asks for the three; the secret and the name have no default and must
+be given. On a re-run the values already in `agent.env` are offered instead, and an empty answer
+keeps them. To install without prompts, pass them as arguments (the hub URL may be left out, and
+the default is used):
 
 - Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash -s -- --hub-url wss://jake.example.org --secret '<shared secret>' --agent-name '<this agent name>'`
 - Windows: run `install.ps1` with `-HubUrl wss://jake.example.org -Secret '<shared secret>' -AgentName '<this agent name>'`.
@@ -100,8 +103,11 @@ example config, the install and uninstall scripts, and this guide.
 The install starts the agent, watches briefly whether it reaches the hub, and reports:
 
 - **connected to the hub** — attached. Done.
-- **not attached yet** — either the secret or name is wrong (rejected), or the URL is wrong or the hub
-  is down (unreachable). The agent keeps retrying on its own, so it attaches once the cause is fixed.
+- **the hub rejected the agent** — the hub answered but refused the shared secret or the agent name.
+- **could not reach the hub** — no answer came from the address: the URL is wrong, or the hub or the
+  path to it is down.
+
+In either case the agent keeps retrying on its own, so it attaches once the cause is fixed.
 
 What happened is in the agent's own local log:
 
