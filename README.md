@@ -3,7 +3,9 @@
 jake is a **bmo agent proxy**: the proxy through which BMO manages 하스's own remote machines. It
 runs on one of 하스's machines — a Windows box or a Linux/WSL box — and dials outward to a hub on
 main-host, so BMO can reach a machine 비모's own network cannot connect into. Over that one tunnel
-BMO runs shell commands and moves files, in both directions.
+BMO runs shell commands and moves files, in both directions. The hub holds the agents of any number
+of machines at once, each known by its own agent name, and every command names the machine it goes
+to.
 
 - **Run modes** — PowerShell and WSL on a Windows host, and a Linux shell on a Linux or WSL host.
 - **File transfer** — upload and download over the tunnel's own frames, so a file crosses the tunnel

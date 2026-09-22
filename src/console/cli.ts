@@ -12,7 +12,7 @@ export const EXIT_FAILED = 4;
 export const USAGE = `jake — operator console for the bmo agent proxy
 
 Usage:
-  jake status [--json]              show whether the agent is attached and what is in flight
+  jake status [--json]              list every attached agent and what is in flight on it
   jake exec <command...>            run a command, stream its output, exit with the remote code
       [--shell powershell|wsl|linux] [--cwd <dir>] [--distro <name>] [--env KEY=VAL]...
   jake upload <local> <remote>      copy a local file to <remote> on the machine
@@ -20,6 +20,10 @@ Usage:
   jake tail [--after <id>]          follow the frames crossing the tunnel
   jake leave --yes                  erase the agent from the machine and detach for good
   jake help                         show this message
+
+exec, upload, download and leave take --agent <name> (-a) to pick the machine by its agent name. It
+may be left out while a single agent is attached; with several attached the hub refuses a request
+that names none.
 
 upload and download move a whole file over the tunnel's own frames — no scp — and verify the bytes
 against a checksum before reporting success; a download is written to <local> only once verified.
@@ -37,11 +41,11 @@ agent does not come back. It refuses without --yes.
 export type Command =
   | { name: "help" }
   | { name: "status"; json: boolean }
-  | { name: "exec"; request: ExecRequest }
-  | { name: "upload"; local: string; remote: string }
-  | { name: "download"; remote: string; local: string }
+  | { name: "exec"; request: ExecRequest; agent: string | null }
+  | { name: "upload"; local: string; remote: string; agent: string | null }
+  | { name: "download"; remote: string; local: string; agent: string | null }
   | { name: "tail"; after: number }
-  | { name: "leave"; confirmed: boolean };
+  | { name: "leave"; confirmed: boolean; agent: string | null };
 
 export type ParseResult = { ok: true; command: Command } | { ok: false; error: string };
 
@@ -127,6 +131,13 @@ function firstFlag(flags: Map<string, string[]>, name: string): string | undefin
   return flags.get(name)?.[0];
 }
 
+/** The flag every command that reaches a machine takes to name its target agent. */
+const AGENT_FLAG: FlagSpec = { canonical: "agent", aliases: ["a"] };
+
+function agentOf(flags: Map<string, string[]>): string | null {
+  return firstFlag(flags, "agent") ?? null;
+}
+
 // --- Argument vector to command -------------------------------------------------------------------
 
 /** Turn the argument vector (everything after `jake`) into one command, or a stated parse error. */
@@ -153,6 +164,7 @@ export function parseArgs(argv: string[]): ParseResult {
         { canonical: "cwd", aliases: [] },
         { canonical: "distro", aliases: [] },
         { canonical: "env", aliases: [], repeatable: true },
+        AGENT_FLAG,
       ]);
       if (parsed.error) return { ok: false, error: parsed.error };
       const commandText = parsed.positionals.join(" ").trim();
@@ -178,25 +190,31 @@ export function parseArgs(argv: string[]): ParseResult {
         env,
         distro: firstFlag(parsed.flags, "distro") ?? null,
       };
-      return { ok: true, command: { name: "exec", request } };
+      return { ok: true, command: { name: "exec", request, agent: agentOf(parsed.flags) } };
     }
 
     case "upload": {
-      const parsed = parseFlags(rest, []);
+      const parsed = parseFlags(rest, [AGENT_FLAG]);
       if (parsed.error) return { ok: false, error: parsed.error };
       if (parsed.positionals.length !== 2) {
         return { ok: false, error: "upload needs a local path and a remote path: jake upload <local> <remote>" };
       }
-      return { ok: true, command: { name: "upload", local: parsed.positionals[0]!, remote: parsed.positionals[1]! } };
+      return {
+        ok: true,
+        command: { name: "upload", local: parsed.positionals[0]!, remote: parsed.positionals[1]!, agent: agentOf(parsed.flags) },
+      };
     }
 
     case "download": {
-      const parsed = parseFlags(rest, []);
+      const parsed = parseFlags(rest, [AGENT_FLAG]);
       if (parsed.error) return { ok: false, error: parsed.error };
       if (parsed.positionals.length !== 2) {
         return { ok: false, error: "download needs a remote path and a local path: jake download <remote> <local>" };
       }
-      return { ok: true, command: { name: "download", remote: parsed.positionals[0]!, local: parsed.positionals[1]! } };
+      return {
+        ok: true,
+        command: { name: "download", remote: parsed.positionals[0]!, local: parsed.positionals[1]!, agent: agentOf(parsed.flags) },
+      };
     }
 
     case "tail": {
@@ -215,12 +233,12 @@ export function parseArgs(argv: string[]): ParseResult {
     }
 
     case "leave": {
-      const parsed = parseFlags(rest, [{ canonical: "yes", aliases: [], boolean: true }]);
+      const parsed = parseFlags(rest, [{ canonical: "yes", aliases: [], boolean: true }, AGENT_FLAG]);
       if (parsed.error) return { ok: false, error: parsed.error };
       if (parsed.positionals.length > 0) {
         return { ok: false, error: `leave takes no arguments (got ${parsed.positionals[0]})` };
       }
-      return { ok: true, command: { name: "leave", confirmed: parsed.flags.has("yes") } };
+      return { ok: true, command: { name: "leave", confirmed: parsed.flags.has("yes"), agent: agentOf(parsed.flags) } };
     }
 
     default:
@@ -304,17 +322,21 @@ async function runStatus(command: { json: boolean }, deps: CliDeps): Promise<num
   return EXIT_OK;
 }
 
-async function runExec(command: { request: ExecRequest }, deps: CliDeps): Promise<number> {
+async function runExec(command: { request: ExecRequest; agent: string | null }, deps: CliDeps): Promise<number> {
   const outDecoder = new TextDecoder();
   const errDecoder = new TextDecoder();
 
   let outcome;
   try {
-    outcome = await deps.client.exec(command.request, {
-      onStart: (id) => deps.onExecStart?.(id),
-      onStdout: (bytes) => deps.out(outDecoder.decode(bytes, { stream: true })),
-      onStderr: (bytes) => deps.err(errDecoder.decode(bytes, { stream: true })),
-    });
+    outcome = await deps.client.exec(
+      command.request,
+      {
+        onStart: (id) => deps.onExecStart?.(id),
+        onStdout: (bytes) => deps.out(outDecoder.decode(bytes, { stream: true })),
+        onStderr: (bytes) => deps.err(errDecoder.decode(bytes, { stream: true })),
+      },
+      command.agent,
+    );
   } catch (error) {
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
@@ -329,7 +351,7 @@ async function runExec(command: { request: ExecRequest }, deps: CliDeps): Promis
   switch (outcome.kind) {
     case "refused":
       deps.err(`jake: ${outcome.message}\n`);
-      return outcome.status === 409 ? EXIT_NO_AGENT : EXIT_FAILED;
+      return refusalExit(outcome.status);
     case "error":
       deps.err(`jake: the command failed [${outcome.code}]: ${outcome.message}\n`);
       return EXIT_FAILED;
@@ -346,6 +368,16 @@ async function runExec(command: { request: ExecRequest }, deps: CliDeps): Promis
   }
 }
 
+/**
+ * The exit code for a request the hub refused before anything streamed: no agent attached, or none
+ * by the name given, is "no agent"; a missing agent name among several is a usage error.
+ */
+function refusalExit(status: number): number {
+  if (status === 409 || status === 404) return EXIT_NO_AGENT;
+  if (status === 400) return EXIT_USAGE;
+  return EXIT_FAILED;
+}
+
 function readFileOf(deps: CliDeps): (path: string) => Promise<Uint8Array> {
   return deps.readFile ?? ((path) => Bun.file(path).bytes());
 }
@@ -359,7 +391,7 @@ function reportTransferFailure(outcome: Exclude<TransferOutcome, { kind: "comple
   switch (outcome.kind) {
     case "refused":
       deps.err(`jake: ${outcome.message}\n`);
-      return outcome.status === 409 ? EXIT_NO_AGENT : EXIT_FAILED;
+      return refusalExit(outcome.status);
     case "error":
       deps.err(`jake: the transfer failed [${outcome.code}]: ${outcome.message}\n`);
       return EXIT_FAILED;
@@ -369,7 +401,7 @@ function reportTransferFailure(outcome: Exclude<TransferOutcome, { kind: "comple
   }
 }
 
-async function runUpload(command: { local: string; remote: string }, deps: CliDeps): Promise<number> {
+async function runUpload(command: { local: string; remote: string; agent: string | null }, deps: CliDeps): Promise<number> {
   let data: Uint8Array;
   try {
     data = await readFileOf(deps)(command.local);
@@ -380,7 +412,7 @@ async function runUpload(command: { local: string; remote: string }, deps: CliDe
 
   let outcome: TransferOutcome;
   try {
-    outcome = await deps.client.upload(command.remote, data);
+    outcome = await deps.client.upload(command.remote, data, {}, command.agent);
   } catch (error) {
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
@@ -393,12 +425,12 @@ async function runUpload(command: { local: string; remote: string }, deps: CliDe
   return EXIT_OK;
 }
 
-async function runDownload(command: { remote: string; local: string }, deps: CliDeps): Promise<number> {
+async function runDownload(command: { remote: string; local: string; agent: string | null }, deps: CliDeps): Promise<number> {
   const chunks: Uint8Array[] = [];
 
   let outcome: TransferOutcome;
   try {
-    outcome = await deps.client.download(command.remote, { onChunk: (bytes) => chunks.push(bytes) });
+    outcome = await deps.client.download(command.remote, { onChunk: (bytes) => chunks.push(bytes) }, command.agent);
   } catch (error) {
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
@@ -444,7 +476,7 @@ async function runTail(command: { after: number }, deps: CliDeps): Promise<numbe
   return EXIT_OK;
 }
 
-async function runLeave(command: { confirmed: boolean }, deps: CliDeps): Promise<number> {
+async function runLeave(command: { confirmed: boolean; agent: string | null }, deps: CliDeps): Promise<number> {
   // Erasing the agent from 하스's machine cannot be undone, so it will not run on a bare `jake leave`;
   // the caller states the intent with --yes. This is the one guard the console keeps against a slip.
   if (!command.confirmed) {
@@ -454,19 +486,20 @@ async function runLeave(command: { confirmed: boolean }, deps: CliDeps): Promise
 
   let result;
   try {
-    result = await deps.client.leave();
+    result = await deps.client.leave(command.agent);
   } catch (error) {
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
   }
 
   if (!result.ok) {
-    if (result.status === 409) {
+    const exit = refusalExit(result.status);
+    if (exit === EXIT_FAILED) {
+      deps.err(`jake: the hub refused the leave (${result.status})\n`);
+    } else {
       deps.err(`jake: ${result.reason ?? "no agent attached"}\n`);
-      return EXIT_NO_AGENT;
     }
-    deps.err(`jake: the hub refused the leave (${result.status})\n`);
-    return EXIT_FAILED;
+    return exit;
   }
 
   deps.out("leave signal sent — the agent will erase itself and detach.\n");
@@ -488,21 +521,24 @@ function formatDuration(ms: number): string {
 }
 
 export function formatStatus(snapshot: StatusSnapshot, now: number): string {
-  if (!snapshot.attached || snapshot.agent === null) {
+  if (snapshot.agents.length === 0) {
     return `detached — no agent connected (hub ${snapshot.run})\n`;
   }
-  const agent = snapshot.agent;
-  const lines = [
-    `attached — ${agent.name} v${agent.agentVersion} (hub ${snapshot.run})`,
-    `  connected for ${formatDuration(now - agent.connectedAt)}`,
-    `  capabilities: ${agent.capabilities.length > 0 ? agent.capabilities.join(", ") : "(none)"}`,
-    `  in-flight commands: ${snapshot.inFlight.length > 0 ? snapshot.inFlight.join(", ") : "(none)"}`,
-  ];
+  const count = snapshot.agents.length;
+  const lines = [`attached — ${count} agent${count === 1 ? "" : "s"} (hub ${snapshot.run})`];
+  for (const agent of snapshot.agents) {
+    lines.push(
+      `${agent.name} v${agent.agentVersion}`,
+      `  connected for ${formatDuration(now - agent.connectedAt)}, last pong ${formatDuration(now - agent.lastPongAt)} ago`,
+      `  capabilities: ${agent.capabilities.length > 0 ? agent.capabilities.join(", ") : "(none)"}`,
+      `  in-flight commands: ${agent.inFlight.length > 0 ? agent.inFlight.join(", ") : "(none)"}`,
+    );
+  }
   return `${lines.join("\n")}\n`;
 }
 
 export function formatTraffic(entry: TrafficEntry): string {
   const time = new Date(entry.at).toISOString().slice(11, 23);
   const arrow = entry.dir === "in" ? "<-" : "->";
-  return `${time} ${arrow} ${entry.type} ${JSON.stringify(entry.summary)}`;
+  return `${time} ${entry.agent ?? "?"} ${arrow} ${entry.type} ${JSON.stringify(entry.summary)}`;
 }

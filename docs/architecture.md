@@ -14,10 +14,12 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 ## The programs
 
-- **hub** — runs permanently on main-host as a systemd user service. It accepts the single agent's
-  outbound connection, and it exposes a loopback control API that the console and 비모 drive it
-  through. It is reachable from 하스's network through a `*.ahas.io` name fronted by NPM. It holds no
-  capability itself; it relays.
+- **hub** — runs permanently on main-host as a systemd user service. It accepts the outbound
+  connection of every agent installed on 하스's machines, holds them all at once, and exposes a
+  loopback control API that the console and 비모 drive them through. It is reachable from 하스's
+  network through a `*.ahas.io` name fronted by NPM. It holds no capability itself; it relays. The
+  hub is the back end every agent shares, not a machine of its own: each attached agent is one
+  machine, and the hub is how all of them are reached.
 - **agent** — runs on one of 하스's machines from a single executable. It dials the hub,
   authenticates, and then serves what the hub asks of it: shell commands, with live-streamed output,
   and file transfers over the same connection. It listens for nothing and only dials. On a Windows
@@ -25,6 +27,26 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and only keeps the agent alive; the command line chooses which of the two a process is. On a Linux
   host the agent needs no guard, because the platform's own service manager keeps it running. The
   staying-alive scheme below covers both.
+
+## Many agents, one hub
+
+- An agent is known to the hub by the name its hello carries, and the name is the whole of its
+  identity. The hub holds one connection per name, as many names at once as there are machines. A
+  hello under a name already held replaces that name's connection — the older socket is closed with
+  the stated reason `superseded by a new connection` — because a redial after a half-dead TCP
+  connection must not leave two peers streaming as the same machine. A hello under a new name
+  displaces nobody.
+- Everything that belongs to a connection lives and dies with it: its liveness probe, its commands
+  and its transfers. An agent that drops, is declared dead, or is superseded ends only what was
+  running on it; the other agents' work carries on.
+- Every control request that reaches a machine — a command, an upload, a download, a leave — names
+  its target agent. A request that names none goes to the one agent attached when exactly one is,
+  and is refused when there are several, so a request never lands on a machine nobody chose. A
+  request naming an agent that is not attached is refused rather than sent elsewhere. Cancelling a
+  command needs no name, because a command's id is unique across the whole hub.
+- The status the control API reports lists every attached agent — its name, version, capabilities,
+  when it connected, when it last answered a ping, and the commands running on it — and the traffic
+  log tags each frame with the agent it crossed to or from.
 
 ## What crosses the tunnel
 
@@ -160,7 +182,7 @@ give very different footing for keeping a per-user process running.
   leaving is a single ordered act that stops every part and removes every file it placed.
 - The leave signal reaches the agent over the tunnel — it is the one instruction the hub carries that
   is not a shell command. Only the agent holds the tunnel, so a leave is possible only while the agent
-  is attached.
+  is attached, and it reaches only the agent it names; the others stay installed.
 - On a Linux host, leaving is what the service manager already makes simple: the agent stops and
   disables its own `systemd --user` unit so nothing restarts it, removes the unit file, deletes its
   data directory and log, and exits. Because the executable was placed as an ordinary per-user file,
@@ -248,7 +270,7 @@ give very different footing for keeping a per-user process running.
 
 ## The console
 
-- 하스 must be able to see, from a console, whether the agent is attached and whether commands are
+- 하스 must be able to see, from a console, which agents are attached and whether commands are
   moving. A command-line tool against the hub's loopback control API is the primary surface — it is
   also the handle a headless session on main-host uses to drive the agent, so no change inside 비모
   is required. A thin read-only web page over the same API shows connection state and recent traffic.
@@ -259,7 +281,9 @@ give very different footing for keeping a per-user process running.
   machine, a download of a file on the machine back to main-host — each verified against its checksum
   before it is reported done, and a download written to its local path only once that check passes. It
   also carries the leave command that uninstalls the agent remotely; because it is irreversible, the CLI refuses it
-  unless the intent is stated outright, and the read-only page cannot trigger it at all.
+  unless the intent is stated outright, and the read-only page cannot trigger it at all. Every CLI
+  command that reaches a machine takes the target agent's name, which may be left out only while a
+  single agent is attached.
 - The page is the one route of the control API served without the token: a browser navigation cannot
   attach a bearer header, so the page comes back open and carries the token embedded in it, which its
   own read requests then present. This is safe because the control API binds to loopback alone —

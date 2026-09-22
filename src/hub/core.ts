@@ -1,4 +1,4 @@
-// The hub's core: it holds the agent connection and routes every frame, with no transport in it.
+// The hub's core: it holds every agent connection and routes every frame, with no transport in it.
 
 import { createHash } from "node:crypto";
 
@@ -22,7 +22,7 @@ import {
 /**
  * The hub's handle on one agent socket. The server wraps a Bun `ServerWebSocket` in this; a test
  * wraps a fake. `socketId` identifies the physical connection so a frame or a close from a
- * superseded socket can be told from the current one and ignored.
+ * superseded socket can be told from the one now holding its agent's name and ignored.
  */
 export interface AgentLink {
   readonly socketId: number;
@@ -94,22 +94,32 @@ export interface DownloadParams {
 export type StartResult = { ok: true; id: string } | { ok: false; reason: string };
 export type CancelResult = { ok: true } | { ok: false; reason: string };
 
-/** The public facts about the attached agent, as the status endpoint reports them. */
+/**
+ * Why a request could not be given an agent: none is attached, the one it named is not, or it named
+ * none while several are attached and the choice is not the hub's to make.
+ */
+export type TargetRefusal = "no-agent" | "unknown-agent" | "agent-required";
+
+export type TargetResult = { ok: true; name: string } | { ok: false; code: TargetRefusal; reason: string };
+
+/** The public facts about one attached agent, as the status endpoint reports them. */
 export interface AgentStatus {
   name: string;
   agentVersion: string;
   capabilities: string[];
   connectedAt: number;
   lastPongAt: number;
+  /** The ids of the commands still streaming on this agent. */
+  inFlight: string[];
 }
 
 export interface StatusSnapshot {
   /** Identifies this hub process, so a console can tell its traffic cursor is still valid. */
   run: string;
+  /** True while at least one agent is attached. */
   attached: boolean;
-  agent: AgentStatus | null;
-  /** The ids of the commands still streaming. */
-  inFlight: string[];
+  /** Every attached agent, ordered by name. */
+  agents: AgentStatus[];
 }
 
 /**
@@ -120,6 +130,8 @@ export interface StatusSnapshot {
 export interface TrafficEntry {
   id: number;
   at: number;
+  /** The agent the frame crossed to or from; null for a frame from a socket that never said hello. */
+  agent: string | null;
   dir: "in" | "out";
   type: FrameType | "invalid";
   summary: Record<string, unknown>;
@@ -150,6 +162,8 @@ const DEFAULT_RING_SIZE = 200;
 // for application use, so it does not collide with a protocol-level close.
 const CLOSE_HUB_INITIATED = 4000;
 
+// One attached agent and everything that lives and dies with its connection: the liveness probe,
+// the commands and the transfers streaming over it.
 interface AttachedAgent {
   link: AgentLink;
   name: string;
@@ -158,6 +172,8 @@ interface AttachedAgent {
   connectedAt: number;
   lastPongAt: number;
   pingTimer: ReturnType<typeof setInterval> | null;
+  commands: Map<string, Command>;
+  transfers: Map<string, Transfer>;
 }
 
 interface Command {
@@ -182,9 +198,10 @@ export class HubCore {
   /** A random tag for this process, so a console can detect a hub restart and re-sync its cursor. */
   readonly run: string;
 
-  private current: AttachedAgent | null = null;
-  private readonly commands = new Map<string, Command>();
-  private readonly transfers = new Map<string, Transfer>();
+  /** Every attached agent by its name, one connection per name. */
+  private readonly agents = new Map<string, AttachedAgent>();
+  /** The same agents by the socket they hold, so a frame or a close finds its agent. */
+  private readonly bySocket = new Map<number, AttachedAgent>();
 
   private readonly traffic: TrafficEntry[] = [];
   private trafficSeq = 0;
@@ -224,9 +241,10 @@ export class HubCore {
 
   /** Feed one raw text frame received from an agent socket. */
   onMessage(link: AgentLink, raw: string): void {
+    const known = this.bySocket.get(link.socketId) ?? null;
     const result = decodeFrame(raw, { maxPayloadBytes: this.options.maxPayloadBytes });
     if (!result.ok) {
-      this.record("in", "invalid", { code: result.error.code, message: result.error.message });
+      this.record(known?.name ?? null, "in", "invalid", { code: result.error.code, message: result.error.message });
       return;
     }
 
@@ -236,30 +254,39 @@ export class HubCore {
       return;
     }
 
-    // Only the current, attached socket may drive the hub. A frame from a socket that never sent a
-    // hello, or from one that has since been superseded, is dropped.
-    if (this.current === null || this.current.link.socketId !== link.socketId) {
+    // Only an attached socket may drive the hub. A frame from a socket that never sent a hello, or
+    // from one that has since been superseded, is dropped.
+    if (known === null) {
       return;
     }
 
-    this.record("in", frame.type, this.summaryOf(frame));
-    this.route(frame);
+    this.record(known.name, "in", frame.type, this.summaryOf(frame));
+    this.route(known, frame);
   }
 
-  /** Note that an agent socket has closed. Only the current socket's close detaches the agent. */
+  /** Note that an agent socket has closed. Only a socket still holding its name detaches an agent. */
   onClose(link: AgentLink): void {
-    if (this.current !== null && this.current.link.socketId === link.socketId) {
-      this.detach("agent connection closed", false);
+    const agent = this.bySocket.get(link.socketId);
+    if (agent !== undefined) {
+      this.detach(agent, "agent connection closed", false);
     }
   }
 
   private attach(link: AgentLink, hello: HelloFrame): void {
-    this.record("in", "hello", this.summaryOf(hello));
+    this.record(hello.agent, "in", "hello", this.summaryOf(hello));
 
-    // Exactly one agent slot. Whatever occupies it is displaced and its socket closed with a stated
-    // reason, so a reconnect after a half-dead TCP connection does not leave two peers streaming.
-    if (this.current !== null) {
-      this.detach("superseded by a new connection", true);
+    // A socket that already holds another name gives that name up; the socket itself carries on.
+    const renamed = this.bySocket.get(link.socketId);
+    if (renamed !== undefined && renamed.name !== hello.agent) {
+      this.detach(renamed, "the connection said hello under another name", false);
+    }
+
+    // One connection per name. Whatever held this name on another socket is displaced and its socket
+    // closed with a stated reason, so a redial after a half-dead TCP connection does not leave two
+    // peers streaming as the same machine. Agents under other names are left alone.
+    const previous = this.agents.get(hello.agent);
+    if (previous !== undefined) {
+      this.detach(previous, "superseded by a new connection", previous.link.socketId !== link.socketId);
     }
 
     const now = Date.now();
@@ -271,22 +298,25 @@ export class HubCore {
       connectedAt: now,
       lastPongAt: now,
       pingTimer: null,
+      commands: new Map(),
+      transfers: new Map(),
     };
-    this.current = agent;
-    agent.pingTimer = setInterval(() => this.pingTick(), this.options.pingIntervalMs);
+    this.agents.set(agent.name, agent);
+    this.bySocket.set(link.socketId, agent);
+    agent.pingTimer = setInterval(() => this.pingTick(agent), this.options.pingIntervalMs);
 
-    this.send(link, { type: "welcome", v: PROTOCOL_VERSION, hubVersion: this.options.hubVersion });
+    this.send(agent, { type: "welcome", v: PROTOCOL_VERSION, hubVersion: this.options.hubVersion });
   }
 
-  private detach(reason: string, closeSocket: boolean): void {
-    const agent = this.current;
-    if (agent === null) {
+  private detach(agent: AttachedAgent, reason: string, closeSocket: boolean): void {
+    if (this.agents.get(agent.name) !== agent) {
       return;
     }
 
-    // Clear current first, so the close below — which fires onClose for the same socket — sees no
-    // current agent to detach again.
-    this.current = null;
+    // Forget the agent first, so the close below — which fires onClose for the same socket — finds
+    // nothing to detach again.
+    this.agents.delete(agent.name);
+    this.bySocket.delete(agent.link.socketId);
     if (agent.pingTimer !== null) {
       clearInterval(agent.pingTimer);
     }
@@ -295,99 +325,92 @@ export class HubCore {
     }
 
     // Nothing in flight can outlive the socket it streamed over: end every command and every transfer
-    // rather than leave a control caller hanging.
-    for (const command of this.commands.values()) {
+    // this agent carried rather than leave a control caller hanging.
+    for (const command of agent.commands.values()) {
       command.listener.push({ kind: "ended", reason });
       command.listener.end();
     }
-    this.commands.clear();
-    for (const transfer of this.transfers.values()) {
+    agent.commands.clear();
+    for (const transfer of agent.transfers.values()) {
       transfer.listener.push({ kind: "ended", reason });
       transfer.listener.end();
     }
-    this.transfers.clear();
+    agent.transfers.clear();
   }
 
-  private pingTick(): void {
-    const agent = this.current;
-    if (agent === null) {
-      return;
-    }
-
+  private pingTick(agent: AttachedAgent): void {
     const deadAfterMs = this.options.pingIntervalMs * this.options.missedPongLimit;
     if (Date.now() - agent.lastPongAt > deadAfterMs) {
-      this.detach("no pong within the liveness window", true);
+      this.detach(agent, "no pong within the liveness window", true);
       return;
     }
 
-    this.toAgent({ type: "ping", v: PROTOCOL_VERSION, ts: Date.now() });
+    this.send(agent, { type: "ping", v: PROTOCOL_VERSION, ts: Date.now() });
   }
 
-  private route(frame: Frame): void {
+  private route(agent: AttachedAgent, frame: Frame): void {
     switch (frame.type) {
       case "pong": {
-        if (this.current !== null) {
-          this.current.lastPongAt = Date.now();
-        }
+        agent.lastPongAt = Date.now();
         return;
       }
       case "ping": {
-        this.toAgent({ type: "pong", v: PROTOCOL_VERSION, ts: frame.ts });
+        this.send(agent, { type: "pong", v: PROTOCOL_VERSION, ts: frame.ts });
         return;
       }
       case "stdout": {
-        this.commands.get(frame.id)?.listener.push({ kind: "stdout", seq: frame.seq, chunk: frame.chunk });
+        agent.commands.get(frame.id)?.listener.push({ kind: "stdout", seq: frame.seq, chunk: frame.chunk });
         return;
       }
       case "stderr": {
-        this.commands.get(frame.id)?.listener.push({ kind: "stderr", seq: frame.seq, chunk: frame.chunk });
+        agent.commands.get(frame.id)?.listener.push({ kind: "stderr", seq: frame.seq, chunk: frame.chunk });
         return;
       }
       case "exit": {
-        const command = this.commands.get(frame.id);
+        const command = agent.commands.get(frame.id);
         if (command !== undefined) {
           command.listener.push({ kind: "exit", code: frame.code, signal: frame.signal, canceled: frame.canceled });
           command.listener.end();
-          this.commands.delete(frame.id);
+          agent.commands.delete(frame.id);
         }
         return;
       }
       case "error": {
         // An error answers a command the agent refused before it could stream (an unknown shell, a
         // spawn failure, say), or a transfer that failed (a missing file, a bad checksum).
-        const command = this.commands.get(frame.id);
+        const command = agent.commands.get(frame.id);
         if (command !== undefined) {
           command.listener.push({ kind: "error", code: frame.code, message: frame.message });
           command.listener.end();
-          this.commands.delete(frame.id);
+          agent.commands.delete(frame.id);
           return;
         }
-        const transfer = this.transfers.get(frame.id);
+        const transfer = agent.transfers.get(frame.id);
         if (transfer !== undefined) {
-          this.failTransfer(transfer, frame.code, frame.message);
+          this.failTransfer(agent, transfer, frame.code, frame.message);
         }
         return;
       }
       case "transfer-begin": {
         // A download's begin from the agent: the size and checksum it is about to stream.
-        const transfer = this.transfers.get(frame.id);
+        const transfer = agent.transfers.get(frame.id);
         if (transfer !== undefined && transfer.direction === "download" && frame.total !== null && frame.checksum !== null) {
           transfer.listener.push({ kind: "begin", total: frame.total, checksum: frame.checksum });
         }
         return;
       }
       case "transfer-chunk": {
-        const transfer = this.transfers.get(frame.id);
+        const transfer = agent.transfers.get(frame.id);
         if (transfer === undefined || transfer.direction !== "download") {
           return;
         }
         if (frame.seq !== transfer.expectedSeq) {
-          this.failTransfer(transfer, "out-of-order", `expected chunk ${transfer.expectedSeq}, got ${frame.seq}`);
+          this.failTransfer(agent, transfer, "out-of-order", `expected chunk ${transfer.expectedSeq}, got ${frame.seq}`);
           return;
         }
         const decoded = decodeBytes(frame.chunk, { maxPayloadBytes: this.options.maxPayloadBytes });
         if (!decoded.ok) {
-          this.failTransfer(transfer, "bad-chunk", decoded.error.message);
+          this.failTransfer(agent, transfer, "bad-chunk", decoded.error.message);
           return;
         }
         transfer.expectedSeq += 1;
@@ -397,7 +420,7 @@ export class HubCore {
         return;
       }
       case "transfer-end": {
-        const transfer = this.transfers.get(frame.id);
+        const transfer = agent.transfers.get(frame.id);
         if (transfer === undefined) {
           return;
         }
@@ -418,7 +441,7 @@ export class HubCore {
           }
         }
         transfer.listener.end();
-        this.transfers.delete(frame.id);
+        agent.transfers.delete(frame.id);
         return;
       }
       default:
@@ -430,16 +453,45 @@ export class HubCore {
 
   // --- Control operations -----------------------------------------------------------------------
 
-  /** Start a shell command on the agent, streaming its life to `listener`. */
-  startExec(params: ExecParams, listener: CommandListener): StartResult {
-    if (this.current === null) {
-      return { ok: false, reason: "no agent attached" };
+  /**
+   * Decide which agent a request goes to. A named agent must be attached; no name picks the only
+   * agent attached, and is refused while there are several, so a request never lands on a machine
+   * nobody chose.
+   */
+  resolveTarget(name: string | null): TargetResult {
+    const found = this.findTarget(name);
+    return found.ok ? { ok: true, name: found.agent.name } : found;
+  }
+
+  private findTarget(name: string | null): { ok: true; agent: AttachedAgent } | { ok: false; code: TargetRefusal; reason: string } {
+    if (this.agents.size === 0) {
+      return { ok: false, code: "no-agent", reason: "no agent attached" };
     }
+    if (name !== null) {
+      const agent = this.agents.get(name);
+      return agent === undefined
+        ? { ok: false, code: "unknown-agent", reason: `no agent named ${name} is attached` }
+        : { ok: true, agent };
+    }
+    if (this.agents.size > 1) {
+      const names = [...this.agents.keys()].sort().join(", ");
+      return { ok: false, code: "agent-required", reason: `${this.agents.size} agents are attached (${names}); name one` };
+    }
+    return { ok: true, agent: this.agents.values().next().value as AttachedAgent };
+  }
+
+  /** Start a shell command on the target agent, streaming its life to `listener`. */
+  startExec(params: ExecParams, listener: CommandListener, target: string | null = null): StartResult {
+    const found = this.findTarget(target);
+    if (!found.ok) {
+      return { ok: false, reason: found.reason };
+    }
+    const agent = found.agent;
 
     const id = this.nextId("c");
-    this.commands.set(id, { id, listener });
+    agent.commands.set(id, { id, listener });
     listener.push({ kind: "started", id });
-    this.toAgent({
+    this.send(agent, {
       type: "exec",
       v: PROTOCOL_VERSION,
       id,
@@ -452,15 +504,19 @@ export class HubCore {
     return { ok: true, id };
   }
 
-  /** Ask the agent to stop a running command. The command ends when its exit frame arrives. */
+  /**
+   * Ask the agent running a command to stop it. The command ends when its exit frame arrives. A
+   * command id is unique across the hub, so the id alone finds the agent.
+   */
   cancel(id: string): CancelResult {
-    if (this.current === null) {
+    if (this.agents.size === 0) {
       return { ok: false, reason: "no agent attached" };
     }
-    if (!this.commands.has(id)) {
+    const agent = [...this.agents.values()].find((candidate) => candidate.commands.has(id));
+    if (agent === undefined) {
       return { ok: false, reason: "unknown command" };
     }
-    this.toAgent({ type: "cancel", v: PROTOCOL_VERSION, id });
+    this.send(agent, { type: "cancel", v: PROTOCOL_VERSION, id });
     return { ok: true };
   }
 
@@ -470,24 +526,26 @@ export class HubCore {
    * held below either side's payload cap, and closes with the same total and checksum. The transfer
    * completes when the agent acknowledges the verified write.
    */
-  startUpload(params: UploadParams, listener: TransferListener): StartResult {
-    if (this.current === null) {
-      return { ok: false, reason: "no agent attached" };
+  startUpload(params: UploadParams, listener: TransferListener, target: string | null = null): StartResult {
+    const found = this.findTarget(target);
+    if (!found.ok) {
+      return { ok: false, reason: found.reason };
     }
+    const agent = found.agent;
 
     const id = this.nextId("u");
     const total = params.data.byteLength;
     const sum = checksum(params.data);
-    this.transfers.set(id, { id, direction: "upload", listener, expectedSeq: 0, received: 0, hash: null });
+    agent.transfers.set(id, { id, direction: "upload", listener, expectedSeq: 0, received: 0, hash: null });
     listener.push({ kind: "started", id });
 
-    this.toAgent({ type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path: params.path, total, checksum: sum });
+    this.send(agent, { type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path: params.path, total, checksum: sum });
     let seq = 0;
     for (let offset = 0; offset < total; offset += TRANSFER_CHUNK_BYTES) {
       const slice = params.data.subarray(offset, Math.min(offset + TRANSFER_CHUNK_BYTES, total));
-      this.toAgent({ type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) });
+      this.send(agent, { type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) });
     }
-    this.toAgent({ type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum });
+    this.send(agent, { type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum });
     return { ok: true, id };
   }
 
@@ -497,54 +555,52 @@ export class HubCore {
    * chunks so it can verify the whole content against that declared total and checksum when the
    * transfer closes.
    */
-  startDownload(params: DownloadParams, listener: TransferListener): StartResult {
-    if (this.current === null) {
-      return { ok: false, reason: "no agent attached" };
+  startDownload(params: DownloadParams, listener: TransferListener, target: string | null = null): StartResult {
+    const found = this.findTarget(target);
+    if (!found.ok) {
+      return { ok: false, reason: found.reason };
     }
+    const agent = found.agent;
 
     const id = this.nextId("d");
-    this.transfers.set(id, { id, direction: "download", listener, expectedSeq: 0, received: 0, hash: createHash(CHECKSUM_ALGORITHM) });
+    agent.transfers.set(id, { id, direction: "download", listener, expectedSeq: 0, received: 0, hash: createHash(CHECKSUM_ALGORITHM) });
     listener.push({ kind: "started", id });
-    this.toAgent({ type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "download", path: params.path, total: null, checksum: null });
+    this.send(agent, { type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "download", path: params.path, total: null, checksum: null });
     return { ok: true, id };
   }
 
-  private failTransfer(transfer: Transfer, code: string, message: string): void {
+  private failTransfer(agent: AttachedAgent, transfer: Transfer, code: string, message: string): void {
     transfer.listener.push({ kind: "error", code, message });
     transfer.listener.end();
-    this.transfers.delete(transfer.id);
+    agent.transfers.delete(transfer.id);
   }
 
   /**
-   * Tell the agent to erase itself and depart. The hub only relays the signal; the agent does the
-   * erasing and then drops its connection, which is the hub's confirmation it went. There is nothing
-   * to wait for, so this returns as soon as the frame is on its way.
+   * Tell the target agent to erase itself and depart. The hub only relays the signal; the agent does
+   * the erasing and then drops its connection, which is the hub's confirmation it went. There is
+   * nothing to wait for, so this returns as soon as the frame is on its way.
    */
-  leave(): CancelResult {
-    if (this.current === null) {
-      return { ok: false, reason: "no agent attached" };
+  leave(target: string | null = null): CancelResult {
+    const found = this.findTarget(target);
+    if (!found.ok) {
+      return { ok: false, reason: found.reason };
     }
-    this.toAgent({ type: "leave", v: PROTOCOL_VERSION });
+    this.send(found.agent, { type: "leave", v: PROTOCOL_VERSION });
     return { ok: true };
   }
 
   status(): StatusSnapshot {
-    const agent = this.current;
-    return {
-      run: this.run,
-      attached: agent !== null,
-      agent:
-        agent === null
-          ? null
-          : {
-              name: agent.name,
-              agentVersion: agent.agentVersion,
-              capabilities: [...agent.capabilities],
-              connectedAt: agent.connectedAt,
-              lastPongAt: agent.lastPongAt,
-            },
-      inFlight: [...this.commands.keys()],
-    };
+    const agents = [...this.agents.values()]
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((agent) => ({
+        name: agent.name,
+        agentVersion: agent.agentVersion,
+        capabilities: [...agent.capabilities],
+        connectedAt: agent.connectedAt,
+        lastPongAt: agent.lastPongAt,
+        inFlight: [...agent.commands.keys()],
+      }));
+    return { run: this.run, attached: agents.length > 0, agents };
   }
 
   // --- Traffic log ------------------------------------------------------------------------------
@@ -562,27 +618,23 @@ export class HubCore {
     };
   }
 
-  /** Stop probing, close the agent socket, and end every command in flight. For shutdown. */
+  /** Stop probing, close every agent socket, and end every command in flight. For shutdown. */
   shutdown(): void {
-    this.detach("hub shutting down", true);
+    for (const agent of [...this.agents.values()]) {
+      this.detach(agent, "hub shutting down", true);
+    }
     this.tailSubs.clear();
   }
 
   // --- Internals --------------------------------------------------------------------------------
 
-  private toAgent(frame: Frame): void {
-    if (this.current !== null) {
-      this.send(this.current.link, frame);
-    }
+  private send(agent: AttachedAgent, frame: Frame): void {
+    agent.link.send(encodeFrame(frame));
+    this.record(agent.name, "out", frame.type, this.summaryOf(frame));
   }
 
-  private send(link: AgentLink, frame: Frame): void {
-    link.send(encodeFrame(frame));
-    this.record("out", frame.type, this.summaryOf(frame));
-  }
-
-  private record(dir: "in" | "out", type: FrameType | "invalid", summary: Record<string, unknown>): void {
-    const entry: TrafficEntry = { id: ++this.trafficSeq, at: Date.now(), dir, type, summary };
+  private record(agent: string | null, dir: "in" | "out", type: FrameType | "invalid", summary: Record<string, unknown>): void {
+    const entry: TrafficEntry = { id: ++this.trafficSeq, at: Date.now(), agent, dir, type, summary };
     this.traffic.push(entry);
     if (this.traffic.length > this.options.ringSize) {
       this.traffic.shift();

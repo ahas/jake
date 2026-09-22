@@ -42,21 +42,20 @@ export function renderConsolePage(token: string): string {
 
 <div class="card">
   <div class="state"><span class="dot" id="dot"></span><span id="stateText">connecting…</span></div>
-  <dl id="detail" hidden>
-    <dt>agent</dt><dd id="agentName">—</dd>
-    <dt>version</dt><dd id="agentVersion">—</dd>
-    <dt>connected for</dt><dd id="uptime">—</dd>
-    <dt>capabilities</dt><dd id="caps">—</dd>
-    <dt>in-flight</dt><dd id="inflight">—</dd>
-  </dl>
+  <div id="detail" hidden style="margin-top:14px; overflow-x:auto">
+    <table>
+      <thead><tr><th>agent</th><th>version</th><th>connected for</th><th>last pong</th><th>capabilities</th><th>in-flight</th></tr></thead>
+      <tbody id="agents"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="card">
   <div class="sub" style="margin:0 0 10px">traffic</div>
   <div class="feed">
     <table>
-      <thead><tr><th>time</th><th>dir</th><th>type</th><th>summary</th></tr></thead>
-      <tbody id="feed"><tr><td colspan="4" class="empty">waiting for frames…</td></tr></tbody>
+      <thead><tr><th>time</th><th>agent</th><th>dir</th><th>type</th><th>summary</th></tr></thead>
+      <tbody id="feed"><tr><td colspan="5" class="empty">waiting for frames…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -82,15 +81,30 @@ async function poll() {
     const dot = document.getElementById("dot");
     const detail = document.getElementById("detail");
     document.getElementById("hubrun").textContent = "hub " + s.run;
-    if (s.attached && s.agent) {
+    if (s.agents.length > 0) {
       dot.className = "dot on";
-      document.getElementById("stateText").textContent = "attached";
+      document.getElementById("stateText").textContent =
+        "attached — " + s.agents.length + (s.agents.length === 1 ? " agent" : " agents");
       detail.hidden = false;
-      document.getElementById("agentName").textContent = s.agent.name;
-      document.getElementById("agentVersion").textContent = "v" + s.agent.agentVersion;
-      document.getElementById("uptime").textContent = fmtDuration(Date.now() - s.agent.connectedAt);
-      document.getElementById("caps").textContent = s.agent.capabilities.length ? s.agent.capabilities.join(", ") : "(none)";
-      document.getElementById("inflight").textContent = s.inFlight.length ? s.inFlight.join(", ") : "(none)";
+      const now = Date.now();
+      const rows = s.agents.map((a) => {
+        const tr = document.createElement("tr");
+        const cells = [
+          a.name,
+          "v" + a.agentVersion,
+          fmtDuration(now - a.connectedAt),
+          fmtDuration(now - a.lastPongAt) + " ago",
+          a.capabilities.length ? a.capabilities.join(", ") : "(none)",
+          a.inFlight.length ? a.inFlight.join(", ") : "(none)",
+        ];
+        for (const text of cells) {
+          const td = document.createElement("td");
+          td.textContent = text;
+          tr.appendChild(td);
+        }
+        return tr;
+      });
+      document.getElementById("agents").replaceChildren(...rows);
     } else {
       dot.className = "dot off";
       document.getElementById("stateText").textContent = "detached — no agent connected";
@@ -111,9 +125,11 @@ function addRow(entry) {
   const dir = entry.dir === "in" ? "<-" : "->";
   tr.innerHTML =
     '<td>' + time + '</td>' +
+    '<td class="agent"></td>' +
     '<td class="' + entry.dir + '">' + dir + '</td>' +
     '<td>' + entry.type + '</td>' +
     '<td class="summary"></td>';
+  tr.querySelector(".agent").textContent = entry.agent ?? "?";
   tr.lastChild.textContent = JSON.stringify(entry.summary);
   feed.appendChild(tr);
   while (feed.childElementCount > 300) feed.removeChild(feed.firstChild);

@@ -116,8 +116,16 @@ describe("parseArgs", () => {
     const result = parseArgs(["exec", "echo", "hi"]);
     expect(result).toEqual({
       ok: true,
-      command: { name: "exec", request: { shell: "powershell", command: "echo hi", cwd: null, env: {}, distro: null } },
+      command: { name: "exec", request: { shell: "powershell", command: "echo hi", cwd: null, env: {}, distro: null }, agent: null },
     });
+  });
+
+  test("every command that reaches a machine reads --agent and its -a alias", () => {
+    expect(parseArgs(["exec", "hostname", "--agent", "node2"])).toMatchObject({ ok: true, command: { name: "exec", agent: "node2" } });
+    expect(parseArgs(["upload", "a", "b", "-a", "node2"])).toMatchObject({ ok: true, command: { name: "upload", agent: "node2" } });
+    expect(parseArgs(["download", "a", "b", "--agent=node2"])).toMatchObject({ ok: true, command: { name: "download", agent: "node2" } });
+    expect(parseArgs(["leave", "--yes", "--agent", "node2"])).toMatchObject({ ok: true, command: { name: "leave", agent: "node2" } });
+    expect(parseArgs(["status", "--agent", "node2"]).ok).toBe(false);
   });
 
   test("exec reads shell, cwd, distro, and repeated env", () => {
@@ -127,6 +135,7 @@ describe("parseArgs", () => {
       command: {
         name: "exec",
         request: { shell: "wsl", command: "ls", cwd: "/tmp", distro: "Ubuntu", env: { A: "1", B: "2" } },
+        agent: null,
       },
     });
   });
@@ -157,7 +166,7 @@ describe("parseArgs", () => {
   test("upload needs exactly a local and a remote path", () => {
     expect(parseArgs(["upload", "./a.txt", "C:/b.txt"])).toEqual({
       ok: true,
-      command: { name: "upload", local: "./a.txt", remote: "C:/b.txt" },
+      command: { name: "upload", local: "./a.txt", remote: "C:/b.txt", agent: null },
     });
     expect(parseArgs(["upload", "only-one"]).ok).toBe(false);
     expect(parseArgs(["upload", "a", "b", "c"]).ok).toBe(false);
@@ -166,7 +175,7 @@ describe("parseArgs", () => {
   test("download needs exactly a remote and a local path", () => {
     expect(parseArgs(["download", "C:/r.bin", "./l.bin"])).toEqual({
       ok: true,
-      command: { name: "download", remote: "C:/r.bin", local: "./l.bin" },
+      command: { name: "download", remote: "C:/r.bin", local: "./l.bin", agent: null },
     });
     expect(parseArgs(["download"]).ok).toBe(false);
     expect(parseArgs(["download", "one", "two", "three"]).ok).toBe(false);
@@ -179,8 +188,8 @@ describe("parseArgs", () => {
   });
 
   test("leave needs --yes and takes no positionals", () => {
-    expect(parseArgs(["leave"])).toEqual({ ok: true, command: { name: "leave", confirmed: false } });
-    expect(parseArgs(["leave", "--yes"])).toEqual({ ok: true, command: { name: "leave", confirmed: true } });
+    expect(parseArgs(["leave"])).toEqual({ ok: true, command: { name: "leave", confirmed: false, agent: null } });
+    expect(parseArgs(["leave", "--yes"])).toEqual({ ok: true, command: { name: "leave", confirmed: true, agent: null } });
     expect(parseArgs(["leave", "now"]).ok).toBe(false);
   });
 
@@ -215,20 +224,39 @@ describe("status", () => {
   const snapshot = {
     run: "hub-abc",
     attached: true,
-    agent: { name: "hass-desktop", agentVersion: "0.1.0", capabilities: ["exec:powershell", "exec:wsl"], connectedAt: NOW - 65_000, lastPongAt: NOW },
-    inFlight: ["c1"],
+    agents: [
+      {
+        name: "hass-desktop",
+        agentVersion: "0.1.0",
+        capabilities: ["exec:powershell", "exec:wsl"],
+        connectedAt: NOW - 65_000,
+        lastPongAt: NOW - 4_000,
+        inFlight: ["c1"],
+      },
+      { name: "node2", agentVersion: "0.1.0", capabilities: ["exec:linux"], connectedAt: NOW - 5_000, lastPongAt: NOW, inFlight: [] },
+    ],
   };
 
-  test("prints a human-readable summary", async () => {
+  test("prints every attached agent", async () => {
     const { client } = fakeHub({ "/status": () => jsonResponse(snapshot) });
     const cap = capture(client);
     const code = await runCli(["status"], cap.deps);
     expect(code).toBe(EXIT_OK);
     const text = cap.out.join("");
-    expect(text).toContain("attached — hass-desktop v0.1.0");
-    expect(text).toContain("connected for 1m 5s");
+    expect(text).toContain("attached — 2 agents");
+    expect(text).toContain("hass-desktop v0.1.0");
+    expect(text).toContain("connected for 1m 5s, last pong 4s ago");
     expect(text).toContain("exec:powershell, exec:wsl");
     expect(text).toContain("in-flight commands: c1");
+    expect(text).toContain("node2 v0.1.0");
+    expect(text).toContain("exec:linux");
+  });
+
+  test("a hub with no agent reads as detached", async () => {
+    const { client } = fakeHub({ "/status": () => jsonResponse({ run: "hub-abc", attached: false, agents: [] }) });
+    const cap = capture(client);
+    await runCli(["status"], cap.deps);
+    expect(cap.out.join("")).toContain("detached — no agent connected");
   });
 
   test("--json prints the raw snapshot", async () => {
@@ -366,6 +394,33 @@ describe("exec streaming", () => {
     expect(cap.err.join("")).toContain("connection ended");
   });
 
+  test("--agent names the target in the request", async () => {
+    const { client, calls } = fakeHub({ "/exec": () => eventStreamResponse([sseEvent("exit", { code: 0, signal: null, canceled: false })]) });
+    const cap = capture(client);
+    expect(await runCli(["exec", "hostname", "--agent", "node 2"], cap.deps)).toBe(EXIT_OK);
+    expect(new URL(calls[0]!.url).searchParams.get("agent")).toBe("node 2");
+  });
+
+  test("no --agent leaves the choice to the hub", async () => {
+    const { client, calls } = fakeHub({ "/exec": () => eventStreamResponse([sseEvent("exit", { code: 0, signal: null, canceled: false })]) });
+    await runCli(["exec", "hostname"], capture(client).deps);
+    expect(new URL(calls[0]!.url).searchParams.has("agent")).toBe(false);
+  });
+
+  test("an agent that is not attached exits with the no-agent code", async () => {
+    const { client } = fakeHub({ "/exec": () => jsonResponse({ error: "no agent named x is attached" }, 404) });
+    const cap = capture(client);
+    expect(await runCli(["exec", "x", "-a", "x"], cap.deps)).toBe(EXIT_NO_AGENT);
+    expect(cap.err.join("")).toContain("no agent named x");
+  });
+
+  test("a missing --agent among several exits with the usage code", async () => {
+    const { client } = fakeHub({ "/exec": () => jsonResponse({ error: "2 agents are attached (a, b); name one" }, 400) });
+    const cap = capture(client);
+    expect(await runCli(["exec", "x"], cap.deps)).toBe(EXIT_USAGE);
+    expect(cap.err.join("")).toContain("name one");
+  });
+
   test("a hub with no agent refuses exec with the no-agent code", async () => {
     const { client } = fakeHub({ "/exec": () => jsonResponse({ error: "no agent attached" }, 409) });
     const cap = capture(client);
@@ -423,6 +478,21 @@ describe("upload", () => {
     expect(code).toBe(EXIT_FAILED);
     expect(calls).toHaveLength(0);
     expect(cap.err.join("")).toContain("could not read nope.txt");
+  });
+
+  test("--agent rides along with the remote path on both transfers", async () => {
+    const { client, calls } = fakeHub({
+      "/upload": () => eventStreamResponse([sseEvent("completed", { total: 1, checksum: "s" })]),
+      "/download": () => eventStreamResponse([sseEvent("completed", { total: 0, checksum: "s" })]),
+    });
+    const cap = capture(client, { readFile: async () => encoder.encode("x"), writeFile: async () => {} });
+    await runCli(["upload", "a", "C:/b", "--agent", "node2"], cap.deps);
+    await runCli(["download", "C:/b", "a", "-a", "node2"], cap.deps);
+    for (const call of calls) {
+      const params = new URL(call.url).searchParams;
+      expect(params.get("path")).toBe("C:/b");
+      expect(params.get("agent")).toBe("node2");
+    }
   });
 
   test("a hub with no agent refuses with the no-agent code", async () => {
@@ -491,6 +561,12 @@ describe("leave", () => {
     expect(cap.out.join("")).toContain("leave signal sent");
   });
 
+  test("--agent names the agent to erase", async () => {
+    const { client, calls } = fakeHub({ "/leave": () => jsonResponse({ ok: true }) });
+    await runCli(["leave", "--yes", "--agent", "node2"], capture(client).deps);
+    expect(new URL(calls[0]!.url).searchParams.get("agent")).toBe("node2");
+  });
+
   test("a hub with no agent refuses with the no-agent code", async () => {
     const { client } = fakeHub({ "/leave": () => jsonResponse({ ok: false, reason: "no agent attached" }, 409) });
     const cap = capture(client);
@@ -520,8 +596,8 @@ describe("tail", () => {
       "/events": () =>
         eventStreamResponse([
           sseEvent("run", { run: "hub-abc" }),
-          sseEvent("traffic", { id: 1, at: NOW, dir: "in", type: "hello", summary: { agent: "hass-desktop" } }, 1),
-          sseEvent("traffic", { id: 2, at: NOW, dir: "out", type: "exec", summary: { id: "c1", command: "echo hi" } }, 2),
+          sseEvent("traffic", { id: 1, at: NOW, agent: "hass-desktop", dir: "in", type: "hello", summary: { agent: "hass-desktop" } }, 1),
+          sseEvent("traffic", { id: 2, at: NOW, agent: "hass-desktop", dir: "out", type: "exec", summary: { id: "c1", command: "echo hi" } }, 2),
         ]),
     });
     const cap = capture(client);
@@ -530,8 +606,8 @@ describe("tail", () => {
     expect(calls[0]?.url).toContain("after=0");
     const lines = cap.out.join("").trimEnd().split("\n");
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toContain("<- hello");
-    expect(lines[1]).toContain("-> exec");
+    expect(lines[0]).toContain("hass-desktop <- hello");
+    expect(lines[1]).toContain("hass-desktop -> exec");
     expect(cap.err.join("")).toContain("hub hub-abc");
   });
 

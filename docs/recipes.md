@@ -7,6 +7,9 @@ for the common cases. Moving a whole file is the exception — `jake upload <loc
 (docs/architecture.md, "Moving files"), so the base64-through-a-command trick below is for a binary
 that a command produces inline, not for transferring a file that already exists.
 
+The recipes are written for a hub with one agent attached. With several attached, every one of them
+takes `--agent <name>` to say which machine it runs on; `jake status` lists the names.
+
 ## How a binary result crosses
 
 - The console prints a command's stdout as text, so a binary result — a PNG, an inline blob — is

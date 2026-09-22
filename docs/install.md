@@ -35,7 +35,9 @@ The install needs three values, and nothing more:
 
 - **Hub URL** — the hub to attach to. An empty answer takes the default, `wss://jake.example.org`.
 - **Shared secret** — the secret the hub also holds. It is not shown while typed.
-- **Agent name** — this agent's name. The hub accepts one agent of this name.
+- **Agent name** — this agent's name, which is how the hub and the console tell this machine from
+  the others. The hub holds one connection per name: give every machine its own, because a second
+  install under a name already attached replaces the first.
 
 Run interactively, the script asks for the three; the secret and the name have no default and must
 be given. On a re-run the values already in `agent.env` are offered instead, and an empty answer

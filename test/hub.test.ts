@@ -273,8 +273,8 @@ describe("agent authentication", () => {
 
     const status = await (await control(hub, "/status")).json();
     expect(status.attached).toBe(true);
-    expect(status.agent.name).toBe("hass-desktop");
-    expect(status.agent.capabilities).toEqual(["exec", "fetch"]);
+    expect(status.agents).toHaveLength(1);
+    expect(status.agents[0]).toMatchObject({ name: "hass-desktop", capabilities: ["exec", "fetch"], inFlight: [] });
     expect(agent.received.some((f) => f.type === "welcome")).toBe(true);
   });
 
@@ -317,20 +317,131 @@ describe("agent authentication", () => {
   });
 });
 
-describe("supersede on reconnect", () => {
-  test("a second agent displaces the first, closing it with a stated reason", async () => {
+function execBody(command: string): RequestInit {
+  return { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shell: "linux", command }) };
+}
+
+describe("many agents", () => {
+  test("agents under different names attach side by side and neither displaces the other", async () => {
+    const hub = launch();
+    const wsl = await attach(hub.agentPort, ["exec:wsl"], "jake_wsl");
+    const node2 = await attach(hub.agentPort, ["exec:linux"], "node2");
+
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["jake_wsl", "node2"]);
+    expect(status.agents[1]).toMatchObject({ capabilities: ["exec:linux"], inFlight: [] });
+    expect(wsl.closeCode).toBeNull();
+    expect(node2.closeCode).toBeNull();
+  });
+
+  test("a reconnect under a name already held replaces that connection alone", async () => {
     const hub = launch();
     const first = await attach(hub.agentPort, [], "hass-desktop");
+    const other = await attach(hub.agentPort, [], "node2");
     const second = await attach(hub.agentPort, [], "hass-desktop");
 
     await first.waitClose();
     expect(first.closeCode).toBe(4000);
     expect(first.closeReason).toBe("superseded by a new connection");
+    expect(other.closeCode).toBeNull();
 
     const status = await (await control(hub, "/status")).json();
-    expect(status.attached).toBe(true);
-    // The surviving connection is the second; a probe reaches it and is answered.
-    void second;
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["hass-desktop", "node2"]);
+
+    // The surviving connection is the second: a named command reaches it.
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=hass-desktop`, execBody("hostname"));
+    await reader.ready;
+    await second.waitFor((f) => f.type === "exec");
+  });
+
+  test("a named command goes to that agent only, and its output comes back from it", async () => {
+    const hub = launch();
+    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const node2 = await attach(hub.agentPort, [], "node2");
+
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=node2`, execBody("hostname"));
+    await reader.ready;
+    const exec = await node2.waitFor((f) => f.type === "exec");
+    const id = (exec as { id: string }).id;
+    node2.send({ type: "stdout", v: V, id, seq: 0, chunk: { bytes: 6, base64: Buffer.from("node2\n").toString("base64") } });
+    node2.send({ type: "exit", v: V, id, code: 0, signal: null, canceled: false });
+
+    const out = await reader.waitFor((e) => e.event === "stdout");
+    expect(decodeChunk((out.data as { chunk: { base64: string } }).chunk)).toBe("node2\n");
+    await reader.waitFor((e) => e.event === "exit");
+    expect(wsl.received.some((f) => f.type === "exec")).toBe(false);
+  });
+
+  test("with several attached, a request naming none or an absent one is refused", async () => {
+    const hub = launch();
+    await attach(hub.agentPort, [], "jake_wsl");
+    await attach(hub.agentPort, [], "node2");
+
+    const unnamed = await control(hub, "/exec", execBody("hostname"));
+    expect(unnamed.status).toBe(400);
+    expect(await unnamed.json()).toMatchObject({ code: "agent-required", error: expect.stringContaining("jake_wsl, node2") });
+
+    const absent = await control(hub, "/download?path=/x&agent=ghost", { method: "POST" });
+    expect(absent.status).toBe(404);
+    expect((await absent.json()).code).toBe("unknown-agent");
+
+    const leave = await control(hub, "/leave", { method: "POST" });
+    expect(leave.status).toBe(400);
+  });
+
+  test("an agent that drops ends only its own commands", async () => {
+    const hub = launch();
+    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const node2 = await attach(hub.agentPort, [], "node2");
+
+    const onWsl = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=jake_wsl`, execBody("sleep 60"));
+    const onNode2 = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=node2`, execBody("sleep 60"));
+    await Promise.all([onWsl.ready, onNode2.ready]);
+    await wsl.waitFor((f) => f.type === "exec");
+    const exec = await node2.waitFor((f) => f.type === "exec");
+
+    wsl.close();
+    const ended = await onWsl.waitFor((e) => e.event === "ended");
+    expect(ended.data).toMatchObject({ reason: "agent connection closed" });
+
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents).toHaveLength(1);
+    expect(status.agents[0]).toMatchObject({ name: "node2", inFlight: [(exec as { id: string }).id] });
+
+    // The other agent's command still streams, and cancel finds it by its id alone.
+    const cancel = await control(hub, "/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: (exec as { id: string }).id }),
+    });
+    expect(cancel.status).toBe(200);
+    await node2.waitFor((f) => f.type === "cancel");
+    expect(onNode2.events.some((e) => e.event === "ended")).toBe(false);
+  });
+
+  test("a leave reaches the named agent and leaves the others installed", async () => {
+    const hub = launch();
+    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const node2 = await attach(hub.agentPort, [], "node2");
+
+    const response = await control(hub, "/leave?agent=node2", { method: "POST" });
+    expect(await response.json()).toEqual({ ok: true, agent: "node2" });
+    await node2.waitFor((f) => f.type === "leave");
+    expect(wsl.received.some((f) => f.type === "leave")).toBe(false);
+  });
+
+  test("the traffic log tags each frame with its agent", async () => {
+    const hub = launch();
+    await attach(hub.agentPort, [], "jake_wsl");
+    await attach(hub.agentPort, [], "node2");
+
+    const hellos = hub.core.trafficSince(0).filter((entry) => entry.type === "hello" || entry.type === "welcome");
+    expect(hellos.map((entry) => `${entry.agent} ${entry.type}`)).toEqual([
+      "jake_wsl hello",
+      "jake_wsl welcome",
+      "node2 hello",
+      "node2 welcome",
+    ]);
   });
 });
 
@@ -516,7 +627,7 @@ describe("leave", () => {
 
     const response = await control(hub, "/leave", { method: "POST" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ ok: true, agent: "hass-desktop" });
 
     await agent.waitFor((f) => f.type === "leave");
   });

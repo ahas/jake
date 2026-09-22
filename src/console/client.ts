@@ -59,6 +59,14 @@ export interface DownloadSink {
   onChunk(bytes: Uint8Array): void;
 }
 
+/**
+ * The `agent` query parameter naming a request's target, led by `lead`; empty when no agent is named
+ * and the hub is left to pick the only one attached.
+ */
+function agentQuery(agent: string | null, lead: "?" | "&"): string {
+  return agent === null ? "" : `${lead}agent=${encodeURIComponent(agent)}`;
+}
+
 export class HubClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -93,11 +101,12 @@ export class HubClient {
   }
 
   /**
-   * Tell the hub to erase the agent and depart. The hub relays the frame and the agent erases itself
-   * and drops; there is nothing to stream. A hub with no agent answers 409, reported as `ok: false`.
+   * Tell the hub to erase the named agent (or the only one attached) and let it depart. The hub relays
+   * the frame and the agent erases itself and drops; there is nothing to stream. A hub that cannot
+   * pick the agent answers with a refusal, reported as `ok: false`.
    */
-  async leave(): Promise<{ ok: boolean; status: number; reason?: string }> {
-    const response = await this.fetchImpl(`${this.baseUrl}/leave`, {
+  async leave(agent: string | null = null): Promise<{ ok: boolean; status: number; reason?: string }> {
+    const response = await this.fetchImpl(`${this.baseUrl}/leave${agentQuery(agent, "?")}`, {
       method: "POST",
       headers: this.headers({ "content-type": "application/json" }),
       body: "{}",
@@ -121,8 +130,8 @@ export class HubClient {
    * declines the command (no agent attached) answers with JSON rather than an event stream; that is
    * reported as a `refused` outcome, not thrown.
    */
-  async exec(request: ExecRequest, sink: ExecSink): Promise<ExecOutcome> {
-    const response = await this.fetchImpl(`${this.baseUrl}/exec`, {
+  async exec(request: ExecRequest, sink: ExecSink, agent: string | null = null): Promise<ExecOutcome> {
+    const response = await this.fetchImpl(`${this.baseUrl}/exec${agentQuery(agent, "?")}`, {
       method: "POST",
       headers: this.headers({ "content-type": "application/json" }),
       body: JSON.stringify(request),
@@ -196,8 +205,13 @@ export class HubClient {
    * over the tunnel and reports the agent's verified acknowledgement. A hub with no agent (or a
    * missing path) answers with JSON rather than a stream, reported as a `refused` outcome.
    */
-  async upload(path: string, data: Uint8Array, sink: { onStart?(id: string): void } = {}): Promise<TransferOutcome> {
-    const response = await this.fetchImpl(`${this.baseUrl}/upload?path=${encodeURIComponent(path)}`, {
+  async upload(
+    path: string,
+    data: Uint8Array,
+    sink: { onStart?(id: string): void } = {},
+    agent: string | null = null,
+  ): Promise<TransferOutcome> {
+    const response = await this.fetchImpl(`${this.baseUrl}/upload?path=${encodeURIComponent(path)}${agentQuery(agent, "&")}`, {
       method: "POST",
       headers: this.headers({ "content-type": "application/octet-stream" }),
       // slice() copies into a fresh ArrayBuffer-backed view, which the fetch body type requires.
@@ -211,8 +225,8 @@ export class HubClient {
    * of content through `sink`. The outcome is `completed` only once the hub has verified the assembled
    * bytes against the declared total and checksum, so a caller writes to disk only on `completed`.
    */
-  async download(path: string, sink: DownloadSink): Promise<TransferOutcome> {
-    const response = await this.fetchImpl(`${this.baseUrl}/download?path=${encodeURIComponent(path)}`, {
+  async download(path: string, sink: DownloadSink, agent: string | null = null): Promise<TransferOutcome> {
+    const response = await this.fetchImpl(`${this.baseUrl}/download?path=${encodeURIComponent(path)}${agentQuery(agent, "&")}`, {
       method: "POST",
       headers: this.headers(),
     });

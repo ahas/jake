@@ -12,6 +12,7 @@ import {
   type ExecParams,
   type HubCoreOptions,
   type StartResult,
+  type TargetRefusal,
   type TransferEvent,
   type TransferListener,
 } from "./core";
@@ -187,25 +188,39 @@ function sseStream(begin: (write: (chunk: string) => void, finish: () => void) =
   return new Response(stream, { headers: sseHeaders() });
 }
 
-function execStream(core: HubCore, params: ExecParams): Response {
+function execStream(core: HubCore, params: ExecParams, target: string): Response {
   return sseStream((write, finish) => {
     const listener: CommandListener = { push: (event) => write(execEventFrame(event)), end: finish };
-    return core.startExec(params, listener);
+    return core.startExec(params, listener, target);
   });
 }
 
-function uploadStream(core: HubCore, path: string, data: Uint8Array): Response {
+function uploadStream(core: HubCore, path: string, data: Uint8Array, target: string): Response {
   return sseStream((write, finish) => {
     const listener: TransferListener = { push: (event) => write(transferEventFrame(event)), end: finish };
-    return core.startUpload({ path, data }, listener);
+    return core.startUpload({ path, data }, listener, target);
   });
 }
 
-function downloadStream(core: HubCore, path: string): Response {
+function downloadStream(core: HubCore, path: string, target: string): Response {
   return sseStream((write, finish) => {
     const listener: TransferListener = { push: (event) => write(transferEventFrame(event)), end: finish };
-    return core.startDownload({ path }, listener);
+    return core.startDownload({ path }, listener, target);
   });
+}
+
+// The HTTP status each target refusal answers with: nothing attached is a conflict with the hub's
+// state, a name that is not attached is not found, and a missing name is the caller's to supply.
+const TARGET_REFUSAL_STATUS: Record<TargetRefusal, number> = {
+  "no-agent": 409,
+  "unknown-agent": 404,
+  "agent-required": 400,
+};
+
+/** The agent a request names in its `agent` query parameter, or null when it names none. */
+function requestedAgent(url: URL): string | null {
+  const name = url.searchParams.get("agent");
+  return name === null || name === "" ? null : name;
 }
 
 // --- The traffic tail SSE stream -----------------------------------------------------------------
@@ -273,25 +288,27 @@ async function route(core: HubCore, request: Request): Promise<Response> {
     if ("error" in params) {
       return json({ error: params.error }, 400);
     }
-    if (!core.status().attached) {
-      return json({ error: "no agent attached" }, 409);
+    const target = core.resolveTarget(requestedAgent(url));
+    if (!target.ok) {
+      return json({ error: target.reason, code: target.code }, TARGET_REFUSAL_STATUS[target.code]);
     }
-    return execStream(core, params);
+    return execStream(core, params, target.name);
   }
 
   if (method === "POST" && (path === "/upload" || path === "/download")) {
-    const target = url.searchParams.get("path");
-    if (target === null || target === "") {
+    const remote = url.searchParams.get("path");
+    if (remote === null || remote === "") {
       return json({ error: "the path query parameter is required" }, 400);
     }
-    if (!core.status().attached) {
-      return json({ error: "no agent attached" }, 409);
+    const target = core.resolveTarget(requestedAgent(url));
+    if (!target.ok) {
+      return json({ error: target.reason, code: target.code }, TARGET_REFUSAL_STATUS[target.code]);
     }
     if (path === "/upload") {
       const data = new Uint8Array(await request.arrayBuffer());
-      return uploadStream(core, target, data);
+      return uploadStream(core, remote, data, target.name);
     }
-    return downloadStream(core, target);
+    return downloadStream(core, remote, target.name);
   }
 
   if (method === "POST" && path === "/cancel") {
@@ -304,8 +321,12 @@ async function route(core: HubCore, request: Request): Promise<Response> {
   }
 
   if (method === "POST" && path === "/leave") {
-    const result = core.leave();
-    return result.ok ? json({ ok: true }) : json({ ok: false, reason: result.reason }, 409);
+    const target = core.resolveTarget(requestedAgent(url));
+    if (!target.ok) {
+      return json({ ok: false, reason: target.reason, code: target.code }, TARGET_REFUSAL_STATUS[target.code]);
+    }
+    const result = core.leave(target.name);
+    return result.ok ? json({ ok: true, agent: target.name }) : json({ ok: false, reason: result.reason }, 409);
   }
 
   return json({ error: "not found" }, 404);

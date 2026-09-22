@@ -137,7 +137,7 @@ systemctl --user status jake-hub                 # active (running)
 curl -sI https://jake.example.org/                   # HTTP 401 — the hub answers, and wants the secret
 curl -sI -H "Authorization: Bearer $(grep '^JAKE_SECRET=' ~/.local/share/jake/hub.env | cut -d= -f2)" \
   https://jake.example.org/                          # HTTP 426 — authorized, expecting a WS upgrade
-bun ~/repos/ahas/infra/jake/src/console/main.ts status   # whether the agent is attached
+bun ~/repos/ahas/infra/jake/src/console/main.ts status   # every attached agent, one line each
 ```
 
 The agent server checks the secret before anything else, so a plain request reaching the hub returns
@@ -146,4 +146,6 @@ upgrade. Either code is the proof the DNS -> router -> NPM -> hub path is whole;
 the secret in `hub.env` is the one the hub loaded. A 502 means NPM cannot reach the hub — recheck the
 port and that the service is running — and a timeout means the firewall rule from step 3 is missing.
 The console's `status` runs against the loopback control API, which is never exposed through NPM; it
-is how you see, on main-host, whether 하스's agent has dialed in.
+is how you see, on main-host, which of 하스's agents have dialed in. The hub holds every agent at
+once, one per agent name, so a second machine's agent appears beside the first rather than in its
+place.
