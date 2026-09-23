@@ -18,7 +18,7 @@ the two secrets, and lock it down.
 
 ```sh
 mkdir -p ~/.local/share/jake
-cp ~/repos/ahas/infra/jake/hub.env.example ~/.local/share/jake/hub.env
+cp ~/repos/ahas/jake/hub.env.example ~/.local/share/jake/hub.env
 # Generate two independent secrets and put them in the file:
 openssl rand -hex 32   # -> JAKE_SECRET        (the agent must present the same value)
 openssl rand -hex 32   # -> JAKE_CONTROL_TOKEN (the console and 비모 present this one)
@@ -39,7 +39,7 @@ reboot without an interactive login.
 
 ```sh
 mkdir -p ~/.config/systemd/user
-ln -sf ~/repos/ahas/infra/jake/jake-hub.service ~/.config/systemd/user/jake-hub.service
+ln -sf ~/repos/ahas/jake/jake-hub.service ~/.config/systemd/user/jake-hub.service
 systemctl --user daemon-reload
 systemctl --user enable --now jake-hub
 loginctl enable-linger "$USER"
@@ -121,7 +121,7 @@ container as `<id>.conf`, then check and reload nginx:
 
 ```sh
 ID=<the id printed above>
-sed "s/HOSTID/$ID/g" ~/repos/ahas/infra/jake/deploy/jake.example.org.conf \
+sed "s/HOSTID/$ID/g" ~/repos/ahas/jake/deploy/jake.example.org.conf \
   | ssh mm "pct exec 109 -- sh -c 'cat > /data/nginx/proxy_host/$ID.conf'"
 ssh mm "pct exec 109 -- sh -c 'nginx -t && nginx -s reload'"
 ```
@@ -137,7 +137,7 @@ systemctl --user status jake-hub                 # active (running)
 curl -sI https://jake.example.org/                   # HTTP 401 — the hub answers, and wants the secret
 curl -sI -H "Authorization: Bearer $(grep '^JAKE_SECRET=' ~/.local/share/jake/hub.env | cut -d= -f2)" \
   https://jake.example.org/                          # HTTP 426 — authorized, expecting a WS upgrade
-bun ~/repos/ahas/infra/jake/src/console/main.ts status   # every attached agent, one line each
+bun ~/repos/ahas/jake/src/console/main.ts status   # every attached agent, one line each
 ```
 
 The agent server checks the secret before anything else, so a plain request reaching the hub returns

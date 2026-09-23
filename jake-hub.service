@@ -13,7 +13,7 @@ StartLimitBurst=5
 
 [Service]
 # The checkout the hub runs from. It is not compiled; bun runs the entry point in place.
-WorkingDirectory=%h/repos/ahas/infra/jake
+WorkingDirectory=%h/repos/ahas/jake
 ExecStart=%h/.bun/bin/bun src/hub/main.ts
 Restart=always
 RestartSec=5
