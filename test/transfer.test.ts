@@ -24,7 +24,14 @@ import {
   type TransferSink,
 } from "../src/agent/transfer";
 import type { Scheduler, Transport } from "../src/agent/transport";
-import { HubCore, type AgentLink, type HubCoreOptions, type TransferEvent, type TransferListener } from "../src/hub/core";
+import {
+  HubCore,
+  type AgentLink,
+  type HubCoreOptions,
+  type SendOutcome,
+  type TransferEvent,
+  type TransferListener,
+} from "../src/hub/core";
 
 const V = PROTOCOL_VERSION;
 const OPTS = { maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES };
@@ -216,6 +223,26 @@ describe("FileTransferRunner upload", () => {
     await until(() => sink.last()?.kind === "fail");
     expect(sink.last()).toMatchObject({ kind: "fail", code: "out-of-order" });
   });
+
+  test("an upload the hub gives up on is discarded with its temp file, and answers nothing", async () => {
+    const dir = tempDir();
+    const path = join(dir, "out.bin");
+    const data = randomBytes(300);
+    const runner = new FileTransferRunner({ fs: nodeTransferFs, maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES, log: silentLog, chunkBytes: 64 });
+    const sink = new CaptureSink();
+    runner.begin({ id: "u5", direction: "upload", path, total: data.byteLength, checksum: checksum(data) }, sink);
+    runner.chunk("u5", 0, encodeBytes(data.subarray(0, 100)));
+    await until(() => readdirSync(dir).length === 1); // the temp file is open
+
+    runner.cancel("u5");
+    await until(() => readdirSync(dir).length === 0);
+    // What the hub had already sent before it gave up finds no transfer to feed.
+    runner.chunk("u5", 1, encodeBytes(data.subarray(100)));
+    runner.end("u5", data.byteLength, checksum(data));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(readdirSync(dir)).toEqual([]);
+    expect(sink.calls).toEqual([]);
+  });
 });
 
 // --- Agent-side runner: downloads -----------------------------------------------------------------
@@ -273,18 +300,32 @@ describe("FileTransferRunner download", () => {
 
 // --- Hub-side routing -----------------------------------------------------------------------------
 
-function attachAgent(core: HubCore): { link: AgentLink; sent: Frame[] } {
+// A link whose socket answers each frame with `outcomeOf`, and whose backlog drains only when the test
+// calls `drain`.
+function attachAgent(
+  core: HubCore,
+  outcomeOf: (frame: Frame) => SendOutcome = () => "sent",
+): { link: AgentLink; sent: Frame[]; drain(): void } {
   const sent: Frame[] = [];
+  const drainWaiters: Array<() => void> = [];
   const link: AgentLink = {
     socketId: core.nextSocketId(),
     send(text) {
       const result = decodeFrame(text, OPTS);
-      if (result.ok) sent.push(result.frame);
+      if (!result.ok) return "dropped";
+      const outcome = outcomeOf(result.frame);
+      if (outcome !== "dropped") sent.push(result.frame);
+      return outcome;
     },
+    drained: () => new Promise((resolve) => drainWaiters.push(resolve)),
     close() {},
   };
   core.onMessage(link, encodeFrame({ type: "hello", v: V, agent: "hass", agentVersion: "0.1.0", capabilities: ["transfer"] }));
-  return { link, sent };
+  return { link, sent, drain: () => drainWaiters.splice(0).forEach((wake) => wake()) };
+}
+
+function uploadChunks(sent: Frame[]): Extract<Frame, { type: "transfer-chunk" }>[] {
+  return sent.filter((f): f is Extract<Frame, { type: "transfer-chunk" }> => f.type === "transfer-chunk");
 }
 
 function chunkFrame(id: string, seq: number, bytes: Uint8Array): Frame {
@@ -321,6 +362,50 @@ describe("HubCore transfer routing", () => {
     core.onMessage(link, encodeFrame({ type: "transfer-end", v: V, id, total: data.byteLength, checksum: sum }));
     expect(listener.terminal()).toMatchObject({ kind: "completed", total: data.byteLength });
     expect(listener.ended).toBe(true);
+  });
+
+  test("an upload hands a backed-up socket nothing more until it drains", async () => {
+    const core = makeCore();
+    const backedUp = (f: Frame): SendOutcome => (f.type === "transfer-chunk" && f.seq === 0 ? "queued" : "sent");
+    const { sent, drain } = attachAgent(core, backedUp);
+    const data = randomBytes(TRANSFER_CHUNK_BYTES * 3 + 10);
+
+    core.startUpload({ path: "/out.bin", data }, new CaptureListener());
+    expect(sent.map((f) => f.type)).toEqual(["welcome", "transfer-begin", "transfer-chunk"]);
+
+    drain();
+    await until(() => sent.some((f) => f.type === "transfer-end"));
+    expect(uploadChunks(sent).map((f) => f.seq)).toEqual([0, 1, 2, 3]);
+    expect(sent.at(-1)).toMatchObject({ type: "transfer-end", total: data.byteLength, checksum: checksum(data) });
+  });
+
+  test("a frame the socket drops fails the upload at once and tells the agent to discard it", () => {
+    const core = makeCore();
+    const { sent } = attachAgent(core, (f) => (f.type === "transfer-chunk" && f.seq === 1 ? "dropped" : "sent"));
+    const listener = new CaptureListener();
+
+    const result = core.startUpload({ path: "/out.bin", data: randomBytes(TRANSFER_CHUNK_BYTES * 3) }, listener);
+    const id = result.ok ? result.id : "";
+
+    expect(listener.terminal()).toMatchObject({ kind: "error", code: "dropped" });
+    expect(listener.ended).toBe(true);
+    expect(sent.at(-1)).toMatchObject({ type: "error", id, code: "dropped" });
+    expect(uploadChunks(sent).map((f) => f.seq)).toEqual([0]);
+    expect(sent.some((f) => f.type === "transfer-end")).toBe(false);
+  });
+
+  test("an upload the agent has failed is sent no further", async () => {
+    const core = makeCore();
+    const { link, sent, drain } = attachAgent(core, (f) => (f.type === "transfer-chunk" ? "queued" : "sent"));
+    const listener = new CaptureListener();
+    const result = core.startUpload({ path: "/out.bin", data: randomBytes(TRANSFER_CHUNK_BYTES * 3) }, listener);
+    const id = result.ok ? result.id : "";
+
+    core.onMessage(link, encodeFrame({ type: "error", v: V, id, code: "disk-full", message: "no space left on device" }));
+    drain();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    expect(listener.terminal()).toMatchObject({ kind: "error", code: "disk-full" });
+    expect(uploadChunks(sent).map((f) => f.seq)).toEqual([0]);
   });
 
   test("requests a download, verifies the assembled bytes, and completes", () => {
@@ -390,7 +475,15 @@ const noopScheduler: Scheduler = {
 
 function wireAgentToHub(hub: HubCore, runner: FileTransferRunner): void {
   let agent: AgentConnection;
-  const agentLink: AgentLink = { socketId: hub.nextSocketId(), send: (text) => agent.handleMessage(text), close() {} };
+  const agentLink: AgentLink = {
+    socketId: hub.nextSocketId(),
+    send: (text) => {
+      agent.handleMessage(text);
+      return "sent";
+    },
+    drained: () => Promise.resolve(),
+    close() {},
+  };
   const transport: Transport = { send: (text) => hub.onMessage(agentLink, text), close() {} };
   const deps: ConnectionDeps = {
     agentName: "hass",

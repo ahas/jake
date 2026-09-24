@@ -39,8 +39,9 @@ export interface TransferSink {
 
 /**
  * The component that serves a file transfer. `begin` opens one — an upload it receives, or a download
- * it answers; `chunk` and `end` feed an upload in progress; `abandon` discards every transfer still
- * open when the socket drops, so no temporary file is left behind.
+ * it answers; `chunk` and `end` feed an upload in progress; `cancel` discards the one transfer the hub
+ * gave up on, and `abandon` every transfer still open when the socket drops, so no temporary file is
+ * left behind.
  */
 export interface TransferRunner {
   /** The capability names this runner contributes to the hello list. */
@@ -48,6 +49,7 @@ export interface TransferRunner {
   begin(request: TransferBeginRequest, sink: TransferSink): void;
   chunk(id: string, seq: number, chunk: EncodedBytes): void;
   end(id: string, total: number, checksum: string): void;
+  cancel(id: string): void;
   abandon(): void;
 }
 
@@ -260,25 +262,38 @@ export class FileTransferRunner implements TransferRunner {
     });
   }
 
+  cancel(id: string): void {
+    const transfer = this.active.get(id);
+    if (transfer !== undefined) {
+      this.discard(id, transfer);
+      this.active.delete(id);
+    }
+  }
+
   abandon(): void {
     for (const [id, transfer] of this.active) {
-      if (transfer.kind === "download") {
-        transfer.canceled = true;
-      } else if (!transfer.done) {
-        transfer.done = true;
-        // Best effort: close a half-open handle and drop the temp. Nothing awaits this; the socket
-        // is already gone and the sink is a no-op.
-        void transfer.chain
-          .then(async () => {
-            if (transfer.write !== null) {
-              await transfer.write.close();
-            }
-            await this.fs.remove(transfer.temp);
-          })
-          .catch((error) => this.log.log("warn", "transfer-abandon-threw", { id, error: message(error) }));
-      }
+      this.discard(id, transfer);
     }
     this.active.clear();
+  }
+
+  // Stop one transfer without answering for it: the hub has given it up, or the socket is gone.
+  private discard(id: string, transfer: Active): void {
+    if (transfer.kind === "download") {
+      transfer.canceled = true;
+    } else if (!transfer.done) {
+      transfer.done = true;
+      // Best effort: close a half-open handle and drop the temp. Nothing awaits this and nothing is
+      // sent, since nobody is waiting on this transfer any more.
+      void transfer.chain
+        .then(async () => {
+          if (transfer.write !== null) {
+            await transfer.write.close();
+          }
+          await this.fs.remove(transfer.temp);
+        })
+        .catch((error) => this.log.log("warn", "transfer-abandon-threw", { id, error: message(error) }));
+    }
   }
 
   // --- Upload internals -------------------------------------------------------------------------

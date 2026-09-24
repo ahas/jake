@@ -26,9 +26,18 @@ import {
  */
 export interface AgentLink {
   readonly socketId: number;
-  send(text: string): void;
+  send(text: string): SendOutcome;
+  /** Settles once the socket has flushed its backlog, or once it has closed. */
+  drained(): Promise<void>;
   close(code: number, reason: string): void;
 }
+
+/**
+ * What became of one frame handed to a link: written out, `queued` behind a backlog the sender should
+ * let drain before handing it more, or `dropped` unsent because the backlog passed the socket's limit
+ * or the socket is closing.
+ */
+export type SendOutcome = "sent" | "queued" | "dropped";
 
 /** One event in a command's life, delivered to whichever control caller owns the command. */
 export type ExecEvent =
@@ -161,6 +170,19 @@ const DEFAULT_RING_SIZE = 200;
 // The close code the hub uses when it drops an agent on purpose. 4000–4999 is the range reserved
 // for application use, so it does not collide with a protocol-level close.
 const CLOSE_HUB_INITIATED = 4000;
+
+/** An upload's whole run of frames in order: the begin with its total and checksum, the chunks, the end. */
+function* uploadFrames(id: string, path: string, data: Uint8Array): Generator<Frame> {
+  const total = data.byteLength;
+  const sum = checksum(data);
+  yield { type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path, total, checksum: sum };
+  let seq = 0;
+  for (let offset = 0; offset < total; offset += TRANSFER_CHUNK_BYTES) {
+    const slice = data.subarray(offset, Math.min(offset + TRANSFER_CHUNK_BYTES, total));
+    yield { type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) };
+  }
+  yield { type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum };
+}
 
 // One attached agent and everything that lives and dies with its connection: the liveness probe,
 // the commands and the transfers streaming over it.
@@ -534,19 +556,35 @@ export class HubCore {
     const agent = found.agent;
 
     const id = this.nextId("u");
-    const total = params.data.byteLength;
-    const sum = checksum(params.data);
-    agent.transfers.set(id, { id, direction: "upload", listener, expectedSeq: 0, received: 0, hash: null });
+    const transfer: Transfer = { id, direction: "upload", listener, expectedSeq: 0, received: 0, hash: null };
+    agent.transfers.set(id, transfer);
     listener.push({ kind: "started", id });
-
-    this.send(agent, { type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path: params.path, total, checksum: sum });
-    let seq = 0;
-    for (let offset = 0; offset < total; offset += TRANSFER_CHUNK_BYTES) {
-      const slice = params.data.subarray(offset, Math.min(offset + TRANSFER_CHUNK_BYTES, total));
-      this.send(agent, { type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) });
-    }
-    this.send(agent, { type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum });
+    void this.pumpUpload(agent, transfer, params);
     return { ok: true, id };
+  }
+
+  /**
+   * Send an upload's frames at the pace the socket carries them: whenever the socket reports a
+   * backlog, wait for it to drain before handing it the next frame, since a socket past its backlog
+   * limit discards frames instead of holding them. The pump stops as soon as the transfer is no longer
+   * this agent's — failed by the agent, or ended with its connection.
+   */
+  private async pumpUpload(agent: AttachedAgent, transfer: Transfer, params: UploadParams): Promise<void> {
+    const { id } = transfer;
+    for (const frame of uploadFrames(id, params.path, params.data)) {
+      if (agent.transfers.get(id) !== transfer) {
+        return;
+      }
+      const outcome = this.send(agent, frame);
+      if (outcome === "dropped") {
+        this.failTransfer(agent, transfer, "dropped", `the socket to the agent dropped the ${frame.type} frame of this upload`);
+        this.send(agent, { type: "error", v: PROTOCOL_VERSION, id, code: "dropped", message: "the hub abandoned this upload" });
+        return;
+      }
+      if (outcome === "queued") {
+        await agent.link.drained();
+      }
+    }
   }
 
   /**
@@ -628,9 +666,10 @@ export class HubCore {
 
   // --- Internals --------------------------------------------------------------------------------
 
-  private send(agent: AttachedAgent, frame: Frame): void {
-    agent.link.send(encodeFrame(frame));
+  private send(agent: AttachedAgent, frame: Frame): SendOutcome {
+    const outcome = agent.link.send(encodeFrame(frame));
     this.record(agent.name, "out", frame.type, this.summaryOf(frame));
+    return outcome;
   }
 
   private record(agent: string | null, dir: "in" | "out", type: FrameType | "invalid", summary: Record<string, unknown>): void {

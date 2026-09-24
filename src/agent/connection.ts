@@ -202,9 +202,10 @@ export class AgentConnection {
   }
 
   private onInboundError(frame: ErrorFrame): void {
-    // The agent makes no requests of the hub, so an inbound error answers nothing here; it is only
-    // recorded, so the reason is legible afterwards in the local log.
+    // The agent makes no requests of the hub; an inbound error only names a transfer the hub has given
+    // up on, which is discarded. It is recorded either way, so the reason is legible in the local log.
     this.deps.log.log("warn", "hub-error", { id: frame.id, code: frame.code, message: frame.message });
+    this.deps.transferRunner?.cancel(frame.id);
   }
 
   // --- File transfer ----------------------------------------------------------------------------

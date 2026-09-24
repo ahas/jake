@@ -11,6 +11,7 @@ import {
   type ExecEvent,
   type ExecParams,
   type HubCoreOptions,
+  type SendOutcome,
   type StartResult,
   type TargetRefusal,
   type TransferEvent,
@@ -18,9 +19,13 @@ import {
 } from "./core";
 import { renderConsolePage } from "./page";
 
-/** Per-socket state the agent server hangs on each upgraded connection. */
+/**
+ * Per-socket state the agent server hangs on each upgraded connection: its id, and whoever is waiting
+ * for its backlog to drain.
+ */
 interface SocketData {
   socketId: number;
+  drainWaiters: Array<() => void>;
 }
 
 // A stream sends nothing between events, so the connection's idle limit must outlast one keep-alive.
@@ -47,6 +52,11 @@ export interface StartHubOptions {
   core?: Pick<HubCoreOptions, "pingIntervalMs" | "missedPongLimit" | "ringSize">;
   /** Where the hub writes its one-line notices, such as a refused agent. Defaults to stderr. */
   log?: (line: string) => void;
+  /**
+   * How many bytes an agent socket may hold queued before it discards further frames. Defaults to
+   * Bun's own limit; a test sets it small to reach the limit with a small file.
+   */
+  socketBacklogBytes?: number;
 }
 
 /**
@@ -58,12 +68,33 @@ function peerOf(request: Request, server: Server<SocketData>): string {
   return forwarded || server.requestIP(request)?.address || "unknown";
 }
 
+// Bun answers a send with the bytes written, -1 when it queued the frame behind a backlog, or 0 when
+// it discarded the frame.
+function sendOutcomeOf(status: number): SendOutcome {
+  if (status > 0) return "sent";
+  return status === -1 ? "queued" : "dropped";
+}
+
+/** Wake everyone waiting on this socket's backlog, when it drains or when the socket closes. */
+function releaseDrainWaiters(ws: ServerWebSocket<SocketData>): void {
+  const waiters = ws.data.drainWaiters.splice(0);
+  for (const wake of waiters) {
+    wake();
+  }
+}
+
 function linkOf(ws: ServerWebSocket<SocketData>): AgentLink {
   return {
     socketId: ws.data.socketId,
-    send: (text) => {
-      ws.send(text);
-    },
+    send: (text) => sendOutcomeOf(ws.send(text)),
+    drained: () =>
+      new Promise<void>((resolve) => {
+        if (ws.readyState !== WebSocket.OPEN || ws.getBufferedAmount() === 0) {
+          resolve();
+          return;
+        }
+        ws.data.drainWaiters.push(resolve);
+      }),
     close: (code, reason) => {
       ws.close(code, reason);
     },
@@ -364,16 +395,23 @@ export function startHub(config: HubConfig, options: StartHubOptions = {}): Runn
         }
         return json({ error: "unauthorized" }, 401);
       }
-      if (server.upgrade(request, { data: { socketId: core.nextSocketId() } })) {
+      if (server.upgrade(request, { data: { socketId: core.nextSocketId(), drainWaiters: [] } })) {
         return undefined;
       }
       return json({ error: "expected a WebSocket upgrade" }, 426);
     },
     websocket: {
+      ...(options.socketBacklogBytes === undefined ? {} : { backpressureLimit: options.socketBacklogBytes }),
       message(ws, message) {
         core.onMessage(linkOf(ws), typeof message === "string" ? message : message.toString());
       },
+      drain(ws) {
+        // A frame sent from inside this callback that meets a backlog again is never followed by
+        // another drain, so the waiters resume on the next turn of the loop, outside it.
+        setImmediate(() => releaseDrainWaiters(ws));
+      },
       close(ws) {
+        releaseDrainWaiters(ws);
         core.onClose(linkOf(ws));
       },
     },

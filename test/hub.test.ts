@@ -571,6 +571,32 @@ describe("file transfer over the control API", () => {
     expect(await uploadP).toMatchObject({ kind: "completed", total: content.byteLength });
   });
 
+  test("upload: a file many times the socket's backlog limit reaches the agent whole and in order", async () => {
+    // The hub's socket discards frames past its backlog limit; a small limit reaches that with a small
+    // file, the way Bun's default limit is reached by a file of twenty-odd megabytes.
+    // The agent reads on the hub's own event loop, so it falls behind the hub's writes the way a slow
+    // link does and the socket's backlog passes its limit many times over.
+    const hub = launch({ socketBacklogBytes: 512 * 1024 });
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const client = hubClient(hub);
+
+    const content = new Uint8Array(12 * 1024 * 1024).map((_, i) => (i * 31) % 253);
+    const uploadP = client.upload("/remote/big.bin", content);
+
+    const begin = await agent.waitFor((f) => f.type === "transfer-begin");
+    const end = await agent.waitFor((f) => f.type === "transfer-end");
+    if (begin.type !== "transfer-begin" || end.type !== "transfer-end") throw new Error("unexpected frames");
+
+    const chunks = agent.received.filter((f): f is Extract<Frame, { type: "transfer-chunk" }> => f.type === "transfer-chunk");
+    expect(chunks.map((f) => f.seq)).toEqual(chunks.map((_, i) => i));
+    const assembled = Buffer.concat(chunks.map((f) => Buffer.from(f.chunk.base64, "base64")));
+    expect(checksum(assembled)).toBe(checksum(content));
+    expect(end).toMatchObject({ total: content.byteLength, checksum: checksum(content) });
+
+    agent.send({ type: "transfer-end", v: V, id: begin.id, total: end.total, checksum: end.checksum });
+    expect(await uploadP).toMatchObject({ kind: "completed", total: content.byteLength });
+  });
+
   test("download: the agent streams the file and the hub verifies it before completing", async () => {
     const hub = launch();
     const agent = await attach(hub.agentPort, ["transfer"]);

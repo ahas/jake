@@ -65,12 +65,19 @@ File transfer (streaming):
   its own begin carrying the size and checksum it is about to stream.
 - **transfer-chunk** — one chunk of the content, carrying the transfer id, a sequence number that
   orders the chunks, and the chunk bytes as an encoded-bytes value. Chunk size is held well below the
-  smaller of the two sides' payload caps, so no chunk is ever refused for exceeding a cap.
+  smaller of the two sides' payload caps, so no chunk is ever refused for exceeding a cap. The hub
+  paces an upload's chunks to its socket: once the socket reports a backlog it hands it nothing more
+  of the transfer until that backlog has drained, because the hub's socket discards frames past its
+  backlog limit instead of holding them, and a discarded chunk or closing frame would leave the agent
+  waiting on a transfer that never ends. The agent's socket holds whatever it is handed, so a
+  download is sent unpaced.
 - **transfer-end** — closes a transfer: the transfer id, the total bytes sent, and the content
   checksum. The receiver accepts the file only after the bytes it assembled match this declared total
   and checksum; a receiver that streamed an upload to a temporary path moves it into place atomically
   only once both match. A mismatch, a dropped chunk, or a file-system failure is answered with an
   **error** frame carrying the transfer id, so a partial transfer is never taken for a whole one.
+  The error travels the other way as well: a hub that cannot finish sending an upload says so with an
+  **error** frame naming it, and the agent discards the temporary file it was writing.
 
 Departure:
 

@@ -249,6 +249,16 @@ give very different footing for keeping a per-user process running.
   silently, the connection staying open — which would leave a gap no sequence number reveals.
   A transfer therefore fixes its chunk size well below the smaller cap a deployment would set, so a
   chunk can never trip a cap in the first place.
+- No upload chunk is sent faster than the connection carries it. The hub's socket, once it has fallen
+  behind, queues what it is handed only up to a limit and discards everything past it, silently, with
+  the connection still open — the same gap no sequence number reveals, and one that swallows the
+  closing frame too, so the agent waits for ever. The hub therefore stops handing an upload's chunks
+  to the socket the moment it reports a backlog and resumes only once it has drained, so a file of any
+  size streams at the speed of the link. A frame the socket discards all the same fails the transfer
+  to its caller at once, and the hub tells the agent with an error frame naming the transfer, so the
+  agent drops the temporary file it was writing rather than holding it until the connection ends.
+  The agent's socket holds whatever it is handed without discarding any, so a download needs no
+  pacing.
 - Completion is verified, never assumed. The receiver assembles the chunks in sequence order and, on
   the closing frame, checks the bytes it actually assembled against the declared total and checksum
   before it accepts the file. An upload is streamed to a temporary path and moved into place in one
