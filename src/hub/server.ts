@@ -3,7 +3,7 @@
 import type { Server, ServerWebSocket } from "bun";
 
 import type { HubConfig } from "../config";
-import { isShellKind, SHELL_KINDS } from "../protocol";
+import { checksum, isChecksum, isShellKind, SHELL_KINDS } from "../protocol";
 import {
   HubCore,
   type AgentLink,
@@ -16,6 +16,7 @@ import {
   type TargetRefusal,
   type TransferEvent,
   type TransferListener,
+  type UploadParams,
 } from "./core";
 import { renderConsolePage } from "./page";
 
@@ -226,11 +227,33 @@ function execStream(core: HubCore, params: ExecParams, target: string): Response
   });
 }
 
-function uploadStream(core: HubCore, path: string, data: Uint8Array, target: string): Response {
+function uploadStream(core: HubCore, params: UploadParams, target: string): Response {
   return sseStream((write, finish) => {
     const listener: TransferListener = { push: (event) => write(transferEventFrame(event)), end: finish };
-    return core.startUpload({ path, data }, listener, target);
+    return core.startUpload(params, listener, target);
   });
+}
+
+/**
+ * What an upload request carries as its content. A request that declares its body's length and
+ * checksum in the `total` and `checksum` query parameters has its body streamed through unread; one
+ * that declares neither has its body read whole first, so the hub can learn both before the opening
+ * frame that must carry them.
+ */
+async function uploadContent(url: URL, request: Request): Promise<Omit<UploadParams, "path"> | { error: string }> {
+  const total = url.searchParams.get("total");
+  const sum = url.searchParams.get("checksum");
+  if (total === null && sum === null) {
+    const data = new Uint8Array(await request.arrayBuffer());
+    return { total: data.byteLength, checksum: checksum(data), body: [data] };
+  }
+  if (total === null || !/^\d+$/.test(total) || !Number.isSafeInteger(Number(total))) {
+    return { error: "the total query parameter must be the body's byte length" };
+  }
+  if (sum === null || !isChecksum(sum)) {
+    return { error: "the checksum query parameter must be the body's sha256 in lowercase hex" };
+  }
+  return { total: Number(total), checksum: sum, body: request.body ?? [] };
 }
 
 function downloadStream(core: HubCore, path: string, target: string): Response {
@@ -336,8 +359,11 @@ async function route(core: HubCore, request: Request): Promise<Response> {
       return json({ error: target.reason, code: target.code }, TARGET_REFUSAL_STATUS[target.code]);
     }
     if (path === "/upload") {
-      const data = new Uint8Array(await request.arrayBuffer());
-      return uploadStream(core, remote, data, target.name);
+      const content = await uploadContent(url, request);
+      if ("error" in content) {
+        return json({ error: content.error }, 400);
+      }
+      return uploadStream(core, { path: remote, ...content }, target.name);
     }
     return downloadStream(core, remote, target.name);
   }
@@ -421,6 +447,8 @@ export function startHub(config: HubConfig, options: StartHubOptions = {}): Runn
     hostname: "127.0.0.1",
     port: options.controlPort ?? config.controlPort,
     idleTimeout: IDLE_TIMEOUT_S,
+    // An upload's body is streamed through to the agent rather than held, so its size is no bound.
+    maxRequestBodySize: Number.MAX_SAFE_INTEGER,
     async fetch(request) {
       // The read-only status page is the one unauthenticated route: a browser navigation cannot
       // carry a bearer header, so the page is served open — safe on a loopback-only server — and it

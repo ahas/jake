@@ -49,6 +49,13 @@ export type TransferOutcome =
   | { kind: "ended"; reason: string }
   | { kind: "refused"; status: number; message: string };
 
+/** A file to upload, and the checksum of its content that the hub declares to the agent. */
+export interface UploadContent {
+  /** The content, read from disk as it is sent. A `Bun.file` is one; a test passes an in-memory Blob. */
+  file: Blob;
+  checksum: string;
+}
+
 /** The callbacks a streamed download drives as the agent's declared size and bytes arrive. */
 export interface DownloadSink {
   /** The hub has accepted the transfer and assigned it this id. */
@@ -201,21 +208,23 @@ export class HubClient {
   }
 
   /**
-   * Write a local file onto the machine at `path`, streaming its bytes to the hub, which chunks them
-   * over the tunnel and reports the agent's verified acknowledgement. A hub with no agent (or a
-   * missing path) answers with JSON rather than a stream, reported as a `refused` outcome.
+   * Write a local file onto the machine at `path`. The request declares the file's length and
+   * checksum and streams its bytes as the body, which the hub chunks over the tunnel as it reads them,
+   * so no side holds the file whole; the outcome is the agent's verified acknowledgement. A hub with
+   * no agent (or a missing path) answers with JSON rather than a stream, reported as a `refused`
+   * outcome.
    */
   async upload(
     path: string,
-    data: Uint8Array,
+    content: UploadContent,
     sink: { onStart?(id: string): void } = {},
     agent: string | null = null,
   ): Promise<TransferOutcome> {
-    const response = await this.fetchImpl(`${this.baseUrl}/upload?path=${encodeURIComponent(path)}${agentQuery(agent, "&")}`, {
+    const query = `path=${encodeURIComponent(path)}&total=${content.file.size}&checksum=${content.checksum}`;
+    const response = await this.fetchImpl(`${this.baseUrl}/upload?${query}${agentQuery(agent, "&")}`, {
       method: "POST",
       headers: this.headers({ "content-type": "application/octet-stream" }),
-      // slice() copies into a fresh ArrayBuffer-backed view, which the fetch body type requires.
-      body: data.slice(),
+      body: content.file,
     });
     return this.consumeTransfer(response, sink);
   }

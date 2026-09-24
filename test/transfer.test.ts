@@ -31,6 +31,7 @@ import {
   type SendOutcome,
   type TransferEvent,
   type TransferListener,
+  type UploadParams,
 } from "../src/hub/core";
 
 const V = PROTOCOL_VERSION;
@@ -328,21 +329,27 @@ function uploadChunks(sent: Frame[]): Extract<Frame, { type: "transfer-chunk" }>
   return sent.filter((f): f is Extract<Frame, { type: "transfer-chunk" }> => f.type === "transfer-chunk");
 }
 
+/** An upload of `data` to `path`, declared with its true length and checksum. */
+function uploadOf(path: string, data: Uint8Array): UploadParams {
+  return { path, total: data.byteLength, checksum: checksum(data), body: [data] };
+}
+
 function chunkFrame(id: string, seq: number, bytes: Uint8Array): Frame {
   return { type: "transfer-chunk", v: V, id, seq, chunk: encodeBytes(bytes) };
 }
 
 describe("HubCore transfer routing", () => {
-  test("drives an upload as chunk frames and completes on the agent's acknowledgement", () => {
+  test("drives an upload as chunk frames and completes on the agent's acknowledgement", async () => {
     const core = makeCore();
     const { link, sent } = attachAgent(core);
     const data = randomBytes(600_000); // exceeds the fixed chunk size, so it is sent as several chunks
     const sum = checksum(data);
     const listener = new CaptureListener();
 
-    const result = core.startUpload({ path: "C:\\out.bin", data }, listener);
+    const result = core.startUpload(uploadOf("C:\\out.bin", data), listener);
     expect(result.ok).toBe(true);
     const id = result.ok ? result.id : "";
+    await until(() => sent.some((f) => f.type === "transfer-end"));
 
     const begin = sent.find((f) => f.type === "transfer-begin");
     expect(begin).toMatchObject({ type: "transfer-begin", direction: "upload", path: "C:\\out.bin", total: data.byteLength, checksum: sum });
@@ -356,7 +363,6 @@ describe("HubCore transfer routing", () => {
       }),
     );
     expect(sameBytes(assembled, new Uint8Array(data))).toBe(true);
-    expect(sent.some((f) => f.type === "transfer-end")).toBe(true);
 
     // The agent acknowledges the verified write.
     core.onMessage(link, encodeFrame({ type: "transfer-end", v: V, id, total: data.byteLength, checksum: sum }));
@@ -370,7 +376,9 @@ describe("HubCore transfer routing", () => {
     const { sent, drain } = attachAgent(core, backedUp);
     const data = randomBytes(TRANSFER_CHUNK_BYTES * 3 + 10);
 
-    core.startUpload({ path: "/out.bin", data }, new CaptureListener());
+    core.startUpload(uploadOf("/out.bin", data), new CaptureListener());
+    await until(() => sent.some((f) => f.type === "transfer-chunk"));
+    await new Promise((resolve) => setTimeout(resolve, 1));
     expect(sent.map((f) => f.type)).toEqual(["welcome", "transfer-begin", "transfer-chunk"]);
 
     drain();
@@ -379,13 +387,14 @@ describe("HubCore transfer routing", () => {
     expect(sent.at(-1)).toMatchObject({ type: "transfer-end", total: data.byteLength, checksum: checksum(data) });
   });
 
-  test("a frame the socket drops fails the upload at once and tells the agent to discard it", () => {
+  test("a frame the socket drops fails the upload at once and tells the agent to discard it", async () => {
     const core = makeCore();
     const { sent } = attachAgent(core, (f) => (f.type === "transfer-chunk" && f.seq === 1 ? "dropped" : "sent"));
     const listener = new CaptureListener();
 
-    const result = core.startUpload({ path: "/out.bin", data: randomBytes(TRANSFER_CHUNK_BYTES * 3) }, listener);
+    const result = core.startUpload(uploadOf("/out.bin", randomBytes(TRANSFER_CHUNK_BYTES * 3)), listener);
     const id = result.ok ? result.id : "";
+    await until(() => listener.ended);
 
     expect(listener.terminal()).toMatchObject({ kind: "error", code: "dropped" });
     expect(listener.ended).toBe(true);
@@ -398,14 +407,67 @@ describe("HubCore transfer routing", () => {
     const core = makeCore();
     const { link, sent, drain } = attachAgent(core, (f) => (f.type === "transfer-chunk" ? "queued" : "sent"));
     const listener = new CaptureListener();
-    const result = core.startUpload({ path: "/out.bin", data: randomBytes(TRANSFER_CHUNK_BYTES * 3) }, listener);
+    const result = core.startUpload(uploadOf("/out.bin", randomBytes(TRANSFER_CHUNK_BYTES * 3)), listener);
     const id = result.ok ? result.id : "";
+    await until(() => uploadChunks(sent).length > 0);
 
     core.onMessage(link, encodeFrame({ type: "error", v: V, id, code: "disk-full", message: "no space left on device" }));
     drain();
     await new Promise((resolve) => setTimeout(resolve, 1));
     expect(listener.terminal()).toMatchObject({ kind: "error", code: "disk-full" });
     expect(uploadChunks(sent).map((f) => f.seq)).toEqual([0]);
+  });
+
+  test("a body arriving in pieces of any size is sent as fixed chunks, whole and in order", async () => {
+    const core = makeCore();
+    const { sent } = attachAgent(core);
+    const data = randomBytes(TRANSFER_CHUNK_BYTES * 2 + 1234);
+    const pieces = [data.subarray(0, 7), data.subarray(7, TRANSFER_CHUNK_BYTES + 99), data.subarray(TRANSFER_CHUNK_BYTES + 99)];
+
+    core.startUpload({ path: "/out.bin", total: data.byteLength, checksum: checksum(data), body: pieces }, new CaptureListener());
+    await until(() => sent.some((f) => f.type === "transfer-end"));
+
+    const chunks = uploadChunks(sent).map((f) => {
+      const decoded = decodeBytes(f.chunk, OPTS);
+      if (!decoded.ok) throw new Error("bad chunk");
+      return decoded.data;
+    });
+    expect(chunks.map((c) => c.byteLength)).toEqual([TRANSFER_CHUNK_BYTES, TRANSFER_CHUNK_BYTES, 1234]);
+    expect(sameBytes(concat(chunks), new Uint8Array(data))).toBe(true);
+  });
+
+  test("a body shorter or longer than its declared total fails the upload and sends no end", async () => {
+    for (const declared of [10_001, 9_999]) {
+      const core = makeCore();
+      const { sent } = attachAgent(core);
+      const data = randomBytes(10_000);
+      const listener = new CaptureListener();
+
+      const result = core.startUpload({ path: "/out.bin", total: declared, checksum: checksum(data), body: [data] }, listener);
+      const id = result.ok ? result.id : "";
+      await until(() => listener.ended);
+
+      expect(listener.terminal()).toMatchObject({ kind: "error", code: "size-mismatch" });
+      expect(sent.at(-1)).toMatchObject({ type: "error", id, code: "size-mismatch" });
+      expect(sent.some((f) => f.type === "transfer-end")).toBe(false);
+    }
+  });
+
+  test("a body that breaks off fails the upload and tells the agent to discard it", async () => {
+    const core = makeCore();
+    const { sent } = attachAgent(core);
+    const listener = new CaptureListener();
+    async function* broken(): AsyncGenerator<Uint8Array> {
+      yield new Uint8Array(100);
+      throw new Error("the caller hung up");
+    }
+
+    const result = core.startUpload({ path: "/out.bin", total: 1000, checksum: "0".repeat(64), body: broken() }, listener);
+    const id = result.ok ? result.id : "";
+    await until(() => listener.ended);
+
+    expect(listener.terminal()).toMatchObject({ kind: "error", code: "body-broken" });
+    expect(sent.at(-1)).toMatchObject({ type: "error", id, code: "body-broken" });
   });
 
   test("requests a download, verifies the assembled bytes, and completes", () => {
@@ -458,7 +520,7 @@ describe("HubCore transfer routing", () => {
 
   test("a transfer against a hub with no agent is refused", () => {
     const core = makeCore();
-    expect(core.startUpload({ path: "/x", data: new Uint8Array(1) }, new CaptureListener()).ok).toBe(false);
+    expect(core.startUpload(uploadOf("/x", new Uint8Array(1)), new CaptureListener()).ok).toBe(false);
     expect(core.startDownload({ path: "/x" }, new CaptureListener()).ok).toBe(false);
   });
 });
@@ -510,7 +572,7 @@ describe("transfer end to end", () => {
 
     const data = randomBytes(600_000);
     const listener = new CaptureListener();
-    const result = hub.startUpload({ path, data }, listener);
+    const result = hub.startUpload(uploadOf(path, data), listener);
     expect(result.ok).toBe(true);
 
     await until(() => listener.terminal() !== undefined);

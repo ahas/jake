@@ -52,6 +52,20 @@ export function checksum(data: Uint8Array): string {
   return createHash(CHECKSUM_ALGORITHM).update(data).digest("hex");
 }
 
+/** The same checksum over content read piece by piece, so a file of any size is hashed without being held whole. */
+export async function streamChecksum(pieces: AsyncIterable<Uint8Array>): Promise<string> {
+  const hash = createHash(CHECKSUM_ALGORITHM);
+  for await (const piece of pieces) {
+    hash.update(piece);
+  }
+  return hash.digest("hex");
+}
+
+/** Whether a string has the shape of a content checksum: the lowercase hex of a sha256 digest. */
+export function isChecksum(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
+}
+
 /**
  * A run of bytes carried inside a text frame. `bytes` is the decoded length, declared up front so a
  * receiver can refuse an oversized payload by reading one integer, before it ever allocates the

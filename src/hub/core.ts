@@ -6,7 +6,6 @@ import {
   CHECKSUM_ALGORITHM,
   PROTOCOL_VERSION,
   TRANSFER_CHUNK_BYTES,
-  checksum,
   decodeBytes,
   decodeFrame,
   encodeBytes,
@@ -89,10 +88,15 @@ export interface TransferListener {
   end(): void;
 }
 
-/** An upload a control caller starts: the bytes to write and the path to write them to on the machine. */
+/**
+ * An upload a control caller starts: the path to write on the machine, the length and checksum the
+ * content is declared with, and the content itself, read only as fast as the agent's socket takes it.
+ */
 export interface UploadParams {
   path: string;
-  data: Uint8Array;
+  total: number;
+  checksum: string;
+  body: AsyncIterable<Uint8Array> | Iterable<Uint8Array>;
 }
 
 /** A download a control caller starts: the path to read back from the machine. */
@@ -171,15 +175,51 @@ const DEFAULT_RING_SIZE = 200;
 // for application use, so it does not collide with a protocol-level close.
 const CLOSE_HUB_INITIATED = 4000;
 
-/** An upload's whole run of frames in order: the begin with its total and checksum, the chunks, the end. */
-function* uploadFrames(id: string, path: string, data: Uint8Array): Generator<Frame> {
-  const total = data.byteLength;
-  const sum = checksum(data);
+/** Why an upload's body did not stream as it was declared. */
+class UploadBodyError extends Error {}
+
+/** The body's bytes regrouped into chunks of exactly `size`, but for a shorter last one. */
+async function* fixedChunks(body: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, size: number): AsyncGenerator<Uint8Array> {
+  let pending = new Uint8Array(size);
+  let filled = 0;
+  for await (const piece of body) {
+    let offset = 0;
+    while (offset < piece.byteLength) {
+      const take = Math.min(size - filled, piece.byteLength - offset);
+      pending.set(piece.subarray(offset, offset + take), filled);
+      filled += take;
+      offset += take;
+      if (filled === size) {
+        yield pending;
+        pending = new Uint8Array(size);
+        filled = 0;
+      }
+    }
+  }
+  if (filled > 0) {
+    yield pending.subarray(0, filled);
+  }
+}
+
+/**
+ * An upload's whole run of frames in order: the begin with its declared total and checksum, the
+ * chunks as the body yields them, the end. A body longer or shorter than its declared total throws an
+ * `UploadBodyError` instead of yielding a chunk past the declaration or an end that claims it.
+ */
+async function* uploadFrames(id: string, params: UploadParams): AsyncGenerator<Frame> {
+  const { path, total, checksum: sum } = params;
   yield { type: "transfer-begin", v: PROTOCOL_VERSION, id, direction: "upload", path, total, checksum: sum };
   let seq = 0;
-  for (let offset = 0; offset < total; offset += TRANSFER_CHUNK_BYTES) {
-    const slice = data.subarray(offset, Math.min(offset + TRANSFER_CHUNK_BYTES, total));
-    yield { type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(slice) };
+  let streamed = 0;
+  for await (const chunk of fixedChunks(params.body, TRANSFER_CHUNK_BYTES)) {
+    streamed += chunk.byteLength;
+    if (streamed > total) {
+      throw new UploadBodyError(`the upload's body ran past its declared ${total} bytes`);
+    }
+    yield { type: "transfer-chunk", v: PROTOCOL_VERSION, id, seq: seq++, chunk: encodeBytes(chunk) };
+  }
+  if (streamed !== total) {
+    throw new UploadBodyError(`the upload's body ended after ${streamed} of its declared ${total} bytes`);
   }
   yield { type: "transfer-end", v: PROTOCOL_VERSION, id, total, checksum: sum };
 }
@@ -544,9 +584,9 @@ export class HubCore {
 
   /**
    * Write a file onto the machine, streaming it as chunk frames the agent assembles and verifies. The
-   * hub is the sender: it declares the total and checksum up front, sends the content in fixed chunks
-   * held below either side's payload cap, and closes with the same total and checksum. The transfer
-   * completes when the agent acknowledges the verified write.
+   * hub is the sender: it declares the caller's total and checksum up front, regroups the body into
+   * fixed chunks held below either side's payload cap, and closes with the same total and checksum.
+   * The transfer completes when the agent acknowledges the verified write.
    */
   startUpload(params: UploadParams, listener: TransferListener, target: string | null = null): StartResult {
     const found = this.findTarget(target);
@@ -565,26 +605,44 @@ export class HubCore {
 
   /**
    * Send an upload's frames at the pace the socket carries them: whenever the socket reports a
-   * backlog, wait for it to drain before handing it the next frame, since a socket past its backlog
-   * limit discards frames instead of holding them. The pump stops as soon as the transfer is no longer
-   * this agent's — failed by the agent, or ended with its connection.
+   * backlog, wait for it to drain before reading the body on and handing the socket the next frame,
+   * since a socket past its backlog limit discards frames instead of holding them. The pump stops as
+   * soon as the transfer is no longer this agent's — failed by the agent, or ended with its connection
+   * — and leaving the loop stops reading the body.
    */
   private async pumpUpload(agent: AttachedAgent, transfer: Transfer, params: UploadParams): Promise<void> {
     const { id } = transfer;
-    for (const frame of uploadFrames(id, params.path, params.data)) {
+    try {
+      for await (const frame of uploadFrames(id, params)) {
+        if (agent.transfers.get(id) !== transfer) {
+          return;
+        }
+        const outcome = this.send(agent, frame);
+        if (outcome === "dropped") {
+          this.abandonUpload(agent, transfer, "dropped", `the socket to the agent dropped the ${frame.type} frame of this upload`);
+          return;
+        }
+        if (outcome === "queued") {
+          await agent.link.drained();
+        }
+      }
+    } catch (error) {
       if (agent.transfers.get(id) !== transfer) {
         return;
       }
-      const outcome = this.send(agent, frame);
-      if (outcome === "dropped") {
-        this.failTransfer(agent, transfer, "dropped", `the socket to the agent dropped the ${frame.type} frame of this upload`);
-        this.send(agent, { type: "error", v: PROTOCOL_VERSION, id, code: "dropped", message: "the hub abandoned this upload" });
-        return;
-      }
-      if (outcome === "queued") {
-        await agent.link.drained();
+      if (error instanceof UploadBodyError) {
+        this.abandonUpload(agent, transfer, "size-mismatch", error.message);
+      } else {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.abandonUpload(agent, transfer, "body-broken", `the upload's body broke off: ${reason}`);
       }
     }
+  }
+
+  /** Fail an upload to its caller and tell the agent, so it drops the temporary file it was writing. */
+  private abandonUpload(agent: AttachedAgent, transfer: Transfer, code: string, message: string): void {
+    this.failTransfer(agent, transfer, code, message);
+    this.send(agent, { type: "error", v: PROTOCOL_VERSION, id: transfer.id, code, message: "the hub abandoned this upload" });
   }
 
   /**

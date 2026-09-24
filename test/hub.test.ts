@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { HubConfig } from "../src/config";
 import {
@@ -8,11 +12,14 @@ import {
   decodeFrame,
   encodeBytes,
   encodeFrame,
+  streamChecksum,
   type Frame,
 } from "../src/protocol";
 import { startHub, type RunningHub, type StartHubOptions } from "../src/hub/server";
-import { HubClient } from "../src/console/client";
-import { HubRefusedError, WebSocketDialer } from "../src/agent/transport";
+import { HubClient, type UploadContent } from "../src/console/client";
+import { AgentConnection } from "../src/agent/connection";
+import { FileTransferRunner, nodeTransferFs } from "../src/agent/transfer";
+import { HubRefusedError, WebSocketDialer, systemScheduler, type Transport } from "../src/agent/transport";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -34,11 +41,16 @@ function baseConfig(): HubConfig {
 const running: RunningHub[] = [];
 const agents: FakeAgent[] = [];
 const readers: SseReader[] = [];
+const transports: Transport[] = [];
+const dirs: string[] = [];
+const silentLog = { log() {} };
 
 afterEach(() => {
   for (const reader of readers.splice(0)) reader.close();
   for (const agent of agents.splice(0)) agent.close();
+  for (const transport of transports.splice(0)) transport.close();
   for (const hub of running.splice(0)) hub.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function launch(options: StartHubOptions = {}): RunningHub {
@@ -548,6 +560,89 @@ describe("file transfer over the control API", () => {
     return new HubClient({ baseUrl: `http://127.0.0.1:${hub.controlPort}`, token: CONTROL });
   }
 
+  function contentOf(bytes: Uint8Array<ArrayBuffer>): UploadContent {
+    return { file: new Blob([bytes]), checksum: checksum(bytes) };
+  }
+
+  // A real agent over a real socket, writing what it receives to disk and verifying it.
+  async function attachRealAgent(hub: RunningHub): Promise<void> {
+    let connection: AgentConnection | null = null;
+    const transport = await new WebSocketDialer().dial(`ws://127.0.0.1:${hub.agentPort}`, SECRET, {
+      onMessage: (raw) => connection?.handleMessage(raw),
+      onClose: () => {},
+      onError: () => {},
+    });
+    transports.push(transport);
+    connection = new AgentConnection(transport, {
+      agentName: "hass",
+      agentVersion: "0.1.0",
+      capabilities: ["transfer"],
+      execRunner: null,
+      transferRunner: new FileTransferRunner({ fs: nodeTransferFs, maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES, log: silentLog }),
+      heartbeatMs: 1_000_000_000,
+      missedHeartbeatLimit: 3,
+      maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
+      scheduler: { ...systemScheduler, setInterval: () => 0, clearInterval: () => {} },
+      log: silentLog,
+    });
+    connection.run();
+    for (let i = 0; i < 200 && hub.core.status().agents.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(hub.core.status().agents.map((a) => a.name)).toEqual(["hass"]);
+  }
+
+  test("upload: a file past the HTTP body limit streams from disk to disk and lands byte for byte", async () => {
+    // 300 MiB is well past the 128 MiB a Bun server takes as one request body by default.
+    const hub = launch();
+    await attachRealAgent(hub);
+    const dir = mkdtempSync(join(tmpdir(), "jake-hub-upload-"));
+    dirs.push(dir);
+    const source = join(dir, "source.bin");
+    const landed = join(dir, "landed.bin");
+
+    // Each mebibyte carries its own index, so a chunk out of place changes the checksum.
+    const block = new Uint8Array(randomBytes(1024 * 1024));
+    const writer = Bun.file(source).writer();
+    for (let i = 0; i < 300; i += 1) {
+      new DataView(block.buffer).setUint32(0, i);
+      writer.write(block);
+      await writer.flush();
+    }
+    await writer.end();
+
+    const file = Bun.file(source);
+    const sum = await streamChecksum(file.stream());
+    const outcome = await hubClient(hub).upload(landed, { file, checksum: sum });
+
+    expect(outcome).toMatchObject({ kind: "completed", total: 300 * 1024 * 1024, checksum: sum });
+    expect(await streamChecksum(Bun.file(landed).stream())).toBe(sum);
+  }, 120_000);
+
+  test("upload: a caller that declares no length or checksum has them learned from its body", async () => {
+    const hub = launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const content = new Uint8Array(1000).map((_, i) => i % 7);
+
+    const upload = control(hub, "/upload?path=/remote/plain.bin", { method: "POST", body: new Blob([content]) });
+    const begin = await agent.waitFor((f) => f.type === "transfer-begin");
+    await agent.waitFor((f) => f.type === "transfer-end");
+    if (begin.type !== "transfer-begin") throw new Error("unexpected frame");
+    expect(begin).toMatchObject({ total: content.byteLength, checksum: checksum(content) });
+
+    agent.send({ type: "transfer-end", v: V, id: begin.id, total: content.byteLength, checksum: checksum(content) });
+    expect(await (await upload).text()).toContain("event: completed");
+  });
+
+  test("upload: a declared length without a well-formed checksum is a bad request", async () => {
+    const hub = launch();
+    await attach(hub.agentPort, ["transfer"]);
+    const body = new Blob([new Uint8Array([1])]);
+    expect((await control(hub, "/upload?path=/x&total=1", { method: "POST", body })).status).toBe(400);
+    expect((await control(hub, "/upload?path=/x&total=1&checksum=XYZ", { method: "POST", body })).status).toBe(400);
+    expect((await control(hub, `/upload?path=/x&total=-1&checksum=${checksum(new Uint8Array([1]))}`, { method: "POST", body })).status).toBe(400);
+  });
+
   test("upload: the hub chunks the file to the agent, which acknowledges the verified write", async () => {
     const hub = launch();
     const agent = await attach(hub.agentPort, ["transfer"]);
@@ -555,7 +650,7 @@ describe("file transfer over the control API", () => {
 
     // Past the fixed chunk size, so more than one chunk frame must cross.
     const content = new Uint8Array(300 * 1024).map((_, i) => i % 251);
-    const uploadP = client.upload("/remote/out.bin", content);
+    const uploadP = client.upload("/remote/out.bin", contentOf(content));
 
     const begin = await agent.waitFor((f) => f.type === "transfer-begin");
     const end = await agent.waitFor((f) => f.type === "transfer-end");
@@ -581,7 +676,7 @@ describe("file transfer over the control API", () => {
     const client = hubClient(hub);
 
     const content = new Uint8Array(12 * 1024 * 1024).map((_, i) => (i * 31) % 253);
-    const uploadP = client.upload("/remote/big.bin", content);
+    const uploadP = client.upload("/remote/big.bin", contentOf(content));
 
     const begin = await agent.waitFor((f) => f.type === "transfer-begin");
     const end = await agent.waitFor((f) => f.type === "transfer-end");

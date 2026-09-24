@@ -1,8 +1,8 @@
 // The jake command line: the primary console surface.
 
-import { isShellKind, SHELL_KINDS } from "../protocol";
+import { isShellKind, SHELL_KINDS, streamChecksum } from "../protocol";
 import type { StatusSnapshot, TrafficEntry } from "../hub/core";
-import type { ExecRequest, HubClient, TransferOutcome } from "./client";
+import type { ExecRequest, HubClient, TransferOutcome, UploadContent } from "./client";
 
 export const EXIT_OK = 0;
 export const EXIT_USAGE = 2;
@@ -258,8 +258,11 @@ export interface CliDeps {
   now?(): number;
   /** Called once the hub assigns an exec an id, so main can bind Ctrl-C to a cancel. */
   onExecStart?(id: string): void;
-  /** Read a local file's bytes, for an upload. Defaults to the Bun file API; a test injects a fake. */
-  readFile?(path: string): Promise<Uint8Array>;
+  /**
+   * Open a local file for an upload, as a Blob read only as it is streamed. Defaults to the Bun file
+   * API; a test injects an in-memory Blob.
+   */
+  openFile?(path: string): Blob;
   /** Write a local file's bytes, for a download. Defaults to the Bun file API; a test injects a fake. */
   writeFile?(path: string, data: Uint8Array): Promise<void>;
 }
@@ -378,8 +381,8 @@ function refusalExit(status: number): number {
   return EXIT_FAILED;
 }
 
-function readFileOf(deps: CliDeps): (path: string) => Promise<Uint8Array> {
-  return deps.readFile ?? ((path) => Bun.file(path).bytes());
+function openFileOf(deps: CliDeps): (path: string) => Blob {
+  return deps.openFile ?? ((path) => Bun.file(path));
 }
 
 function writeFileOf(deps: CliDeps): (path: string, data: Uint8Array) => Promise<void> {
@@ -402,9 +405,12 @@ function reportTransferFailure(outcome: Exclude<TransferOutcome, { kind: "comple
 }
 
 async function runUpload(command: { local: string; remote: string; agent: string | null }, deps: CliDeps): Promise<number> {
-  let data: Uint8Array;
+  // The file is read once here to learn its checksum, then again as it streams to the hub, so it is
+  // never held whole however large it is.
+  let content: UploadContent;
   try {
-    data = await readFileOf(deps)(command.local);
+    const file = openFileOf(deps)(command.local);
+    content = { file, checksum: await streamChecksum(file.stream()) };
   } catch (error) {
     deps.err(`jake: could not read ${command.local}: ${errorMessage(error)}\n`);
     return EXIT_FAILED;
@@ -412,7 +418,7 @@ async function runUpload(command: { local: string; remote: string; agent: string
 
   let outcome: TransferOutcome;
   try {
-    outcome = await deps.client.upload(command.remote, data, {}, command.agent);
+    outcome = await deps.client.upload(command.remote, content, {}, command.agent);
   } catch (error) {
     deps.err(`jake: could not reach the hub: ${errorMessage(error)}\n`);
     return EXIT_FAILED;

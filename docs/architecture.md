@@ -249,6 +249,15 @@ give very different footing for keeping a per-user process running.
   silently, the connection staying open — which would leave a gap no sequence number reveals.
   A transfer therefore fixes its chunk size well below the smaller cap a deployment would set, so a
   chunk can never trip a cap in the first place.
+- An upload reaches the hub as a stream, never as one body held whole. The console reads the local
+  file once to learn its length and checksum, names both on its request to the control API, and then
+  streams the file as the request body; the hub declares those two in the upload's opening frame and
+  reads the body only as fast as it hands chunks to the agent's socket, so neither the console nor the
+  hub holds more of the file than the chunks in flight, and the control API sets no bound on an
+  upload's body. A caller that declares neither the length nor the checksum still has its upload
+  taken, at the cost of the hub reading that body whole first to learn both. The hub counts the bytes it streams: a body that runs past the declared length, stops
+  short of it, or breaks off fails the transfer and sends the agent an error frame, and the agent's own
+  check on the closing frame still refuses content that does not match the declared checksum.
 - No upload chunk is sent faster than the connection carries it. The hub's socket, once it has fallen
   behind, queues what it is handed only up to a limit and discards everything past it, silently, with
   the connection still open — the same gap no sequence number reveals, and one that swallows the

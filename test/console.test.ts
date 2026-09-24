@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { HubClient } from "../src/console/client";
+import { checksum } from "../src/protocol";
 import {
   EXIT_FAILED,
   EXIT_NO_AGENT,
@@ -447,37 +448,35 @@ describe("exec streaming", () => {
 // --- file transfer --------------------------------------------------------------------------------
 
 describe("upload", () => {
-  test("reads the local file, sends it to the remote path, and reports the byte total", async () => {
+  test("opens the local file, declares its length and checksum to the remote path, and reports the byte total", async () => {
     const { client, calls } = fakeHub({
       "/upload": () => eventStreamResponse([sseEvent("started", { id: "u1" }), sseEvent("completed", { total: 5, checksum: "abc" })]),
     });
-    const reads: string[] = [];
+    const opened: string[] = [];
     const cap = capture(client, {
-      readFile: async (path) => {
-        reads.push(path);
-        return encoder.encode("hello");
+      openFile: (path) => {
+        opened.push(path);
+        return new Blob([encoder.encode("hello")]);
       },
     });
     const code = await runCli(["upload", "./local.txt", "C:/remote.txt"], cap.deps);
     expect(code).toBe(EXIT_OK);
-    expect(reads).toEqual(["./local.txt"]);
+    expect(opened).toEqual(["./local.txt"]);
     expect(calls[0]?.method).toBe("POST");
-    expect(calls[0]?.url).toContain("/upload?path=");
-    expect(calls[0]?.url).toContain(encodeURIComponent("C:/remote.txt"));
+    const params = new URL(calls[0]?.url ?? "").searchParams;
+    expect(params.get("path")).toBe("C:/remote.txt");
+    expect(params.get("total")).toBe("5");
+    expect(params.get("checksum")).toBe(checksum(encoder.encode("hello")));
     expect(cap.out.join("")).toContain("uploaded ./local.txt -> C:/remote.txt (5 bytes)");
   });
 
   test("a missing local file fails before reaching the hub", async () => {
     const { client, calls } = fakeHub({ "/upload": () => eventStreamResponse([]) });
-    const cap = capture(client, {
-      readFile: async () => {
-        throw new Error("ENOENT");
-      },
-    });
-    const code = await runCli(["upload", "nope.txt", "C:/x"], cap.deps);
+    const cap = capture(client);
+    const code = await runCli(["upload", "/nonexistent/jake/nope.txt", "C:/x"], cap.deps);
     expect(code).toBe(EXIT_FAILED);
     expect(calls).toHaveLength(0);
-    expect(cap.err.join("")).toContain("could not read nope.txt");
+    expect(cap.err.join("")).toContain("could not read /nonexistent/jake/nope.txt");
   });
 
   test("--agent rides along with the remote path on both transfers", async () => {
@@ -485,7 +484,7 @@ describe("upload", () => {
       "/upload": () => eventStreamResponse([sseEvent("completed", { total: 1, checksum: "s" })]),
       "/download": () => eventStreamResponse([sseEvent("completed", { total: 0, checksum: "s" })]),
     });
-    const cap = capture(client, { readFile: async () => encoder.encode("x"), writeFile: async () => {} });
+    const cap = capture(client, { openFile: () => new Blob([encoder.encode("x")]), writeFile: async () => {} });
     await runCli(["upload", "a", "C:/b", "--agent", "node2"], cap.deps);
     await runCli(["download", "C:/b", "a", "-a", "node2"], cap.deps);
     for (const call of calls) {
@@ -497,7 +496,7 @@ describe("upload", () => {
 
   test("a hub with no agent refuses with the no-agent code", async () => {
     const { client } = fakeHub({ "/upload": () => jsonResponse({ error: "no agent attached" }, 409) });
-    const cap = capture(client, { readFile: async () => encoder.encode("x") });
+    const cap = capture(client, { openFile: () => new Blob([encoder.encode("x")]) });
     const code = await runCli(["upload", "a", "b"], cap.deps);
     expect(code).toBe(EXIT_NO_AGENT);
     expect(cap.err.join("")).toContain("no agent attached");
