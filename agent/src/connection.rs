@@ -365,16 +365,6 @@ impl<'a> Session<'a> {
 
   async fn exec(&mut self, request: ExecRequest) {
     let id = request.id.clone();
-    if !Platform::HOST.shells().contains(&request.shell.as_str()) {
-      let message = format!("this agent runs no {} shell", request.shell);
-      return self
-        .send(Frame::Error {
-          id,
-          code: "unsupported".into(),
-          message,
-        })
-        .await;
-    }
     let limits = Limits {
       max_output_bytes: self.agent.config.exec_max_output_bytes,
       timeout: self.agent.config.exec_timeout,

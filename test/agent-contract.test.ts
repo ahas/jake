@@ -232,6 +232,18 @@ describe("running commands", () => {
     expect(result.stdout).toBe(`안녕|${work}|kept`);
   });
 
+  test("a command naming a shell this host has none of runs in the host's own shell", async () => {
+    // The console sends PowerShell when its caller names no shell, whatever the machine is.
+    const result = await run(connection, "echo $0 here", { shell: "powershell" });
+    expect(result.stdout).toBe("bash here\n");
+    expect(result.end).toMatchObject({ type: "exit", code: 0 });
+  });
+
+  test("an empty working directory names none", async () => {
+    const result = await run(connection, "true", { cwd: "" });
+    expect(result.end).toMatchObject({ type: "exit", code: 0 });
+  });
+
   test("a command that cannot start is reported as an error, not an exit", async () => {
     const result = await run(connection, "true", { cwd: join(work, "no-such-dir") });
     expect(result.end).toMatchObject({ type: "error", code: "spawn-failed" });

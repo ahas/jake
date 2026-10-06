@@ -123,7 +123,9 @@ pub fn linux_invocation(request: &ExecRequest) -> Invocation {
   }
 }
 
-/// The invocation for the shell a request names, on this platform.
+/// The invocation for the shell a request names, on this platform. A name the host has no shell for
+/// runs in the host's own: callers that name no shell send the console's default, PowerShell, to
+/// Linux hosts too.
 pub fn invocation(platform: Platform, request: &ExecRequest) -> Invocation {
   match (platform, request.shell.as_str()) {
     (Platform::Windows, "wsl") => wsl_invocation(request),
@@ -324,7 +326,8 @@ fn spawn(invocation: &Invocation) -> std::io::Result<tokio::process::Child> {
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-  if let Some(cwd) = &invocation.cwd {
+  // An empty directory names none, and the run starts where the agent runs.
+  if let Some(cwd) = invocation.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
     command.current_dir(cwd);
   }
   // A group of its own, so stopping the run reaches everything the shell started.

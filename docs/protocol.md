@@ -40,9 +40,9 @@ Command execution (streaming):
 
 - **exec** — hub to agent: run a command. It carries a caller-chosen id that every frame the run
   emits will echo, the shell to run it through, the command text, an optional working directory, an
-  environment overlay, and, for WSL, an optional distribution. The named shell is one of those the
-  hello list advertised; on a Windows host these are PowerShell and WSL, on a Linux or WSL host a
-  Linux shell. The command text is bounded by the same size cap as a byte payload, so an
+  environment overlay, and, for WSL, an optional distribution. The named shell is meant to be one of
+  those the hello list advertised; on a Windows host these are PowerShell and WSL, on a Linux or WSL
+  host a Linux shell. A name the host has no shell for is run in the host's own shell, not refused. The command text is bounded by the same size cap as a byte payload, so an
   embedded-content command cannot slip past the cap that guards every chunk.
 - **stdout** / **stderr** — agent to hub: one chunk of a run's output, carrying the run's id, a
   sequence number that orders the chunks, and the chunk bytes. Chunks are emitted as output arrives,
@@ -51,7 +51,7 @@ Command execution (streaming):
   killed, and whether the end came from a cancel rather than a natural finish.
 - **cancel** — hub to agent: stop the run with this id, ending its whole process tree.
 
-- **error** — agent to hub, or hub to agent: a request failed — an unsupported shell, a spawn
+- **error** — agent to hub, or hub to agent: a request failed — a spawn
   failure, or a file-transfer failure such as a missing file, a permission denial, a full disk, or a
   content that did not verify — carrying the id it answers, a short code, and a message.
 

@@ -234,8 +234,10 @@ give very different footing for keeping a per-user process running.
   chunk by chunk, never held until the command finishes. A program that prints without a trailing
   newline is forwarded as its bytes arrive rather than looking hung waiting for a full line. The
   shells a build offers depend on the host: PowerShell and WSL on a Windows host, a Linux shell on a
-  Linux or WSL host. The agent advertises only the shells its own platform can run, so the hub never
-  offers a shell the machine cannot serve.
+  Linux or WSL host. The agent advertises only the shells its own platform can run. A request that
+  names a shell the host does not have runs in the host's own instead — the Linux shell on a Linux
+  host, PowerShell for anything but WSL on a Windows host — because a caller that names no shell
+  sends the console's default, PowerShell, whatever machine it is aimed at.
 - PowerShell is run non-interactively, without the user profile, and with the execution policy
   bypassed, so an unattended command neither prompts nor is refused for policy. Its console output is
   forced to UTF-8, so a non-ASCII character crosses the tunnel as itself rather than as mojibake in
