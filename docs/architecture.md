@@ -14,7 +14,8 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 ## The programs
 
-- **hub** — runs permanently on main-host as a systemd user service. It accepts the outbound
+- **hub** — a Rust program, the `hub` crate in this repository, that runs permanently on main-host
+  as a systemd user service. It accepts the outbound
   connection of every agent installed on 하스's machines, holds them all at once, and exposes a
   loopback control API that the console and 비모 drive them through. It is reachable from 하스's
   network through a `*.ahas.io` name fronted by NPM. It holds no capability itself; it relays. The
@@ -258,16 +259,15 @@ give very different footing for keeping a per-user process running.
   taken, at the cost of the hub reading that body whole first to learn both. The hub counts the bytes it streams: a body that runs past the declared length, stops
   short of it, or breaks off fails the transfer and sends the agent an error frame, and the agent's own
   check on the closing frame still refuses content that does not match the declared checksum.
-- No upload chunk is sent faster than the connection carries it. The hub's socket, once it has fallen
-  behind, queues what it is handed only up to a limit and discards everything past it, silently, with
-  the connection still open — the same gap no sequence number reveals, and one that swallows the
-  closing frame too, so the agent waits for ever. The hub therefore stops handing an upload's chunks
-  to the socket the moment it reports a backlog and resumes only once it has drained, so a file of any
-  size streams at the speed of the link. A frame the socket discards all the same fails the transfer
-  to its caller at once, and the hub tells the agent with an error frame naming the transfer, so the
-  agent drops the temporary file it was writing rather than holding it until the connection ends.
-  The agent's socket holds whatever it is handed without discarding any, so a download needs no
-  pacing.
+- No upload chunk is sent faster than the connection carries it. Each agent socket on the hub has
+  an outbound queue that holds every frame it is handed and counts the bytes not yet written; once
+  that backlog passes its limit the hub hands the socket nothing more of the upload until it has
+  drained to half the limit, so a file of any size streams at the speed of the link and the hub holds
+  no more of it than that backlog. The limit is configuration, `JAKE_HUB_SOCKET_BACKLOG_BYTES`. A
+  frame the socket refuses because it is already closing fails the transfer to its caller at once,
+  and the hub tells the agent with an error frame naming the transfer, so the agent drops the
+  temporary file it was writing rather than holding it until the connection ends. The agent's
+  socket holds whatever it is handed without discarding any, so a download needs no pacing.
 - Completion is verified, never assumed. The receiver assembles the chunks in sequence order and, on
   the closing frame, checks the bytes it actually assembled against the declared total and checksum
   before it accepts the file. An upload is streamed to a temporary path and moved into place in one
@@ -343,7 +343,16 @@ give very different footing for keeping a per-user process running.
 ## The hub on main-host
 
 - The hub runs permanently on main-host as a systemd **user** service, restarted on failure and
-  brought up at boot once lingering is enabled for the user. It does not start until its config file
+  brought up at boot once lingering is enabled for the user. The unit runs it from the checkout
+  through cargo, offline: cargo rebuilds the release binary whenever the crate or its build output is
+  newer than it, then replaces itself with the hub, so the unit's main process is the hub alone and
+  a restart always runs what the checkout holds. A start after the build output was swept compiles
+  first and listens once that build ends; the crates it needs are fetched once, at deployment.
+- The hub is one thread. Everything it does is relaying — frames in, frames out, a running hash over
+  a download — so it waits on sockets rather than on the processor, and an idle hub with every agent
+  attached sits at a few megabytes. Every accepted connection sends each write at once, without
+  waiting to batch it, because each write is a whole frame or event and a held write costs a
+  round trip its delayed acknowledgement. It does not start until its config file
   exists — the unit's condition guards that file — so a box without the secret and control token in
   place stays quiet rather than crash-looping. Only the hub has a systemd unit; the agent and the
   guard keep themselves alive on Windows by the anchors described above, since 비모 cannot reach into

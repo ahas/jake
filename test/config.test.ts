@@ -8,7 +8,7 @@ import {
   hubEnvPath,
   hubFileEnv,
   loadAgentConfig,
-  loadHubConfig,
+  loadConsoleConfig,
   parseEnvFile,
   type Env,
 } from "../src/config";
@@ -17,11 +17,6 @@ const fullAgent: Env = {
   JAKE_HUB_URL: "wss://jake.example.org",
   JAKE_SECRET: "s3cr3t",
   JAKE_AGENT_NAME: "hass-desktop",
-};
-
-const fullHub: Env = {
-  JAKE_SECRET: "s3cr3t",
-  JAKE_CONTROL_TOKEN: "c0nsole",
 };
 
 describe("loadAgentConfig", () => {
@@ -79,37 +74,6 @@ describe("loadAgentConfig", () => {
   test("rejects a non-positive interval by name", () => {
     expect(() => loadAgentConfig({ ...fullAgent, JAKE_TICK_MS: "0" })).toThrow("JAKE_TICK_MS");
     expect(() => loadAgentConfig({ ...fullAgent, JAKE_WATCHDOG_STALE_MS: "0" })).toThrow("JAKE_WATCHDOG_STALE_MS");
-  });
-});
-
-describe("loadHubConfig", () => {
-  test("reads the required keys and applies defaults", () => {
-    const config = loadHubConfig(fullHub);
-    expect(config.host).toBe("0.0.0.0");
-    expect(config.port).toBe(8790);
-    expect(config.secret).toBe("s3cr3t");
-    expect(config.controlPort).toBe(8791);
-    expect(config.controlToken).toBe("c0nsole");
-    expect(config.maxPayloadBytes).toBe(16 * 1024 * 1024);
-  });
-
-  test("honours overrides", () => {
-    const config = loadHubConfig({ ...fullHub, JAKE_HUB_HOST: "127.0.0.1", JAKE_HUB_PORT: "9000", JAKE_CONTROL_PORT: "9001" });
-    expect(config.host).toBe("127.0.0.1");
-    expect(config.port).toBe(9000);
-    expect(config.controlPort).toBe(9001);
-  });
-
-  test("names a missing secret", () => {
-    expect(() => loadHubConfig({ ...fullHub, JAKE_SECRET: undefined })).toThrow("JAKE_SECRET");
-  });
-
-  test("names a missing control token", () => {
-    expect(() => loadHubConfig({ ...fullHub, JAKE_CONTROL_TOKEN: "" })).toThrow("JAKE_CONTROL_TOKEN");
-  });
-
-  test("rejects a bad port by name", () => {
-    expect(() => loadHubConfig({ ...fullHub, JAKE_HUB_PORT: "eighty" })).toThrow("JAKE_HUB_PORT");
   });
 });
 
@@ -192,16 +156,15 @@ describe("hubEnvPath", () => {
 });
 
 describe("hubFileEnv", () => {
-  test("reads the file JAKE_HUB_ENV points at and feeds loadHubConfig", () => {
+  test("reads the file JAKE_HUB_ENV points at and feeds loadConsoleConfig", () => {
     const dir = mkdtempSync(join(tmpdir(), "jake-hub-env-"));
     try {
       const file = join(dir, "hub.env");
-      writeFileSync(file, "JAKE_SECRET=shared\nJAKE_CONTROL_TOKEN=ctl\nJAKE_HUB_PORT=9001\n");
+      writeFileSync(file, "JAKE_SECRET=shared\nJAKE_CONTROL_TOKEN=ctl\nJAKE_CONTROL_PORT=9001\n");
       const env = hubFileEnv({ JAKE_HUB_ENV: file });
-      const config = loadHubConfig(env);
-      expect(config.secret).toBe("shared");
+      const config = loadConsoleConfig(env);
       expect(config.controlToken).toBe("ctl");
-      expect(config.port).toBe(9001);
+      expect(config.controlPort).toBe(9001);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

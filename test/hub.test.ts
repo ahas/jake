@@ -4,10 +4,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { HubConfig } from "../src/config";
 import {
   DEFAULT_MAX_PAYLOAD_BYTES,
   PROTOCOL_VERSION,
+  TRANSFER_CHUNK_BYTES,
   checksum,
   decodeFrame,
   encodeBytes,
@@ -15,7 +15,7 @@ import {
   streamChecksum,
   type Frame,
 } from "../src/protocol";
-import { startHub, type RunningHub, type StartHubOptions } from "../src/hub/server";
+import { startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
 import { HubClient, type UploadContent } from "../src/console/client";
 import { AgentConnection } from "../src/agent/connection";
 import { FileTransferRunner, nodeTransferFs } from "../src/agent/transfer";
@@ -26,35 +26,24 @@ const SECRET = "s3cr3t";
 const CONTROL = "c0nsole";
 const OPTS = { maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES };
 
-function baseConfig(): HubConfig {
-  return {
-    host: "127.0.0.1",
-    port: 0,
-    secret: SECRET,
-    controlPort: 0,
-    controlToken: CONTROL,
-    maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
-  };
-}
-
 // Everything a test starts, torn down after it so no server or socket outlives the case.
-const running: RunningHub[] = [];
+const running: HubProcess[] = [];
 const agents: FakeAgent[] = [];
 const readers: SseReader[] = [];
 const transports: Transport[] = [];
 const dirs: string[] = [];
 const silentLog = { log() {} };
 
-afterEach(() => {
+afterEach(async () => {
   for (const reader of readers.splice(0)) reader.close();
   for (const agent of agents.splice(0)) agent.close();
   for (const transport of transports.splice(0)) transport.close();
-  for (const hub of running.splice(0)) hub.close();
+  await Promise.all(running.splice(0).map((hub) => hub.stop()));
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function launch(options: StartHubOptions = {}): RunningHub {
-  const hub = startHub(baseConfig(), options);
+async function launch(seams: HubSeams = {}): Promise<HubProcess> {
+  const hub = await startHubProcess(SECRET, CONTROL, seams);
   running.push(hub);
   return hub;
 }
@@ -264,11 +253,20 @@ function openSse(url: string, init: RequestInit): SseReader {
   return reader;
 }
 
-async function control(hub: RunningHub, path: string, init: RequestInit = {}): Promise<Response> {
+async function control(hub: HubProcess, path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`http://127.0.0.1:${hub.controlPort}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${CONTROL}`, ...(init.headers ?? {}) },
   });
+}
+
+/** Wait, bounded, for a condition another process settles. */
+async function until(pred: () => boolean | Promise<boolean>, tries = 400): Promise<void> {
+  for (let i = 0; i < tries; i += 1) {
+    if (await pred()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("condition was not met in time");
 }
 
 const utf8 = new TextEncoder();
@@ -280,7 +278,7 @@ function decodeChunk(chunk: { base64: string }): string {
 
 describe("agent authentication", () => {
   test("accepts an agent presenting the shared secret and records its hello", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec", "fetch"], "hass-desktop");
 
     const status = await (await control(hub, "/status")).json();
@@ -291,8 +289,7 @@ describe("agent authentication", () => {
   });
 
   test("rejects an agent presenting the wrong secret at the upgrade, logging it without the value", async () => {
-    const lines: string[] = [];
-    const hub = launch({ log: (line) => lines.push(line) });
+    const hub = await launch();
     const agent = new FakeAgent(hub.agentPort, "wrong-secret");
     agents.push(agent);
     expect(await agent.outcome()).toBe("error");
@@ -302,11 +299,12 @@ describe("agent authentication", () => {
 
     const plain = await fetch(`http://127.0.0.1:${hub.agentPort}/`, { headers: { Authorization: "Bearer nope" } });
     expect(plain.status).toBe(401);
-    expect(lines).toEqual(["jake hub: refused an agent connection from 127.0.0.1 (a wrong credential)"]);
+    await until(() => hub.stderr.length > 0);
+    expect(hub.stderr).toEqual(["jake hub: refused an agent connection from 127.0.0.1 (a wrong credential)"]);
   });
 
   test("the agent's dialer tells a refused secret apart from a hub that does not answer", async () => {
-    const hub = launch({ log: () => {} });
+    const hub = await launch();
     const events = { onMessage() {}, onClose() {}, onError() {} };
     const dialer = new WebSocketDialer(1_000);
 
@@ -323,7 +321,7 @@ describe("agent authentication", () => {
   });
 
   test("rejects a control request without the control token", async () => {
-    const hub = launch();
+    const hub = await launch();
     const response = await fetch(`http://127.0.0.1:${hub.controlPort}/status`);
     expect(response.status).toBe(401);
   });
@@ -335,7 +333,7 @@ function execBody(command: string): RequestInit {
 
 describe("many agents", () => {
   test("agents under different names attach side by side and neither displaces the other", async () => {
-    const hub = launch();
+    const hub = await launch();
     const wsl = await attach(hub.agentPort, ["exec:wsl"], "jake_wsl");
     const node2 = await attach(hub.agentPort, ["exec:linux"], "node2");
 
@@ -347,7 +345,7 @@ describe("many agents", () => {
   });
 
   test("a reconnect under a name already held replaces that connection alone", async () => {
-    const hub = launch();
+    const hub = await launch();
     const first = await attach(hub.agentPort, [], "hass-desktop");
     const other = await attach(hub.agentPort, [], "node2");
     const second = await attach(hub.agentPort, [], "hass-desktop");
@@ -367,7 +365,7 @@ describe("many agents", () => {
   });
 
   test("a named command goes to that agent only, and its output comes back from it", async () => {
-    const hub = launch();
+    const hub = await launch();
     const wsl = await attach(hub.agentPort, [], "jake_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
@@ -385,7 +383,7 @@ describe("many agents", () => {
   });
 
   test("with several attached, a request naming none or an absent one is refused", async () => {
-    const hub = launch();
+    const hub = await launch();
     await attach(hub.agentPort, [], "jake_wsl");
     await attach(hub.agentPort, [], "node2");
 
@@ -402,7 +400,7 @@ describe("many agents", () => {
   });
 
   test("an agent that drops ends only its own commands", async () => {
-    const hub = launch();
+    const hub = await launch();
     const wsl = await attach(hub.agentPort, [], "jake_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
@@ -432,7 +430,7 @@ describe("many agents", () => {
   });
 
   test("a leave reaches the named agent and leaves the others installed", async () => {
-    const hub = launch();
+    const hub = await launch();
     const wsl = await attach(hub.agentPort, [], "jake_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
@@ -443,11 +441,15 @@ describe("many agents", () => {
   });
 
   test("the traffic log tags each frame with its agent", async () => {
-    const hub = launch();
+    const hub = await launch();
     await attach(hub.agentPort, [], "jake_wsl");
     await attach(hub.agentPort, [], "node2");
 
-    const hellos = hub.core.trafficSince(0).filter((entry) => entry.type === "hello" || entry.type === "welcome");
+    // The replay a console opening now catches up on carries every handshake frame, tagged.
+    const tail = openSse(`http://127.0.0.1:${hub.controlPort}/events`, { method: "GET" });
+    const handshake = (e: SseEvent): boolean => e.event === "traffic" && ["hello", "welcome"].includes((e.data as { type: string }).type);
+    const hellos: { agent: string; type: string }[] = [];
+    for (let i = 0; i < 4; i += 1) hellos.push((await tail.waitFor(handshake)).data as { agent: string; type: string });
     expect(hellos.map((entry) => `${entry.agent} ${entry.type}`)).toEqual([
       "jake_wsl hello",
       "jake_wsl welcome",
@@ -459,7 +461,7 @@ describe("many agents", () => {
 
 describe("exec streaming", () => {
   test("streams a command's output through to an SSE reader in order", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec"]);
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec`, {
@@ -498,7 +500,7 @@ describe("exec streaming", () => {
   });
 
   test("cancel reaches the agent and the run ends as canceled", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec"]);
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec`, {
@@ -526,7 +528,7 @@ describe("exec streaming", () => {
   });
 
   test("an agent disconnect ends every in-flight command explicitly", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec"]);
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec`, {
@@ -545,7 +547,7 @@ describe("exec streaming", () => {
   });
 
   test("exec against a hub with no agent is refused", async () => {
-    const hub = launch();
+    const hub = await launch();
     const response = await control(hub, "/exec", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -556,7 +558,7 @@ describe("exec streaming", () => {
 });
 
 describe("file transfer over the control API", () => {
-  function hubClient(hub: RunningHub): HubClient {
+  function hubClient(hub: HubProcess): HubClient {
     return new HubClient({ baseUrl: `http://127.0.0.1:${hub.controlPort}`, token: CONTROL });
   }
 
@@ -565,7 +567,7 @@ describe("file transfer over the control API", () => {
   }
 
   // A real agent over a real socket, writing what it receives to disk and verifying it.
-  async function attachRealAgent(hub: RunningHub): Promise<void> {
+  async function attachRealAgent(hub: HubProcess): Promise<void> {
     let connection: AgentConnection | null = null;
     const transport = await new WebSocketDialer().dial(`ws://127.0.0.1:${hub.agentPort}`, SECRET, {
       onMessage: (raw) => connection?.handleMessage(raw),
@@ -586,15 +588,17 @@ describe("file transfer over the control API", () => {
       log: silentLog,
     });
     connection.run();
-    for (let i = 0; i < 200 && hub.core.status().agents.length === 0; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(hub.core.status().agents.map((a) => a.name)).toEqual(["hass"]);
+    let names: string[] = [];
+    await until(async () => {
+      names = (await (await control(hub, "/status")).json()).agents.map((a: { name: string }) => a.name);
+      return names.length > 0;
+    });
+    expect(names).toEqual(["hass"]);
   }
 
   test("upload: a file past the HTTP body limit streams from disk to disk and lands byte for byte", async () => {
     // 300 MiB is well past the 128 MiB a Bun server takes as one request body by default.
-    const hub = launch();
+    const hub = await launch();
     await attachRealAgent(hub);
     const dir = mkdtempSync(join(tmpdir(), "jake-hub-upload-"));
     dirs.push(dir);
@@ -620,7 +624,7 @@ describe("file transfer over the control API", () => {
   }, 120_000);
 
   test("upload: a caller that declares no length or checksum has them learned from its body", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["transfer"]);
     const content = new Uint8Array(1000).map((_, i) => i % 7);
 
@@ -635,7 +639,7 @@ describe("file transfer over the control API", () => {
   });
 
   test("upload: a declared length without a well-formed checksum is a bad request", async () => {
-    const hub = launch();
+    const hub = await launch();
     await attach(hub.agentPort, ["transfer"]);
     const body = new Blob([new Uint8Array([1])]);
     expect((await control(hub, "/upload?path=/x&total=1", { method: "POST", body })).status).toBe(400);
@@ -644,7 +648,7 @@ describe("file transfer over the control API", () => {
   });
 
   test("upload: the hub chunks the file to the agent, which acknowledges the verified write", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["transfer"]);
     const client = hubClient(hub);
 
@@ -671,7 +675,7 @@ describe("file transfer over the control API", () => {
     // file, the way Bun's default limit is reached by a file of twenty-odd megabytes.
     // The agent reads on the hub's own event loop, so it falls behind the hub's writes the way a slow
     // link does and the socket's backlog passes its limit many times over.
-    const hub = launch({ socketBacklogBytes: 512 * 1024 });
+    const hub = await launch({ socketBacklogBytes: 512 * 1024 });
     const agent = await attach(hub.agentPort, ["transfer"]);
     const client = hubClient(hub);
 
@@ -693,7 +697,7 @@ describe("file transfer over the control API", () => {
   });
 
   test("download: the agent streams the file and the hub verifies it before completing", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["transfer"]);
     const client = hubClient(hub);
 
@@ -723,8 +727,108 @@ describe("file transfer over the control API", () => {
     expect(assembled).toEqual(content);
   });
 
+  test("upload: a body arriving in pieces of any size reaches the agent as fixed chunks, whole and in order", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const content = new Uint8Array(TRANSFER_CHUNK_BYTES * 2 + 1234).map((_, i) => (i * 13) % 241);
+    const pieces = [content.subarray(0, 7), content.subarray(7, TRANSFER_CHUNK_BYTES + 99), content.subarray(TRANSFER_CHUNK_BYTES + 99)];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const piece of pieces) controller.enqueue(piece);
+        controller.close();
+      },
+    });
+
+    const upload = control(hub, `/upload?path=/remote/pieces.bin&total=${content.byteLength}&checksum=${checksum(content)}`, { method: "POST", body });
+    const end = await agent.waitFor((f) => f.type === "transfer-end");
+    const chunks = agent.received.filter((f): f is Extract<Frame, { type: "transfer-chunk" }> => f.type === "transfer-chunk");
+    expect(chunks.map((f) => f.chunk.bytes)).toEqual([TRANSFER_CHUNK_BYTES, TRANSFER_CHUNK_BYTES, 1234]);
+    expect(checksum(Buffer.concat(chunks.map((f) => Buffer.from(f.chunk.base64, "base64"))))).toBe(checksum(content));
+
+    if (end.type !== "transfer-end") throw new Error("unexpected frame");
+    agent.send({ type: "transfer-end", v: V, id: end.id, total: end.total, checksum: end.checksum });
+    expect(await (await upload).text()).toContain("event: completed");
+  });
+
+  test("upload: a body shorter or longer than its declared total fails the upload, tells the agent, and sends no end", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const content = new Uint8Array(10_000).map((_, i) => i % 199);
+    for (const declared of [10_001, 9_999]) {
+      const response = await control(hub, `/upload?path=/remote/size.bin&total=${declared}&checksum=${checksum(content)}`, {
+        method: "POST",
+        body: new Blob([content]),
+      });
+      const text = await response.text();
+      expect(text).toContain("event: error");
+      expect(text).toContain('"code":"size-mismatch"');
+      const notice = await agent.waitFor((f) => f.type === "error");
+      expect(notice).toMatchObject({ code: "size-mismatch" });
+    }
+    expect(agent.received.some((f) => f.type === "transfer-end")).toBe(false);
+  });
+
+  test("download: assembled bytes that do not match the declared checksum are refused as an integrity error", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/download?path=/x`, { method: "POST" });
+    await reader.ready;
+    const req = await agent.waitFor((f) => f.type === "transfer-begin");
+    if (req.type !== "transfer-begin") throw new Error("unexpected frame");
+
+    const data = new Uint8Array(1000).map((_, i) => i % 7);
+    agent.send({ type: "transfer-begin", v: V, id: req.id, direction: "download", path: "/x", total: data.byteLength, checksum: "0".repeat(64) });
+    agent.send({ type: "transfer-chunk", v: V, id: req.id, seq: 0, chunk: encodeBytes(data) });
+    agent.send({ type: "transfer-end", v: V, id: req.id, total: data.byteLength, checksum: "0".repeat(64) });
+
+    const failed = await reader.waitFor((e) => e.event === "error");
+    expect(failed.data).toMatchObject({ code: "integrity" });
+  });
+
+  test("download: a chunk out of order fails the transfer rather than assembling a gap", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/download?path=/x`, { method: "POST" });
+    await reader.ready;
+    const req = await agent.waitFor((f) => f.type === "transfer-begin");
+    if (req.type !== "transfer-begin") throw new Error("unexpected frame");
+
+    agent.send({ type: "transfer-chunk", v: V, id: req.id, seq: 1, chunk: encodeBytes(new Uint8Array(3)) });
+    const failed = await reader.waitFor((e) => e.event === "error");
+    expect(failed.data).toMatchObject({ code: "out-of-order", message: "expected chunk 0, got 1" });
+  });
+
+  test("an error frame for a transfer ends it as failed with the agent's code", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["transfer"]);
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/download?path=/missing`, { method: "POST" });
+    await reader.ready;
+    const req = await agent.waitFor((f) => f.type === "transfer-begin");
+    if (req.type !== "transfer-begin") throw new Error("unexpected frame");
+
+    agent.send({ type: "error", v: V, id: req.id, code: "not-found", message: "no such file" });
+    const failed = await reader.waitFor((e) => e.event === "error");
+    expect(failed.data).toEqual({ code: "not-found", message: "no such file" });
+  });
+
+  test("download: a real agent streams a file off its disk and the hub hands it back verified", async () => {
+    const hub = await launch();
+    await attachRealAgent(hub);
+    const dir = mkdtempSync(join(tmpdir(), "jake-hub-download-"));
+    dirs.push(dir);
+    const source = join(dir, "source.bin");
+    const content = new Uint8Array(randomBytes(600_000));
+    await Bun.write(source, content);
+
+    const received: Uint8Array[] = [];
+    const outcome = await hubClient(hub).download(source, { onChunk: (bytes) => received.push(bytes) });
+
+    expect(outcome).toMatchObject({ kind: "completed", total: content.byteLength, checksum: checksum(content) });
+    expect(checksum(Buffer.concat(received))).toBe(checksum(content));
+  });
+
   test("a transfer with no path is a bad request", async () => {
-    const hub = launch();
+    const hub = await launch();
     await attach(hub.agentPort, ["transfer"]);
     const up = await control(hub, "/upload", { method: "POST", body: new Blob([new Uint8Array([1])]) });
     expect(up.status).toBe(400);
@@ -733,7 +837,7 @@ describe("file transfer over the control API", () => {
   });
 
   test("a transfer against a hub with no agent is refused", async () => {
-    const hub = launch();
+    const hub = await launch();
     const up = await control(hub, "/upload?path=/x", { method: "POST", body: new Blob([new Uint8Array([1])]) });
     expect(up.status).toBe(409);
     const down = await control(hub, "/download?path=/x", { method: "POST" });
@@ -743,7 +847,7 @@ describe("file transfer over the control API", () => {
 
 describe("leave", () => {
   test("relays a leave frame to the attached agent", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec"]);
 
     const response = await control(hub, "/leave", { method: "POST" });
@@ -754,7 +858,7 @@ describe("leave", () => {
   });
 
   test("is refused when no agent is attached", async () => {
-    const hub = launch();
+    const hub = await launch();
     const response = await control(hub, "/leave", { method: "POST" });
     expect(response.status).toBe(409);
     expect((await response.json()).ok).toBe(false);
@@ -763,7 +867,7 @@ describe("leave", () => {
 
 describe("the control API carries no capability calls", () => {
   test("a /call request is not a route", async () => {
-    const hub = launch();
+    const hub = await launch();
     await attach(hub.agentPort, ["exec:powershell"]);
     const response = await control(hub, "/call", {
       method: "POST",
@@ -776,7 +880,7 @@ describe("the control API carries no capability calls", () => {
 
 describe("liveness", () => {
   test("declares the agent dead after missed pongs and closes it", async () => {
-    const hub = launch({ core: { pingIntervalMs: 20, missedPongLimit: 2 } });
+    const hub = await launch({ pingIntervalMs: 20, missedPongLimit: 2 });
 
     // This agent never answers a ping, so its liveness window lapses.
     const agent = new FakeAgent(hub.agentPort, SECRET, false);
@@ -797,7 +901,7 @@ describe("liveness", () => {
   });
 
   test("an agent that answers pings stays attached", async () => {
-    const hub = launch({ core: { pingIntervalMs: 20, missedPongLimit: 2 } });
+    const hub = await launch({ pingIntervalMs: 20, missedPongLimit: 2 });
     const agent = await attach(hub.agentPort, []); // autoPong on by default
 
     await agent.waitFor((f) => f.type === "ping"); // it is being probed
@@ -810,14 +914,15 @@ describe("liveness", () => {
 
 describe("traffic tail", () => {
   test("replays recent frames then follows the live feed", async () => {
-    const hub = launch();
+    const hub = await launch();
     const agent = await attach(hub.agentPort, ["exec"]);
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/events`, { method: "GET" });
     await reader.ready;
 
     const run = await reader.waitFor((e) => e.event === "run");
-    expect((run.data as { run: string }).run).toBe(hub.core.run);
+    const status = await (await control(hub, "/status")).json();
+    expect((run.data as { run: string }).run).toBe(status.run);
     // The hello that attached the agent is in the replay.
     await reader.waitFor((e) => e.event === "traffic" && (e.data as { type: string }).type === "hello");
 
@@ -834,7 +939,7 @@ describe("traffic tail", () => {
 
 describe("status page", () => {
   test("serves the read-only page at / without a token, and still guards the API", async () => {
-    const hub = launch();
+    const hub = await launch();
 
     // The page is reachable with no Authorization header — a browser navigation cannot send one.
     const page = await fetch(`http://127.0.0.1:${hub.controlPort}/`);

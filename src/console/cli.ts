@@ -1,8 +1,7 @@
 // The jake command line: the primary console surface.
 
 import { isShellKind, SHELL_KINDS, streamChecksum } from "../protocol";
-import type { StatusSnapshot, TrafficEntry } from "../hub/core";
-import type { ExecRequest, HubClient, TransferOutcome, UploadContent } from "./client";
+import type { ExecRequest, HubClient, StatusSnapshot, TrafficEntry, TransferOutcome, UploadContent } from "./client";
 
 export const EXIT_OK = 0;
 export const EXIT_USAGE = 2;

@@ -1,0 +1,21 @@
+# The shape 하스's Rust is written in, held to the options stable rustfmt reads.
+edition = "2024"
+
+max_width = 108
+tab_spaces = 2
+newline_style = "Auto"
+
+fn_call_width = 88
+attr_fn_like_width = 88
+struct_lit_width = 18
+struct_variant_width = 36
+array_width = 88
+chain_width = 88
+single_line_if_else_max_width = 88
+single_line_let_else_max_width = 88
+
+reorder_modules = true
+reorder_imports = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+remove_nested_parens = true

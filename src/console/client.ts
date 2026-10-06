@@ -1,8 +1,37 @@
 // A typed client over the hub's loopback control API.
 
-import type { StatusSnapshot, TrafficEntry } from "../hub/core";
-import type { ShellKind } from "../protocol";
+import type { FrameType, ShellKind } from "../protocol";
 import { readSse } from "./sse";
+
+/** One attached agent, as the hub's status reports it. */
+export interface AgentStatus {
+  name: string;
+  agentVersion: string;
+  capabilities: string[];
+  connectedAt: number;
+  lastPongAt: number;
+  /** The ids of the commands still streaming on this agent. */
+  inFlight: string[];
+}
+
+/** The hub's status: its run tag, whether any agent is attached, and every attached agent by name. */
+export interface StatusSnapshot {
+  /** Identifies the hub process, so a console can tell its traffic cursor is still valid. */
+  run: string;
+  attached: boolean;
+  agents: AgentStatus[];
+}
+
+/** One frame that crossed the tunnel, reduced to its shape, as the hub's traffic feed carries it. */
+export interface TrafficEntry {
+  id: number;
+  at: number;
+  /** The agent the frame crossed to or from; null for a socket that never said hello. */
+  agent: string | null;
+  dir: "in" | "out";
+  type: FrameType | "invalid";
+  summary: Record<string, unknown>;
+}
 
 export interface HubClientOptions {
   /** The control API's base URL, e.g. http://127.0.0.1:8791. A trailing slash is tolerated. */

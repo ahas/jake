@@ -12,13 +12,17 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-# The checkout the hub runs from. It is not compiled; bun runs the entry point in place.
+# The checkout the hub runs from. cargo builds the Rust hub in place when its sources or its build
+# are newer than the binary, offline from the crates already fetched, and then replaces itself with
+# the hub, so the unit's main process is the hub and a restart runs whatever the checkout holds.
 WorkingDirectory=%h/repos/ahas/jake
-ExecStart=%h/.bun/bin/bun src/hub/main.ts
+ExecStart=%h/.cargo/bin/cargo run --release --frozen --quiet --manifest-path hub/Cargo.toml
+# The journal names the hub, not the cargo that started it.
+SyslogIdentifier=jake-hub
 Restart=always
 RestartSec=5
-# The same PATH BMO's units carry, so bun and the tools a login shell reaches for are found the same
-# way whether the hub was started by systemd or from a shell.
+# The same PATH BMO's units carry, so cargo, rustc and the tools a login shell reaches for are found
+# the same way whether the hub was started by systemd or from a shell.
 Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]

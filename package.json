@@ -10,8 +10,10 @@
   "scripts": {
     "check:types": "bunx tsc --noEmit",
     "typecheck": "bunx tsc --noEmit",
+    "check:hub": "cargo clippy --offline --all-targets --manifest-path hub/Cargo.toml -- -D warnings && cargo fmt --manifest-path hub/Cargo.toml --check",
+    "test:hub": "cargo test --offline --manifest-path hub/Cargo.toml",
     "test": "bun test",
-    "check": "bun run check:types && bun run test",
+    "check": "bun run check:types && bun run check:hub && bun run test:hub && bun run test",
     "build": "bun scripts/build.ts"
   }
 }

@@ -34,8 +34,17 @@ nginx template in step 5 too — the two must agree. Record the same `JAKE_SECRE
 
 ## 2. The systemd user service
 
-Link the unit into the user unit directory, enable it, and turn on lingering so it runs across a
-reboot without an interactive login.
+The hub is the Rust crate under `hub/`, and the unit builds and runs it with cargo offline, so the
+Rust toolchain must be installed under `~/.cargo` and the crates fetched once beforehand. Fetch them
+and build the release binary, so the first start does not wait on a compile:
+
+```sh
+cargo fetch --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
+cargo build --release --frozen --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
+```
+
+Then link the unit into the user unit directory, enable it, and turn on lingering so it runs across
+a reboot without an interactive login.
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -46,7 +55,8 @@ loginctl enable-linger "$USER"
 ```
 
 The unit will not start until the config file from step 1 exists — that is what the
-`ConditionPathExists` guards. Confirm it came up:
+`ConditionPathExists` guards. A restart runs whatever the checkout holds, rebuilding first if the
+crate changed, so putting a new hub live is `systemctl --user restart jake-hub`. Confirm it came up:
 
 ```sh
 systemctl --user status jake-hub

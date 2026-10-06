@@ -29,22 +29,6 @@ export interface AgentConfig {
   execTimeoutMs: number;
 }
 
-/** What the main-host-side hub needs to accept the agent and to be driven by the console. */
-export interface HubConfig {
-  /** The address the agent-facing WebSocket server binds to. */
-  host: string;
-  /** The port the agent-facing WebSocket server listens on. */
-  port: number;
-  /** The shared secret an agent must present. Must match the agent's secret. */
-  secret: string;
-  /** The port the loopback control API listens on, bound to 127.0.0.1 alone. */
-  controlPort: number;
-  /** The token every control-API request carries. Distinct from the agent secret. */
-  controlToken: string;
-  /** The largest single frame payload the hub will accept from the agent, in bytes. */
-  maxPayloadBytes: number;
-}
-
 // Defaults for the non-credential knobs. Credentials and the hub URL have no default: a process
 // that cannot find them must stop, not run against a guessed value.
 const DEFAULT_HEARTBEAT_MS = 15_000;
@@ -56,8 +40,6 @@ const DEFAULT_WATCHDOG_STALE_MS = 180_000;
 const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_HUB_HOST = "0.0.0.0";
-const DEFAULT_HUB_PORT = 8790;
 const DEFAULT_CONTROL_PORT = 8791;
 
 function requireEnv(env: Env, name: string): string {
@@ -129,18 +111,6 @@ export function loadConsoleConfig(env: Env = process.env): ConsoleConfig {
   return {
     controlPort: optionalPositiveIntEnv(env, "JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT),
     controlToken: requireEnv(env, "JAKE_CONTROL_TOKEN"),
-  };
-}
-
-/** Read the hub's configuration from an environment source. */
-export function loadHubConfig(env: Env = process.env): HubConfig {
-  return {
-    host: env.JAKE_HUB_HOST === undefined || env.JAKE_HUB_HOST === "" ? DEFAULT_HUB_HOST : env.JAKE_HUB_HOST,
-    port: optionalPositiveIntEnv(env, "JAKE_HUB_PORT", DEFAULT_HUB_PORT),
-    secret: requireEnv(env, "JAKE_SECRET"),
-    controlPort: optionalPositiveIntEnv(env, "JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT),
-    controlToken: requireEnv(env, "JAKE_CONTROL_TOKEN"),
-    maxPayloadBytes: optionalPositiveIntEnv(env, "JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES),
   };
 }
 
