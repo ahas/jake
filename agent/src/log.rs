@@ -28,7 +28,11 @@ impl Log {
   }
 
   fn with_limits(path: PathBuf, max_bytes: u64, keep: u32) -> Self {
-    Self(Arc::new(Mutex::new(Rolling { path, max_bytes, keep })))
+    Self(Arc::new(Mutex::new(Rolling {
+      path,
+      max_bytes,
+      keep,
+    })))
   }
 
   pub fn info(&self, event: &str, detail: Value) {
@@ -63,7 +67,11 @@ impl Rolling {
     if let Some(parent) = self.path.parent() {
       fs::create_dir_all(parent)?;
     }
-    OpenOptions::new().create(true).append(true).open(&self.path)?.write_all(text.as_bytes())
+    OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(&self.path)?
+      .write_all(text.as_bytes())
   }
 
   // The oldest kept file falls off, each survivor moves up a slot, and the live file becomes slot 1.
@@ -96,8 +104,10 @@ mod tests {
       log.info("tick", serde_json::json!({ "n": n }));
     }
     let live = fs::read_to_string(&path).unwrap();
-    let mut names: Vec<String> =
-      fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    let mut names: Vec<String> = fs::read_dir(&dir)
+      .unwrap()
+      .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+      .collect();
     names.sort();
     fs::remove_dir_all(&dir).unwrap();
 

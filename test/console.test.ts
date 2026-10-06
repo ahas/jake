@@ -236,6 +236,7 @@ describe("status", () => {
       },
       { name: "node2", agentVersion: "0.1.0", capabilities: ["exec:linux"], connectedAt: NOW - 5_000, lastPongAt: NOW, inFlight: [] },
     ],
+    departed: [{ name: "jungsu-wsl", departedAt: NOW - 120_000 }],
   };
 
   test("prints every attached agent", async () => {
@@ -251,10 +252,11 @@ describe("status", () => {
     expect(text).toContain("in-flight commands: c1");
     expect(text).toContain("node2 v0.1.0");
     expect(text).toContain("exec:linux");
+    expect(text).toContain("jungsu-wsl departed 2m 0s ago");
   });
 
   test("a hub with no agent reads as detached", async () => {
-    const { client } = fakeHub({ "/status": () => jsonResponse({ run: "hub-abc", attached: false, agents: [] }) });
+    const { client } = fakeHub({ "/status": () => jsonResponse({ run: "hub-abc", attached: false, agents: [], departed: [] }) });
     const cap = capture(client);
     await runCli(["status"], cap.deps);
     expect(cap.out.join("")).toContain("detached — no agent connected");

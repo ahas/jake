@@ -182,8 +182,8 @@ Set-Content -LiteralPath $envPath -Value $lines -Encoding UTF8
 Write-Ok "config written (credential stays on this machine only)"
 
 # --- register the three anchors for both run modes ----------------------------------------------
-# These mirror src/agent/anchors.ts exactly, so the watchdog's per-tick rewrite maintains the same
-# registrations rather than competing with them: a per-user Run value, a logon-triggered scheduled
+# These mirror the agent's own anchor commands exactly, so the watchdog's per-tick rewrite keeps the
+# same registrations rather than competing with them: a per-user Run value, a logon-triggered scheduled
 # task with no stored credentials at the limited run level, and a Startup-folder shortcut. All three
 # are per-user and need no elevation. Overwriting in place is what makes a re-run add no duplicates.
 # The guard run mode launches the same exe with the guard flag.
@@ -209,7 +209,7 @@ function Register-Anchor($name, $exe, $arguments, $workingDir) {
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 
-  # Startup shortcut: built through WScript.Shell, the same way anchors.ts builds it.
+  # Startup shortcut: built through WScript.Shell, the same way the watchdog builds it.
   $lnk = Join-Path $StartupDir "$name.lnk"
   $shell = New-Object -ComObject WScript.Shell
   $sc = $shell.CreateShortcut($lnk)

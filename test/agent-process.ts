@@ -4,9 +4,24 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
+const MANIFEST = join(ROOT, "agent", "Cargo.toml");
 
 /** The agent under contract: started as a process, so the tests hold whatever it is written in. */
-export const AGENT_COMMAND: readonly string[] = ["bun", join(ROOT, "src", "main.ts")];
+export const AGENT_COMMAND: readonly string[] = [join(ROOT, "target", "debug", "jake")];
+
+let built = false;
+
+/** Build the agent once per test run; cargo answers at once when nothing changed. */
+export function ensureAgentBuilt(): void {
+  if (built) return;
+  const result = Bun.spawnSync(["cargo", "build", "--offline", "--quiet", "--manifest-path", MANIFEST], {
+    stdin: "ignore",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  if (result.exitCode !== 0) throw new Error("cargo build of the agent failed");
+  built = true;
+}
 
 /** One frame as the wire carries it, read loosely: the tests check fields by name. */
 export type WireFrame = { type: string; v: number } & Record<string, unknown>;
@@ -143,6 +158,7 @@ export function agentLogPath(home: string): string {
 
 /** Start the agent with the given configuration in its environment. */
 export function startAgentProcess(options: AgentOptions): AgentProcess {
+  ensureAgentBuilt();
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: options.home,

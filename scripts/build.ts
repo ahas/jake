@@ -10,10 +10,14 @@ const repoRoot = join(scriptDir, "..");
 const distDir = join(repoRoot, "dist");
 const layoutDir = join(distDir, "jake");
 
-/** The per-platform executables the layout ships: a bun compile target and the name it lands under. */
+/**
+ * The per-platform executables the layout ships: a Rust target and the name it lands under. The Linux
+ * binary links musl statically, so it runs on any distribution or WSL whatever its C library; zig is
+ * the linker and C compiler for both targets, so neither needs a toolchain of its own.
+ */
 const BINARIES: ReadonlyArray<{ target: string; outName: string }> = [
-  { target: "bun-windows-x64", outName: "jake.exe" },
-  { target: "bun-linux-x64", outName: "jake" },
+  { target: "x86_64-pc-windows-gnu", outName: "jake.exe" },
+  { target: "x86_64-unknown-linux-musl", outName: "jake" },
 ];
 
 /** Derive the build version: the package version, plus the git short hash and a dirty marker. */
@@ -38,29 +42,21 @@ function git(args: string[]): string | null {
   return result.stdout.trim();
 }
 
-/** Cross-compile one entry point for one target into the layout, stamping the version in. */
-function compile(entry: string, target: string, outName: string, version: string): void {
-  const out = join(layoutDir, outName);
+/** Cross-compile the agent for one target into the layout, stamping the version in. */
+function compile(target: string, outName: string, version: string): void {
   const result = spawnSync(
-    "bun",
-    [
-      "build",
-      "--compile",
-      `--target=${target}`,
-      "--define",
-      `__JAKE_VERSION__=${JSON.stringify(version)}`,
-      "--outfile",
-      out,
-      join(repoRoot, entry),
-    ],
-    { cwd: repoRoot, stdio: "inherit" },
+    "cargo",
+    ["zigbuild", "--release", "--offline", "--package", "jake-agent", "--target", target],
+    { cwd: repoRoot, stdio: "inherit", env: { ...process.env, JAKE_VERSION: version } },
   );
   if (result.status !== 0) {
-    throw new Error(`compile failed for ${entry} → ${target} (exit ${result.status ?? "signal"})`);
+    throw new Error(`compile failed for ${target} (exit ${result.status ?? "signal"})`);
   }
-  if (!existsSync(out)) {
-    throw new Error(`compile reported success but ${out} is missing`);
+  const built = join(repoRoot, "target", target, "release", outName);
+  if (!existsSync(built)) {
+    throw new Error(`compile reported success but ${built} is missing`);
   }
+  cpSync(built, join(layoutDir, outName));
 }
 
 /** Copy one repo file into the layout under a chosen name. */
@@ -84,7 +80,7 @@ async function main(): Promise<void> {
 
   for (const { target, outName } of BINARIES) {
     console.log(`· compiling ${outName} (${target})`);
-    compile("src/main.ts", target, outName, version);
+    compile(target, outName, version);
   }
 
   console.log("· placing the example config, the install scripts, and the systemd unit");

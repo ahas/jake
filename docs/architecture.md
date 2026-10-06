@@ -21,11 +21,13 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   network through a `*.ahas.io` name fronted by NPM. It holds no capability itself; it relays. The
   hub is the back end every agent shares, not a machine of its own: each attached agent is one
   machine, and the hub is how all of them are reached.
-- **agent** — runs on one of 하스's machines from a single executable. It dials the hub,
+- **agent** — a Rust program, the `agent` crate in this repository, that runs on one of 하스's
+  machines from a single executable. It dials the hub,
   authenticates, and then serves what the hub asks of it: shell commands, with live-streamed output,
   and file transfers over the same connection. It listens for nothing and only dials. On a Windows
   host the same executable also runs as the **guard**, a small supervisor that carries no capability
-  and only keeps the agent alive; the command line chooses which of the two a process is. On a Linux
+  and only keeps the agent alive; the command line chooses which of the two a process is. Run with
+  the leave-notice flag it is neither: it tells the hub the agent was uninstalled, and exits. On a Linux
   host the agent needs no guard, because the platform's own service manager keeps it running. The
   staying-alive scheme below covers both.
 
@@ -46,8 +48,16 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   request naming an agent that is not attached is refused rather than sent elsewhere. Cancelling a
   command needs no name, because a command's id is unique across the whole hub.
 - The status the control API reports lists every attached agent — its name, version, capabilities,
-  when it connected, when it last answered a ping, and the commands running on it — and the traffic
-  log tags each frame with the agent it crossed to or from.
+  when it connected, when it last answered a ping, and the commands running on it — and every
+  departed one with when it left, and the traffic log tags each frame with the agent it crossed to
+  or from.
+- A departed agent is one that was uninstalled, told apart from one that is merely disconnected. An
+  agent the hub sends a leave to is recorded as departed at once, and so is an agent whose
+  uninstaller tells the hub it was removed by hand; either is dropped from the attached list. A
+  disconnected agent is simply absent from the attached list, so a reader that expects a machine can
+  tell a box that is down from one that is gone. The record is kept in a file under the hub's data
+  directory, so a restart does not forget it, and a later hello under a departed name — a reinstall —
+  removes the name from it. The hub writes a line to its log for every departure and every return.
 
 ## What crosses the tunnel
 
@@ -207,6 +217,12 @@ give very different footing for keeping a per-user process running.
 - Leaving is the remote counterpart of the local uninstaller. The uninstaller is run by hand on the
   machine and can keep the config for a reinstall; a leave is sent from the hub, keeps nothing, and
   does not come back. It is deliberately guarded on the console side so a slip cannot trigger it.
+- The uninstaller tells the hub the agent has gone, so a removal by hand is recorded as a departure
+  just as a leave is. Once it has stopped the agent, and before it deletes the executable, it runs the
+  executable once in its leave-notice mode: that process dials the hub with the configured secret
+  and name, says hello, and once welcomed sends a leave frame of its own and exits. The agent is
+  already stopped, so this hello displaces no live connection. A hub that cannot be reached does not
+  stop the uninstall; the uninstaller says the hub was not told and carries on.
 
 ## Running commands
 
@@ -312,11 +328,12 @@ give very different footing for keeping a per-user process running.
 ## The build and the install
 
 - The executable is cross-compiled from main-host for both hosts — a Windows target and a Linux
-  target — so no Windows toolchain and no separate Linux machine are needed to produce them. Each is
-  a single self-contained file with the runtime embedded, and the build version is stamped into it at
-  compile time — the agent run mode announces it to the hub. The build's output is a small layout: the
-  Windows executable, the Linux binary, the example config, the install scripts for both platforms,
-  and the install guide. Nothing else is bundled, because the agent needs nothing beyond the shells
+  target — with zig as the linker and C compiler, so no Windows toolchain and no separate Linux
+  machine are needed to produce them. Each is a single self-contained file: the Linux binary links
+  its C library statically, so it runs on any distribution or WSL whatever C library that has. The
+  build version is stamped into it at compile time — the agent run mode announces it to the hub.
+  The build's output is a small layout: the Windows executable, the Linux binary, the example
+  config, the install scripts for both platforms, and the install guide. Nothing else is bundled, because the agent needs nothing beyond the shells
   already on the machine.
 - The build layout is served under `ai.example.org/bmo/jake/`, so 하스 installs with a single command
   that needs nothing downloaded by hand first. On Linux/WSL it is `curl -fsSL

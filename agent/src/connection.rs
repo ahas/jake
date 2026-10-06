@@ -66,13 +66,20 @@ impl Agent {
   }
 
   async fn dial(&self) -> Result<Socket, DialError> {
-    let mut request = self.config.hub_url.as_str().into_client_request().map_err(|error| DialError::Failed(error.to_string()))?;
+    let mut request = self
+      .config
+      .hub_url
+      .as_str()
+      .into_client_request()
+      .map_err(|error| DialError::Failed(error.to_string()))?;
     let credential = HeaderValue::from_str(&format!("Bearer {}", self.config.secret))
       .map_err(|_| DialError::Failed("the shared secret cannot be sent as a header".into()))?;
     request.headers_mut().insert(AUTHORIZATION, credential);
     // A frame carries at most one payload at the cap, grown by a third in base64, plus its envelope.
     let frame_limit = self.config.max_payload_bytes / 3 * 4 + 1024 * 1024;
-    let settings = WebSocketConfig::default().max_message_size(Some(frame_limit)).max_frame_size(Some(frame_limit));
+    let settings = WebSocketConfig::default()
+      .max_message_size(Some(frame_limit))
+      .max_frame_size(Some(frame_limit));
     let dialing = tokio_tungstenite::connect_async_with_config(request, Some(settings), true);
     match timeout(DIAL_TIMEOUT, dialing).await {
       Ok(Ok((socket, _))) => Ok(socket),
@@ -99,22 +106,23 @@ impl Agent {
           }
         }
         Err(DialError::Refused(status)) => {
-          self.log.warn("rejected", json!({ "status": status, "reason": "the hub refused the shared secret" }));
+          self
+            .log
+            .warn("rejected", json!({ "status": status, "reason": "the hub refused the shared secret" }));
         }
         Err(DialError::Failed(error)) => self.log.warn("dial-failed", json!({ "error": error })),
       }
       let delay = self.backoff(attempt);
       attempt = (attempt + 1).min(MAX_ATTEMPT);
-      self.log.info("redial-scheduled", json!({ "attempt": attempt, "delayMs": delay.as_millis() as u64 }));
+      self
+        .log
+        .info("redial-scheduled", json!({ "attempt": attempt, "delayMs": delay.as_millis() as u64 }));
       sleep(delay).await;
     }
   }
 
-  // Full jitter over an exponential window clamped to the cap, so retries neither fall into lockstep
-  // nor drift toward hours apart.
   fn backoff(&self, attempt: u32) -> Duration {
-    let window = self.config.redial_base.saturating_mul(2u32.saturating_pow(attempt)).min(self.config.redial_cap);
-    window.mul_f64(rand::random::<f64>())
+    backoff(self.config.redial_base, self.config.redial_cap, attempt, rand::random::<f64>())
   }
 
   /// Tell the hub this agent is uninstalled, so it is forgotten rather than counted as disconnected.
@@ -149,7 +157,11 @@ impl Agent {
 }
 
 // The one task that writes to the socket, so no handler ever waits on the writer it would block.
-fn writer(mut sink: SplitSink<Socket, Message>, mut frames: mpsc::Receiver<Frame>, close: oneshot::Receiver<()>) -> JoinHandle<()> {
+fn writer(
+  mut sink: SplitSink<Socket, Message>,
+  mut frames: mpsc::Receiver<Frame>,
+  close: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
   tokio::spawn(async move {
     tokio::pin!(close);
     loop {
@@ -210,7 +222,10 @@ impl<'a> Session<'a> {
 
   async fn run(mut self) -> Outcome {
     let log = self.agent.log.clone();
-    log.info("connecting", json!({ "agent": self.agent.config.agent_name, "capabilities": self.agent.capabilities() }));
+    log.info(
+      "connecting",
+      json!({ "agent": self.agent.config.agent_name, "capabilities": self.agent.capabilities() }),
+    );
     self.send(self.agent.hello()).await;
     let beat = self.agent.config.heartbeat;
     let mut heartbeat = interval_at(Instant::now() + beat, beat);
@@ -295,16 +310,20 @@ impl<'a> Session<'a> {
         env,
         distro,
       } => {
-        let env = env.into_iter().filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned()))).collect();
-        self.exec(ExecRequest {
-          id,
-          shell,
-          command,
-          cwd,
-          env,
-          distro,
-        })
-        .await;
+        let env = env
+          .into_iter()
+          .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
+          .collect();
+        self
+          .exec(ExecRequest {
+            id,
+            shell,
+            command,
+            cwd,
+            env,
+            distro,
+          })
+          .await;
       }
       // A cancel for a run that already ended reaches nothing.
       Frame::Cancel { id } => {
@@ -323,12 +342,23 @@ impl<'a> Session<'a> {
         self.transfers.discard(&id).await;
       }
       Frame::TransferBegin {
-        id, direction, path, ..
+        id,
+        direction,
+        path,
+        ..
       } => self.transfers.begin(id, direction, path).await,
       Frame::TransferChunk { id, seq, chunk } => self.transfers.chunk(&id, seq, &chunk).await,
-      Frame::TransferEnd { id, total, checksum } => self.transfers.end(&id, total, &checksum).await,
+      Frame::TransferEnd {
+        id,
+        total,
+        checksum,
+      } => self.transfers.end(&id, total, &checksum).await,
       // The agent's own kinds, arriving from the hub, are not the agent's to act on.
-      Frame::Hello { .. } | Frame::Stdout { .. } | Frame::Stderr { .. } | Frame::Exit { .. } | Frame::Pong { .. } => {}
+      Frame::Hello { .. }
+      | Frame::Stdout { .. }
+      | Frame::Stderr { .. }
+      | Frame::Exit { .. }
+      | Frame::Pong { .. } => {}
     }
     None
   }
@@ -337,7 +367,13 @@ impl<'a> Session<'a> {
     let id = request.id.clone();
     if !Platform::HOST.shells().contains(&request.shell.as_str()) {
       let message = format!("this agent runs no {} shell", request.shell);
-      return self.send(Frame::Error { id, code: "unsupported".into(), message }).await;
+      return self
+        .send(Frame::Error {
+          id,
+          code: "unsupported".into(),
+          message,
+        })
+        .await;
     }
     let limits = Limits {
       max_output_bytes: self.agent.config.exec_max_output_bytes,
@@ -348,7 +384,15 @@ impl<'a> Session<'a> {
         self.runs.retain(|_, run| !run.finished());
         self.runs.insert(id, run);
       }
-      Err(message) => self.send(Frame::Error { id, code: "spawn-failed".into(), message }).await,
+      Err(message) => {
+        self
+          .send(Frame::Error {
+            id,
+            code: "spawn-failed".into(),
+            message,
+          })
+          .await
+      }
     }
   }
 }
@@ -362,6 +406,29 @@ impl Drop for Session<'_> {
   }
 }
 
+// Full jitter over an exponential window clamped to the cap, so retries neither fall into lockstep
+// nor drift toward hours apart; `draw` is the jitter, from zero up to one.
+fn backoff(base: Duration, cap: Duration, attempt: u32, draw: f64) -> Duration {
+  base.saturating_mul(2u32.saturating_pow(attempt)).min(cap).mul_f64(draw)
+}
+
 fn epoch_ms() -> u64 {
-  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |since| since.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn the_redial_window_doubles_per_attempt_and_settles_at_the_cap() {
+    let (base, cap) = (Duration::from_secs(1), Duration::from_secs(60));
+    assert_eq!(backoff(base, cap, 0, 1.0), Duration::from_secs(1));
+    assert_eq!(backoff(base, cap, 3, 1.0), Duration::from_secs(8));
+    assert_eq!(backoff(base, cap, 30, 1.0), cap);
+    assert_eq!(backoff(base, cap, 30, 0.5), Duration::from_secs(30));
+    assert_eq!(backoff(base, cap, 2, 0.0), Duration::ZERO);
+  }
 }

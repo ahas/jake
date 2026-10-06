@@ -1,0 +1,458 @@
+// The Windows self-healing pair: the autostart anchors, the single-instance lock and the watchdog.
+
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, interval_at};
+
+use crate::exec::encode_powershell_script;
+use crate::log::Log;
+use crate::platform::{Platform, Role, startup_dir};
+
+// The pair is two processes of one executable: the agent runs it with no argument, the guard with the
+// guard-mode flag. Each watches the other by heartbeat, and either alone brings the other back.
+pub const JAKE_BINARY: &str = "jake.exe";
+pub const GUARD_MODE_FLAG: &str = "--guard";
+
+// One name serves as the registry value name, the scheduled-task name and the Startup shortcut's base
+// name, so an anchor of any kind is found, rewritten and removed by the same key.
+pub const AGENT_ANCHOR_NAME: &str = "JakeAgent";
+pub const GUARD_ANCHOR_NAME: &str = "JakeGuard";
+
+// The per-user Run key: HKCU needs no elevation, and explorer launches its values at this user's logon.
+const RUN_KEY: &str = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+/// One run mode to anchor: the name it is registered under, the executable and its arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnchorTarget {
+  pub name: &'static str,
+  pub binary_path: String,
+  pub args: Vec<String>,
+}
+
+/// The two anchor targets of an install in one directory: the agent and guard run modes of one exe.
+pub fn install_targets(dir: &str) -> [AnchorTarget; 2] {
+  let binary_path = Platform::Windows.join(dir, &[JAKE_BINARY]);
+  [
+    AnchorTarget {
+      name: AGENT_ANCHOR_NAME,
+      binary_path: binary_path.clone(),
+      args: Vec::new(),
+    },
+    AnchorTarget {
+      name: GUARD_ANCHOR_NAME,
+      binary_path,
+      args: vec![GUARD_MODE_FLAG.to_owned()],
+    },
+  ]
+}
+
+/// The anchor name a role is registered and relaunched under.
+pub fn anchor_name(role: Role) -> &'static str {
+  match role {
+    Role::Agent => AGENT_ANCHOR_NAME,
+    Role::Guard => GUARD_ANCHOR_NAME,
+  }
+}
+
+// The quoted executable path followed by the run mode's arguments, so a path with spaces is one word.
+fn invocation(target: &AnchorTarget) -> String {
+  let quoted = format!("\"{}\"", target.binary_path);
+  if target.args.is_empty() {
+    quoted
+  } else {
+    format!("{quoted} {}", target.args.join(" "))
+  }
+}
+
+/// A string as a PowerShell single-quoted literal, any single quote inside it doubled.
+pub fn ps_single_quote(value: &str) -> String {
+  format!("'{}'", value.replace('\'', "''"))
+}
+
+/// PowerShell run unattended — no profile, no prompt, the policy bypassed — with the script encoded.
+pub fn powershell_command(script: &str) -> Vec<String> {
+  [
+    "powershell.exe",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+  ]
+  .into_iter()
+  .map(str::to_owned)
+  .chain([encode_powershell_script(script)])
+  .collect()
+}
+
+fn owned(parts: &[&str]) -> Vec<String> {
+  parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+/// Add, or overwrite in place, the per-user Run value that launches this run mode at logon.
+pub fn run_key_add_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&[
+    "reg",
+    "add",
+    RUN_KEY,
+    "/v",
+    target.name,
+    "/t",
+    "REG_SZ",
+    "/d",
+    &invocation(target),
+    "/f",
+  ])
+}
+
+pub fn run_key_remove_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&["reg", "delete", RUN_KEY, "/v", target.name, "/f"])
+}
+
+/// Create, or overwrite in place, the logon-triggered task for this run mode. It stores no credential
+/// and runs non-elevated; a boot trigger or a task that runs logged off would need an administrator.
+pub fn task_create_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&[
+    "schtasks",
+    "/create",
+    "/tn",
+    target.name,
+    "/tr",
+    &invocation(target),
+    "/sc",
+    "onlogon",
+    "/rl",
+    "limited",
+    "/f",
+  ])
+}
+
+pub fn task_remove_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&["schtasks", "/delete", "/tn", target.name, "/f"])
+}
+
+/// Run a registered task now. Task Scheduler starts it on the caller's behalf, so what it starts is
+/// not the caller's child and shares no teardown boundary with it.
+pub fn task_run_command(name: &str) -> Vec<String> {
+  owned(&["schtasks", "/run", "/tn", name])
+}
+
+/// This run mode's shortcut in the per-user Startup folder.
+pub fn startup_shortcut_path(target: &AnchorTarget, env: &HashMap<String, String>) -> String {
+  Platform::Windows.join(&startup_dir(env), &[&format!("{}.lnk", target.name)])
+}
+
+/// Create, or overwrite, the Startup shortcut. A `.lnk` is not plain bytes, so it is built through the
+/// WScript.Shell COM object, every path crossing as a single-quoted literal.
+pub fn startup_shortcut_create_command(
+  target: &AnchorTarget,
+  env: &HashMap<String, String>,
+) -> Vec<String> {
+  let directory = target.binary_path.rsplit_once('\\').map_or("", |(directory, _)| directory);
+  let mut lines = vec![
+    format!(
+      "$s = (New-Object -ComObject WScript.Shell).CreateShortcut({})",
+      ps_single_quote(&startup_shortcut_path(target, env))
+    ),
+    format!("$s.TargetPath = {}", ps_single_quote(&target.binary_path)),
+    format!("$s.WorkingDirectory = {}", ps_single_quote(directory)),
+  ];
+  if !target.args.is_empty() {
+    lines.push(format!("$s.Arguments = {}", ps_single_quote(&target.args.join(" "))));
+  }
+  lines.push("$s.Save()".to_owned());
+  powershell_command(&lines.join("\n"))
+}
+
+/// Remove the Startup shortcut; one that is already gone is not an error.
+pub fn startup_shortcut_remove_command(
+  target: &AnchorTarget,
+  env: &HashMap<String, String>,
+) -> Vec<String> {
+  let lnk = ps_single_quote(&startup_shortcut_path(target, env));
+  powershell_command(&format!("Remove-Item -LiteralPath {lnk} -Force -ErrorAction SilentlyContinue"))
+}
+
+/// Every command that registers all three anchors of one run mode, in the order a rewrite runs them.
+pub fn anchor_register_commands(target: &AnchorTarget, env: &HashMap<String, String>) -> [Vec<String>; 3] {
+  [
+    run_key_add_command(target),
+    task_create_command(target),
+    startup_shortcut_create_command(target, env),
+  ]
+}
+
+/// Every command that removes all three anchors of one run mode.
+pub fn anchor_remove_commands(target: &AnchorTarget, env: &HashMap<String, String>) -> [Vec<String>; 3] {
+  [
+    run_key_remove_command(target),
+    task_remove_command(target),
+    startup_shortcut_remove_command(target, env),
+  ]
+}
+
+// --- The single-instance lock ----------------------------------------------------------------------
+
+/// Try to become the one running copy of a run mode. The lock is a file created exclusively — the OS
+/// lets exactly one create win — holding the holder's id; a lock whose holder is gone is reclaimed
+/// once, so two copies racing over a stale lock cannot loop.
+pub fn acquire_lock(path: &Path, pid: u32, alive: impl Fn(u32) -> bool) -> bool {
+  if create_exclusive(path, pid) {
+    return true;
+  }
+  let holder = fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<u32>().ok());
+  if holder.is_some_and(alive) {
+    return false;
+  }
+  let _ = fs::remove_file(path);
+  create_exclusive(path, pid)
+}
+
+fn create_exclusive(path: &Path, pid: u32) -> bool {
+  if let Some(parent) = path.parent() {
+    let _ = fs::create_dir_all(parent);
+  }
+  match OpenOptions::new().write(true).create_new(true).open(path) {
+    Ok(mut file) => file.write_all(pid.to_string().as_bytes()).is_ok(),
+    Err(_) => false,
+  }
+}
+
+/// Give the lock up on a clean exit; a crash leaves it for the next copy's liveness check.
+pub fn release_lock(path: &Path) {
+  let _ = fs::remove_file(path);
+}
+
+/// The process id a lock or heartbeat file holds, if it holds one.
+pub fn read_number(path: &Path) -> Option<u64> {
+  fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok())
+}
+
+/// Whether a process id is running. When unsure it answers yes, so a lock is never stolen from a
+/// holder that may still be alive.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+  let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+  // SAFETY: signal 0 only asks whether the process exists; nothing is delivered.
+  if unsafe { libc::kill(pid, 0) } == 0 {
+    return true;
+  }
+  std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+  use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE};
+  use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+  };
+  // SAFETY: the handle is checked before use and closed once read.
+  unsafe {
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if handle.is_null() {
+      return GetLastError() != ERROR_INVALID_PARAMETER;
+    }
+    let mut code = 0u32;
+    let read = GetExitCodeProcess(handle, &mut code);
+    CloseHandle(handle);
+    read == 0 || code == STILL_ACTIVE as u32
+  }
+}
+
+// --- The watchdog ----------------------------------------------------------------------------------
+
+/// Start a helper command and leave it to run; anchor rewrites and relaunches are quick, their output
+/// is not needed, and a tick never stalls the connection the agent holds.
+fn launch(argv: &[String]) {
+  if let Some(mut command) = crate::command::quiet(argv) {
+    let _ = command.spawn();
+  }
+}
+
+fn epoch_ms() -> u64 {
+  SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Whether a peer last seen at `seen` reads as dead at `now`: a missing heartbeat does, and so does
+/// one older than `stale`, so a hung peer that never exited is brought back like a crashed one.
+pub fn peer_stale(now: u64, seen: Option<u64>, stale: Duration) -> bool {
+  seen.is_none_or(|seen| now.saturating_sub(seen) > stale.as_millis() as u64)
+}
+
+/// What one process's watchdog over its peer works with.
+pub struct Watchdog {
+  pub role: Role,
+  pub install_dir: String,
+  pub env: HashMap<String, String>,
+  pub tick: Duration,
+  pub stale: Duration,
+  pub log: Log,
+}
+
+impl Watchdog {
+  /// Tick at once — so the first heartbeat and the anchors are in place immediately — then on every
+  /// tick: refresh this process's heartbeat, rewrite every anchor, and relaunch the peer's task when
+  /// its heartbeat is missing or stale. A redundant relaunch is harmless, as the peer's lock drops it.
+  pub fn start(self) -> JoinHandle<()> {
+    tokio::spawn(async move {
+      let mut ticks = interval_at(Instant::now(), self.tick);
+      loop {
+        ticks.tick().await;
+        self.run_tick();
+      }
+    })
+  }
+
+  fn run_tick(&self) {
+    let windows = Platform::Windows;
+    let now = epoch_ms();
+    let own = windows.heartbeat_path(&self.env, self.role);
+    if let Some(parent) = Path::new(&own).parent() {
+      let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&own, now.to_string());
+    for target in install_targets(&self.install_dir) {
+      for command in anchor_register_commands(&target, &self.env) {
+        launch(&command);
+      }
+    }
+
+    let peer = self.role.peer();
+    let seen = read_number(Path::new(&windows.heartbeat_path(&self.env, peer)));
+    if peer_stale(now, seen, self.stale) {
+      let age = seen.map(|seen| now.saturating_sub(seen));
+      self
+        .log
+        .warn("peer-stale", json!({ "peer": anchor_name(peer), "lastSeenMs": seen, "ageMs": age }));
+      launch(&task_run_command(anchor_name(peer)));
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn env() -> HashMap<String, String> {
+    HashMap::from([("APPDATA".to_owned(), "C:\\Users\\h\\AppData\\Roaming".to_owned())])
+  }
+
+  fn decode(encoded: &str) -> String {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let units: Vec<u16> = bytes.chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    String::from_utf16(&units).unwrap()
+  }
+
+  #[test]
+  fn both_run_modes_are_one_executable_told_apart_by_the_guard_flag() {
+    let [agent, guard] = install_targets("C:\\Program Files\\jake\\");
+    assert_eq!(agent.binary_path, "C:\\Program Files\\jake\\jake.exe");
+    assert_eq!((agent.name, agent.args.len()), ("JakeAgent", 0));
+    assert_eq!((guard.name, guard.args.as_slice()), ("JakeGuard", ["--guard".to_owned()].as_slice()));
+  }
+
+  #[test]
+  fn the_run_value_and_the_task_launch_the_quoted_path_with_the_run_modes_argument() {
+    let [agent, guard] = install_targets("C:\\Program Files\\jake");
+    assert_eq!(
+      run_key_add_command(&guard),
+      [
+        "reg",
+        "add",
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "/v",
+        "JakeGuard",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "\"C:\\Program Files\\jake\\jake.exe\" --guard",
+        "/f"
+      ]
+    );
+    assert_eq!(
+      task_create_command(&agent),
+      [
+        "schtasks",
+        "/create",
+        "/tn",
+        "JakeAgent",
+        "/tr",
+        "\"C:\\Program Files\\jake\\jake.exe\"",
+        "/sc",
+        "onlogon",
+        "/rl",
+        "limited",
+        "/f"
+      ]
+    );
+    assert_eq!(task_run_command("JakeGuard"), ["schtasks", "/run", "/tn", "JakeGuard"]);
+    assert_eq!(run_key_remove_command(&agent)[..2], ["reg", "delete"]);
+    assert_eq!(task_remove_command(&guard), ["schtasks", "/delete", "/tn", "JakeGuard", "/f"]);
+  }
+
+  #[test]
+  fn the_shortcut_is_built_through_wscript_with_every_path_single_quoted() {
+    let [_, guard] = install_targets("C:\\it's here");
+    let command = startup_shortcut_create_command(&guard, &env());
+    assert_eq!(
+      command[..6],
+      [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand"
+      ]
+    );
+    let script = decode(&command[6]);
+    let lnk =
+      "C:\\Users\\h\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\JakeGuard.lnk";
+    assert!(script.contains(&format!("CreateShortcut('{lnk}')")));
+    assert!(script.contains("$s.TargetPath = 'C:\\it''s here\\jake.exe'"));
+    assert!(script.contains("$s.WorkingDirectory = 'C:\\it''s here'"));
+    assert!(script.contains("$s.Arguments = '--guard'"));
+    assert!(script.ends_with("$s.Save()"));
+    let removal = decode(&startup_shortcut_remove_command(&guard, &env())[6]);
+    assert_eq!(
+      removal,
+      format!("Remove-Item -LiteralPath '{lnk}' -Force -ErrorAction SilentlyContinue")
+    );
+  }
+
+  #[test]
+  fn one_copy_takes_the_lock_and_a_dead_holders_lock_is_reclaimed() {
+    let dir = std::env::temp_dir().join(format!("jake-lock-{}", std::process::id()));
+    let path = dir.join("agent.lock");
+    assert!(acquire_lock(&path, 10, |_| true));
+    assert!(!acquire_lock(&path, 11, |pid| pid == 10));
+    assert_eq!(read_number(&path), Some(10));
+    assert!(acquire_lock(&path, 12, |_| false));
+    assert_eq!(read_number(&path), Some(12));
+    release_lock(&path);
+    assert!(!path.exists());
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn a_peer_is_dead_once_its_heartbeat_is_missing_or_older_than_the_threshold() {
+    let stale = Duration::from_secs(180);
+    assert!(peer_stale(1_000_000, None, stale));
+    assert!(!peer_stale(1_000_000, Some(1_000_000 - 180_000), stale));
+    assert!(peer_stale(1_000_000, Some(1_000_000 - 180_001), stale));
+    // A heartbeat written after this tick read the clock is fresh, not an overflow.
+    assert!(!peer_stale(1_000_000, Some(1_000_500), stale));
+  }
+
+  #[test]
+  fn this_process_reads_as_alive() {
+    assert!(pid_alive(std::process::id()));
+  }
+}

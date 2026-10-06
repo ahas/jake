@@ -149,7 +149,10 @@ mod tests {
       Platform::Windows.heartbeat_path(&windows, Role::Guard),
       "C:\\Users\\h\\AppData\\Local\\jake\\guard.heartbeat"
     );
-    assert_eq!(Platform::Linux.lock_path(&env(&[("HOME", "/home/h")]), Role::Agent), "/home/h/.local/share/jake/agent.lock");
+    assert_eq!(
+      Platform::Linux.lock_path(&env(&[("HOME", "/home/h")]), Role::Agent),
+      "/home/h/.local/share/jake/agent.lock"
+    );
   }
 
   #[test]
@@ -162,8 +165,14 @@ mod tests {
       startup_dir(&env(&[("USERPROFILE", "C:\\Users\\h")])),
       "C:\\Users\\h\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
     );
-    assert_eq!(systemd_unit_path(&env(&[("HOME", "/home/h")])), "/home/h/.config/systemd/user/jake-agent.service");
-    assert_eq!(systemd_unit_path(&env(&[("XDG_CONFIG_HOME", "/x")])), "/x/systemd/user/jake-agent.service");
+    assert_eq!(
+      systemd_unit_path(&env(&[("HOME", "/home/h")])),
+      "/home/h/.config/systemd/user/jake-agent.service"
+    );
+    assert_eq!(
+      systemd_unit_path(&env(&[("XDG_CONFIG_HOME", "/x")])),
+      "/x/systemd/user/jake-agent.service"
+    );
   }
 
   #[test]

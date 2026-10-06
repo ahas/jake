@@ -1,4 +1,4 @@
-// The config each side reads from its environment file at startup.
+// The console's config, read from the hub's own environment file.
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,60 +7,14 @@ import { join } from "node:path";
 /** A source of configuration values. process.env satisfies it; tests pass a plain object. */
 export type Env = Record<string, string | undefined>;
 
-/** What the Windows-side agent needs to dial the hub and keep itself alive. */
-export interface AgentConfig {
-  /** The hub URL the agent dials out to (wss:// through the public name, ws:// on the LAN). */
-  hubUrl: string;
-  /** The shared secret sent as a Bearer credential at the WebSocket upgrade. */
-  secret: string;
-  /** This agent's identity. The hub expects exactly one; a duplicate supersedes the first. */
-  agentName: string;
-  /** How often the agent sends a ping and refreshes its liveness, in milliseconds. */
-  heartbeatMs: number;
-  /** How often the self-healing pair rewrites its autostart anchors, in milliseconds. */
-  tickMs: number;
-  /** How old a peer's heartbeat may grow before the watchdog treats it as dead, in milliseconds. */
-  watchdogStaleMs: number;
-  /** The largest single frame payload the agent will encode or accept, in bytes. */
-  maxPayloadBytes: number;
-  /** The most output one exec command may stream before jake stops it, in bytes. */
-  execMaxOutputBytes: number;
-  /** The wall-clock ceiling on a single exec command before jake stops it, in milliseconds. */
-  execTimeoutMs: number;
-  /** The first redial delay's ceiling, doubled per failed attempt up to `redialCapMs`. */
-  redialBaseMs: number;
-  /** The ceiling the redial delay never exceeds, however long the outage. */
-  redialCapMs: number;
-}
-
-// Defaults for the non-credential knobs. Credentials and the hub URL have no default: a process
-// that cannot find them must stop, not run against a guessed value.
-const DEFAULT_HEARTBEAT_MS = 15_000;
-const DEFAULT_TICK_MS = 60_000;
-// Three ticks at the default tick: a peer is declared dead only after it has missed three
-// consecutive heartbeat writes, so one slow or paused tick does not trigger a false relaunch, while
-// a genuine death or hang is caught within about three minutes.
-const DEFAULT_WATCHDOG_STALE_MS = 180_000;
-const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
-const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
-const DEFAULT_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
-const DEFAULT_REDIAL_BASE_MS = 1_000;
-const DEFAULT_REDIAL_CAP_MS = 60_000;
+// The control API's port when the hub's file does not name one. The token has no default: a console
+// that cannot find it must stop, not call the hub with a guessed value.
 const DEFAULT_CONTROL_PORT = 8791;
 
 function requireEnv(env: Env, name: string): string {
   const value = env[name];
   if (value === undefined || value === "") {
     throw new Error(`${name} is not set. Copy the matching .env.example and fill it in.`);
-  }
-  return value;
-}
-
-function requireIntEnv(env: Env, name: string): number {
-  const raw = requireEnv(env, name);
-  const value = Number.parseInt(raw, 10);
-  if (Number.isNaN(value)) {
-    throw new Error(`${name} must be an integer.`);
   }
   return value;
 }
@@ -83,23 +37,6 @@ function optionalPositiveIntEnv(env: Env, name: string, fallback: number): numbe
     throw new Error(`${name} must be a positive integer.`);
   }
   return value;
-}
-
-/** Read the agent's configuration from an environment source. */
-export function loadAgentConfig(env: Env = process.env): AgentConfig {
-  return {
-    hubUrl: requireEnv(env, "JAKE_HUB_URL"),
-    secret: requireEnv(env, "JAKE_SECRET"),
-    agentName: requireEnv(env, "JAKE_AGENT_NAME"),
-    heartbeatMs: optionalPositiveIntEnv(env, "JAKE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS),
-    tickMs: optionalPositiveIntEnv(env, "JAKE_TICK_MS", DEFAULT_TICK_MS),
-    watchdogStaleMs: optionalPositiveIntEnv(env, "JAKE_WATCHDOG_STALE_MS", DEFAULT_WATCHDOG_STALE_MS),
-    maxPayloadBytes: optionalPositiveIntEnv(env, "JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES),
-    execMaxOutputBytes: optionalPositiveIntEnv(env, "JAKE_EXEC_MAX_OUTPUT_BYTES", DEFAULT_EXEC_MAX_OUTPUT_BYTES),
-    execTimeoutMs: optionalPositiveIntEnv(env, "JAKE_EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS),
-    redialBaseMs: optionalPositiveIntEnv(env, "JAKE_REDIAL_BASE_MS", DEFAULT_REDIAL_BASE_MS),
-    redialCapMs: optionalPositiveIntEnv(env, "JAKE_REDIAL_CAP_MS", DEFAULT_REDIAL_CAP_MS),
-  };
 }
 
 /** What the operator console needs to reach the hub's loopback control API. */
@@ -157,22 +94,6 @@ export function loadEnvFile(path: string): Record<string, string> {
   return parseEnvFile(readFileSync(path, "utf8"));
 }
 
-/**
- * The environment the agent and guard binaries run against. The installer writes the real
- * configuration to `agent.env` beside the executable — the anchors launch the exe with no
- * environment of their own — so both binaries read that file at startup. Its values sit under the
- * real process environment, so a variable set explicitly in the environment still overrides the
- * file. When no file is beside the exe — a plain `bun` run in development — the process environment
- * stands alone.
- */
-export function agentFileEnv(exeDir: string, env: Env = process.env): Env {
-  const path = join(exeDir, "agent.env");
-  if (existsSync(path)) {
-    return { ...loadEnvFile(path), ...env };
-  }
-  return env;
-}
-
 /** Where the hub keeps its configuration when nothing overrides it — a single file under the data
  * directory, outside the git tree, the same place the console reads it from. */
 export function hubEnvPath(env: Env = process.env): string {
@@ -185,8 +106,7 @@ export function hubEnvPath(env: Env = process.env): string {
  * lives. Its values sit under the real process environment, so a variable set explicitly still
  * overrides the file, and JAKE_HUB_ENV points the resolution at another file for a local test. When
  * neither the override nor the default file exists — a plain `bun` run with the environment already
- * populated — the process environment stands alone. This mirrors how the agent reads its own file
- * beside its executable; each side owns the file it reads.
+ * populated — the process environment stands alone.
  */
 export function hubFileEnv(env: Env = process.env): Env {
   const path = hubEnvPath(env);

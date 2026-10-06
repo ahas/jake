@@ -526,11 +526,12 @@ function formatDuration(ms: number): string {
 }
 
 export function formatStatus(snapshot: StatusSnapshot, now: number): string {
-  if (snapshot.agents.length === 0) {
-    return `detached — no agent connected (hub ${snapshot.run})\n`;
-  }
   const count = snapshot.agents.length;
-  const lines = [`attached — ${count} agent${count === 1 ? "" : "s"} (hub ${snapshot.run})`];
+  const lines = [
+    count === 0
+      ? `detached — no agent connected (hub ${snapshot.run})`
+      : `attached — ${count} agent${count === 1 ? "" : "s"} (hub ${snapshot.run})`,
+  ];
   for (const agent of snapshot.agents) {
     lines.push(
       `${agent.name} v${agent.agentVersion}`,
@@ -538,6 +539,9 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
       `  capabilities: ${agent.capabilities.length > 0 ? agent.capabilities.join(", ") : "(none)"}`,
       `  in-flight commands: ${agent.inFlight.length > 0 ? agent.inFlight.join(", ") : "(none)"}`,
     );
+  }
+  for (const agent of snapshot.departed) {
+    lines.push(`${agent.name} departed ${formatDuration(now - agent.departedAt)} ago`);
   }
   return `${lines.join("\n")}\n`;
 }

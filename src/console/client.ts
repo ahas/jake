@@ -14,12 +14,19 @@ export interface AgentStatus {
   inFlight: string[];
 }
 
-/** The hub's status: its run tag, whether any agent is attached, and every attached agent by name. */
+/** An agent that was uninstalled, and when the hub recorded it as gone. */
+export interface DepartedAgent {
+  name: string;
+  departedAt: number;
+}
+
+/** The hub's status: its run tag, whether any agent is attached, every attached and every departed agent by name. */
 export interface StatusSnapshot {
   /** Identifies the hub process, so a console can tell its traffic cursor is still valid. */
   run: string;
   attached: boolean;
   agents: AgentStatus[];
+  departed: DepartedAgent[];
 }
 
 /** One frame that crossed the tunnel, reduced to its shape, as the hub's traffic feed carries it. */

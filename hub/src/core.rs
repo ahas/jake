@@ -1,6 +1,7 @@
 // The hub's core: every attached agent, the commands and transfers on each, and the traffic log.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
 
+use crate::departed::Departed;
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
   Checksum, Direction, EncodedBytes, Frame, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
@@ -35,6 +37,8 @@ pub struct HubOptions {
   pub ping_interval: Duration,
   pub missed_pong_limit: u32,
   pub socket_backlog_bytes: usize,
+  /// Where the departed agents are recorded; none keeps the record in memory alone.
+  pub departed_path: Option<PathBuf>,
 }
 
 /// One event in a command's or a transfer's life, as its control caller receives it.
@@ -167,6 +171,7 @@ struct State {
   traffic_seq: u64,
   traffic_tx: broadcast::Sender<Arc<TrafficEntry>>,
   id_seq: u64,
+  departed: Departed,
 }
 
 pub struct Hub {
@@ -258,6 +263,9 @@ impl State {
     summary: Value,
   ) {
     self.record(Some(&name), "in", "hello", summary);
+    if self.departed.forget(&name) {
+      eprintln!("jake hub: agent {name} said hello again and is no longer departed");
+    }
 
     // A socket that already holds another name gives that name up; the socket itself carries on.
     if let Some(previous) = self.by_socket.get(&link.socket_id).cloned()
@@ -313,6 +321,13 @@ impl State {
     }
   }
 
+  // An agent that has left is dropped and recorded, so it reads as gone rather than disconnected.
+  fn depart(&mut self, name: &str, how: &str) {
+    self.detach(name, how, true);
+    self.departed.record(name, now_ms());
+    eprintln!("jake hub: agent {name} departed: {how}");
+  }
+
   fn fail_transfer(&mut self, name: &str, id: &str, code: &str, message: &str) {
     if let Some(transfer) = self.agents.get_mut(name).and_then(|agent| agent.transfers.remove(id)) {
       transfer.listener.push("error", json!({ "code": code, "message": message }));
@@ -325,6 +340,8 @@ impl State {
     };
     match frame {
       Frame::Pong { .. } => agent.last_pong_at = now_ms(),
+      // An agent's own leave is its uninstaller saying it has been removed by hand.
+      Frame::Leave => self.depart(name, "uninstalled on the machine"),
       Frame::Ping { ts } => {
         self.send(name, &Frame::Pong { ts });
       }
@@ -456,6 +473,7 @@ impl Hub {
       traffic_seq: 0,
       traffic_tx,
       id_seq: 0,
+      departed: Departed::load(options.departed_path.clone()),
     };
     Arc::new(Self {
       options,
@@ -843,15 +861,17 @@ impl Hub {
     Ok(events)
   }
 
-  /// Tell the target agent to erase itself and depart; the name of the agent told.
+  /// Tell the target agent to erase itself and depart; the name of the agent told. The leave is
+  /// queued ahead of the socket's close, so the agent reads it before the connection ends.
   pub fn leave(&self, target: Option<&str>) -> Result<String, String> {
     let mut state = self.lock();
     let name = state.find_target(target).map_err(|refusal| refusal.reason)?;
     state.send(&name, &Frame::Leave);
+    state.depart(&name, "told to leave by the hub");
     Ok(name)
   }
 
-  /// Every attached agent, ordered by name, and this process's run tag.
+  /// Every attached agent, ordered by name, every departed one, and this process's run tag.
   pub fn status(&self) -> Value {
     let state = self.lock();
     let mut agents: Vec<(&String, &Agent)> = state.agents.iter().collect();
@@ -869,7 +889,7 @@ impl Hub {
         })
       })
       .collect();
-    json!({ "run": self.run, "attached": !agents.is_empty(), "agents": agents })
+    json!({ "run": self.run, "attached": !agents.is_empty(), "agents": agents, "departed": state.departed.list() })
   }
 
   /// The traffic recorded after `after_id`, and the live feed from the very next entry on.
@@ -914,6 +934,7 @@ mod tests {
       ping_interval: Duration::from_secs(3600),
       missed_pong_limit: 3,
       socket_backlog_bytes,
+      departed_path: None,
     })
   }
 

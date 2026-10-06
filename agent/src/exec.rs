@@ -23,8 +23,7 @@ const READ_BYTES: usize = 64 * 1024;
 
 // Forces PowerShell's console output to UTF-8, so a non-ASCII character does not cross the tunnel in
 // the machine's OEM code page.
-const POWERSHELL_UTF8_PRELUDE: &str =
-  "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8";
+const POWERSHELL_UTF8_PRELUDE: &str = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8";
 
 /// A command to run, as the exec frame carried it.
 #[derive(Clone, Debug)]
@@ -88,8 +87,12 @@ pub fn wsl_invocation(request: &ExecRequest) -> Invocation {
   args.push(request.command.clone());
 
   let mut env = request.env.clone();
-  let shared: Vec<String> =
-    request.env.iter().filter(|(key, _)| key != "WSLENV").map(|(key, _)| format!("{key}/u")).collect();
+  let shared: Vec<String> = request
+    .env
+    .iter()
+    .filter(|(key, _)| key != "WSLENV")
+    .map(|(key, _)| format!("{key}/u"))
+    .collect();
   if !shared.is_empty() {
     let declared = shared.join(":");
     let given = request.env.iter().find(|(key, _)| key == "WSLENV").map(|(_, value)| value.as_str());
@@ -172,7 +175,12 @@ impl RunHandle {
 
 /// Start a command, its output streamed by a task of its own through `out` for as long as the
 /// connection holds; a command that cannot start is answered with the reason.
-pub fn start(request: ExecRequest, limits: Limits, out: mpsc::Sender<Frame>, log: Log) -> Result<RunHandle, String> {
+pub fn start(
+  request: ExecRequest,
+  limits: Limits,
+  out: mpsc::Sender<Frame>,
+  log: Log,
+) -> Result<RunHandle, String> {
   let invocation = invocation(Platform::HOST, &request);
   let child = spawn(&invocation).map_err(|error| format!("{}: {error}", invocation.file))?;
   let pid = child.id();
@@ -449,7 +457,15 @@ mod tests {
     assert_eq!(built.file, "powershell.exe");
     assert_eq!(
       built.args[..7],
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-EncodedCommand"]
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-OutputFormat",
+        "Text",
+        "-EncodedCommand"
+      ]
     );
     assert_eq!(decode_script(&built.args[7]), format!("{POWERSHELL_UTF8_PRELUDE}\n{}", asked.command));
     assert_eq!((built.cwd, built.env), (asked.cwd, asked.env));
@@ -468,7 +484,10 @@ mod tests {
     let built = invocation(Platform::Windows, &asked);
     assert_eq!(built.args[..4], ["--distribution", "Ubuntu", "--cd", "/srv"]);
     assert_eq!(built.cwd, None);
-    assert_eq!(built.env, [("A".to_owned(), "1".to_owned()), ("WSLENV".to_owned(), "A/u:PATH/l".to_owned())]);
+    assert_eq!(
+      built.env,
+      [("A".to_owned(), "1".to_owned()), ("WSLENV".to_owned(), "A/u:PATH/l".to_owned())]
+    );
   }
 
   #[test]
@@ -477,7 +496,10 @@ mod tests {
     asked.cwd = Some("/srv".into());
     asked.distro = Some("ignored".into());
     let built = invocation(Platform::Linux, &asked);
-    assert_eq!((built.file.as_str(), built.args.as_slice()), ("bash", ["-lc".to_owned(), "make".to_owned()].as_slice()));
+    assert_eq!(
+      (built.file.as_str(), built.args.as_slice()),
+      ("bash", ["-lc".to_owned(), "make".to_owned()].as_slice())
+    );
     assert_eq!(built.cwd.as_deref(), Some("/srv"));
   }
 

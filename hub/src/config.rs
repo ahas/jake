@@ -22,6 +22,7 @@ pub struct HubConfig {
   pub ping_interval: Duration,
   pub missed_pong_limit: u32,
   pub socket_backlog_bytes: usize,
+  pub departed_path: PathBuf,
 }
 
 /// Where the hub's file is: `JAKE_HUB_ENV` when set, else `hub.env` under the data directory.
@@ -31,6 +32,11 @@ fn env_path(process: &HashMap<String, String>) -> PathBuf {
   }
   let home = process.get("HOME").cloned().unwrap_or_default();
   PathBuf::from(home).join(".local/share/jake/hub.env")
+}
+
+/// The record of departed agents, beside the hub's file in the data directory.
+fn departed_path(process: &HashMap<String, String>) -> PathBuf {
+  env_path(process).with_file_name("departed.json")
 }
 
 /// The environment the hub runs against: its file's values, under the process's own.
@@ -95,10 +101,12 @@ impl Source {
 
 /// Read the hub's configuration, naming the first key that is missing or malformed.
 pub fn load() -> Result<HubConfig, String> {
-  read(&Source(merged(std::env::vars().collect())?))
+  let process: HashMap<String, String> = std::env::vars().collect();
+  let departed = departed_path(&process);
+  read(&Source(merged(process)?), departed)
 }
 
-fn read(env: &Source) -> Result<HubConfig, String> {
+fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
   Ok(HubConfig {
     host: env.present("JAKE_HUB_HOST").unwrap_or(DEFAULT_HUB_HOST).to_owned(),
     port: env.port("JAKE_HUB_PORT", DEFAULT_HUB_PORT)?,
@@ -114,6 +122,7 @@ fn read(env: &Source) -> Result<HubConfig, String> {
     )
     .map_err(|_| "JAKE_HUB_MISSED_PONG_LIMIT is too large.".to_owned())?,
     socket_backlog_bytes: env.count("JAKE_HUB_SOCKET_BACKLOG_BYTES", DEFAULT_SOCKET_BACKLOG_BYTES)?,
+    departed_path,
   })
 }
 
@@ -128,12 +137,12 @@ mod tests {
   const REQUIRED: [(&str, &str); 2] = [("JAKE_SECRET", "s3cr3t"), ("JAKE_CONTROL_TOKEN", "c0nsole")];
 
   fn error_of(pairs: &[(&str, &str)]) -> String {
-    read(&source(pairs)).err().expect("refused")
+    read(&source(pairs), PathBuf::new()).err().expect("refused")
   }
 
   #[test]
   fn reads_the_required_keys_and_applies_defaults() {
-    let config = read(&source(&REQUIRED)).expect("loads");
+    let config = read(&source(&REQUIRED), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("0.0.0.0", 8790, 8791));
     assert_eq!((config.secret.as_str(), config.control_token.as_str()), ("s3cr3t", "c0nsole"));
     assert_eq!(config.max_payload_bytes, 16 * 1024 * 1024);
@@ -149,7 +158,7 @@ mod tests {
       ("JAKE_HUB_PORT", "9000"),
       ("JAKE_CONTROL_PORT", "9001"),
     ];
-    let config = read(&source(&pairs)).expect("loads");
+    let config = read(&source(&pairs), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("127.0.0.1", 9000, 9001));
   }
 
@@ -185,7 +194,7 @@ mod tests {
       ("JAKE_HUB_ENV".to_owned(), path.display().to_string()),
       ("JAKE_SECRET".to_owned(), "from-env".to_owned()),
     ]);
-    let config = read(&Source(merged(process).expect("reads")));
+    let config = read(&Source(merged(process).expect("reads")), PathBuf::new());
     std::fs::remove_file(&path).expect("removes");
     let config = config.expect("loads");
     assert_eq!(

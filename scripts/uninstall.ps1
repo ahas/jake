@@ -30,7 +30,7 @@ $DataDir = Join-Path $env:LOCALAPPDATA 'jake'
 
 function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
 
-# Remove all three anchors for one run mode, mirroring the remove commands in src/agent/anchors.ts.
+# Remove all three anchors for one run mode, mirroring the remove commands the agent's watchdog keeps.
 # Absence of any one anchor is not an error — the point is that none remains afterwards.
 function Unregister-Anchor($name) {
   try { Remove-ItemProperty -Path $RunKey -Name $name -ErrorAction Stop } catch { }
@@ -46,6 +46,16 @@ Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
   try { $_ | Stop-Process -Force } catch { }
 }
 Start-Sleep -Milliseconds 500
+
+# Tell the hub this agent is gone, so it is recorded as departed rather than shown as disconnected.
+# The pair is already stopped, so the notice's own hello displaces no live connection. A hub that
+# cannot be reached does not stop the removal.
+$Exe = Join-Path $InstallDir 'jake.exe'
+if (Test-Path $Exe) {
+  Write-Step "telling the hub this agent has left"
+  & $Exe --leave
+  if ($LASTEXITCODE -ne 0) { Write-Host "  ! the hub was not told; it will show this agent as disconnected" -ForegroundColor Yellow }
+}
 
 Write-Step "removing autostart anchors"
 Unregister-Anchor $AgentAnchor

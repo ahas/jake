@@ -31,7 +31,10 @@ pub struct AgentConfig {
 }
 
 /// The environment the agent runs against: agent.env beside the executable, under the process's own.
-pub fn merged(install_dir: &Path, process: HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+pub fn merged(
+  install_dir: &Path,
+  process: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
   let path = install_dir.join("agent.env");
   let mut merged = HashMap::new();
   if path.exists() {
@@ -140,7 +143,8 @@ mod tests {
   fn the_file_beside_the_executable_sits_under_the_process_environment() {
     let dir = std::env::temp_dir().join(format!("jake-config-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("agent.env"), "# comment\nJAKE_AGENT_NAME='from file'\nJAKE_SECRET=file\n").unwrap();
+    std::fs::write(dir.join("agent.env"), "# comment\nJAKE_AGENT_NAME='from file'\nJAKE_SECRET=file\n")
+      .unwrap();
     let merged = merged(&dir, env(&[("JAKE_SECRET", "process")])).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(merged["JAKE_AGENT_NAME"], "from file");

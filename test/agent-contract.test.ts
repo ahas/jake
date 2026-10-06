@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AGENT_COMMAND, StandInHub, startAgentProcess, until, type AgentProcess, type HubConnection, type WireFrame } from "./agent-process";
+import { AGENT_COMMAND, ensureAgentBuilt, StandInHub, startAgentProcess, until, type AgentProcess, type HubConnection, type WireFrame } from "./agent-process";
 
 const SECRET = "contract-secret";
 const CHUNK = 256 * 1024;
@@ -18,6 +18,9 @@ function tempDir(): string {
 
 const hubs: StandInHub[] = [];
 const agents: AgentProcess[] = [];
+
+// A build after a change takes far longer than one case may, so the agent is built before any.
+beforeAll(ensureAgentBuilt, 600_000);
 
 afterAll(async () => {
   await Promise.all(agents.map((agent) => agent.stop()));
@@ -145,6 +148,7 @@ describe("a dial that does not open", () => {
 
   test("a missing required key stops the agent and names the key", async () => {
     const home = tempDir();
+    ensureAgentBuilt();
     const child = Bun.spawn([...AGENT_COMMAND], {
       cwd: home,
       env: { PATH: process.env.PATH ?? "", HOME: home, JAKE_HUB_URL: "ws://127.0.0.1:9", JAKE_AGENT_NAME: "box" },
@@ -389,5 +393,29 @@ describe("leaving", () => {
     expect(args.startsWith("--user\n--collect\n--unit\njake-depart\n/bin/sh\n-c\n")).toBe(true);
     expect(args).toContain("systemctl --user disable --now jake-agent.service");
     expect(args).toContain(`rm -rf '${dataDir}'`);
+  });
+
+  test("the uninstaller's leave notice says hello, sends a leave once welcomed, and exits; a refusal fails it", async () => {
+    const hub = standInHub();
+    const notice = (secret: string) => {
+      const home = tempDir();
+      return Bun.spawn([...AGENT_COMMAND, "--leave"], {
+        cwd: home,
+        env: { PATH: process.env.PATH ?? "", HOME: home, JAKE_HUB_URL: hub.url, JAKE_SECRET: secret, JAKE_AGENT_NAME: "box" },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+    };
+    ensureAgentBuilt();
+
+    const told = notice(SECRET);
+    const connection = await hub.welcomed(0);
+    await connection.next((f) => f.type === "leave", "the leave notice");
+    expect(await told.exited).toBe(0);
+
+    const refused = notice("wrong-secret");
+    expect(await refused.exited).not.toBe(0);
+    expect(await new Response(refused.stderr).text()).toContain("refused");
   });
 });

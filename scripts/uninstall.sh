@@ -35,6 +35,14 @@ echo "jake agent uninstaller"
 step "stopping and disabling the user service"
 systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
 
+# Tell the hub this agent is gone, so it is recorded as departed rather than shown as disconnected.
+# The agent's unit is already stopped, so the notice's own hello displaces no live connection. A hub
+# that cannot be reached does not stop the removal.
+if [ -x "$BIN" ]; then
+  step "telling the hub this agent has left"
+  "$BIN" --leave || printf '\033[33m  ! the hub was not told; it will show this agent as disconnected\033[0m\n'
+fi
+
 step "removing the unit"
 rm -f "$UNIT"
 systemctl --user daemon-reload 2>/dev/null || true

@@ -4,6 +4,7 @@ mod agent_server;
 mod config;
 mod control;
 mod core;
+mod departed;
 mod link;
 
 use jake_protocol as protocol;
@@ -44,6 +45,7 @@ async fn run() -> Result<(), String> {
     ping_interval: config.ping_interval,
     missed_pong_limit: config.missed_pong_limit,
     socket_backlog_bytes: config.socket_backlog_bytes,
+    departed_path: Some(config.departed_path),
   });
 
   let agent_listener = bind(&config.host, config.port).await?;

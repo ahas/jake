@@ -45,6 +45,14 @@
   </div>
 </div>
 
+<div class="card" id="departedCard" hidden>
+  <div class="sub" style="margin:0 0 10px">departed — uninstalled, not expected back</div>
+  <table>
+    <thead><tr><th>agent</th><th>departed</th></tr></thead>
+    <tbody id="departed"></tbody>
+  </table>
+</div>
+
 <div class="card">
   <div class="sub" style="margin:0 0 10px">traffic</div>
   <div class="feed">
@@ -76,12 +84,12 @@ async function poll() {
     const dot = document.getElementById("dot");
     const detail = document.getElementById("detail");
     document.getElementById("hubrun").textContent = "hub " + s.run;
+    const now = Date.now();
     if (s.agents.length > 0) {
       dot.className = "dot on";
       document.getElementById("stateText").textContent =
         "attached — " + s.agents.length + (s.agents.length === 1 ? " agent" : " agents");
       detail.hidden = false;
-      const now = Date.now();
       const rows = s.agents.map((a) => {
         const tr = document.createElement("tr");
         const cells = [
@@ -105,6 +113,17 @@ async function poll() {
       document.getElementById("stateText").textContent = "detached — no agent connected";
       detail.hidden = true;
     }
+    const departed = s.departed.map((a) => {
+      const tr = document.createElement("tr");
+      for (const text of [a.name, fmtDuration(now - a.departedAt) + " ago"]) {
+        const td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      return tr;
+    });
+    document.getElementById("departed").replaceChildren(...departed);
+    document.getElementById("departedCard").hidden = departed.length === 0;
   } catch (e) {
     document.getElementById("dot").className = "dot";
     document.getElementById("stateText").textContent = "cannot reach the hub";

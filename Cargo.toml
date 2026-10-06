@@ -1,7 +1,5 @@
 [workspace]
-members = ["hub", "protocol"]
-# The Rust agent is not built yet: its Windows run mode and its entry point are still to be written.
-exclude = ["agent"]
+members = ["agent", "hub", "protocol"]
 resolver = "3"
 
 # The contract tests run the debug builds through transfers of hundreds of megabytes; the hashing,

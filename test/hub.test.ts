@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,11 +15,9 @@ import {
   streamChecksum,
   type Frame,
 } from "../src/protocol";
-import { startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
+import { ensureHubBuilt, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
 import { HubClient, type UploadContent } from "../src/console/client";
-import { AgentConnection } from "../src/agent/connection";
-import { FileTransferRunner, nodeTransferFs } from "../src/agent/transfer";
-import { HubRefusedError, WebSocketDialer, systemScheduler, type Transport } from "../src/agent/transport";
+import { ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -30,14 +28,19 @@ const OPTS = { maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES };
 const running: HubProcess[] = [];
 const agents: FakeAgent[] = [];
 const readers: SseReader[] = [];
-const transports: Transport[] = [];
+const realAgents: AgentProcess[] = [];
 const dirs: string[] = [];
-const silentLog = { log() {} };
+
+// A build after a change takes far longer than one case may, so both programs are built before any.
+beforeAll(() => {
+  ensureHubBuilt();
+  ensureAgentBuilt();
+}, 600_000);
 
 afterEach(async () => {
   for (const reader of readers.splice(0)) reader.close();
   for (const agent of agents.splice(0)) agent.close();
-  for (const transport of transports.splice(0)) transport.close();
+  await Promise.all(realAgents.splice(0).map((agent) => agent.stop()));
   await Promise.all(running.splice(0).map((hub) => hub.stop()));
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -253,6 +256,15 @@ function openSse(url: string, init: RequestInit): SseReader {
   return reader;
 }
 
+/** The agent itself, as its own process, under a home of its own. */
+function startRealAgent(hubUrl: string, secret: string): AgentProcess {
+  const home = mkdtempSync(join(tmpdir(), "jake-hub-agent-"));
+  dirs.push(home);
+  const agent = startAgentProcess({ hubUrl, secret, name: "hass", home, env: { JAKE_REDIAL_BASE_MS: "20" } });
+  realAgents.push(agent);
+  return agent;
+}
+
 async function control(hub: HubProcess, path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`http://127.0.0.1:${hub.controlPort}${path}`, {
     ...init,
@@ -303,21 +315,17 @@ describe("agent authentication", () => {
     expect(hub.stderr).toEqual(["jake hub: refused an agent connection from 127.0.0.1 (a wrong credential)"]);
   });
 
-  test("the agent's dialer tells a refused secret apart from a hub that does not answer", async () => {
+  test("the agent tells this hub's refusal of its secret apart from a hub that does not answer", async () => {
     const hub = await launch();
-    const events = { onMessage() {}, onClose() {}, onError() {} };
-    const dialer = new WebSocketDialer(1_000);
-
-    const refused = await dialer.dial(`ws://127.0.0.1:${hub.agentPort}`, "wrong-secret", events).catch((e) => e);
-    expect(refused).toBeInstanceOf(HubRefusedError);
-    expect(refused.status).toBe(401);
+    const refused = startRealAgent(`ws://127.0.0.1:${hub.agentPort}`, "wrong-secret");
+    await until(() => refused.log().some((line) => line.event === "rejected" && line.status === 401));
 
     const vacant = Bun.serve({ port: 0, fetch: () => new Response() });
     const deadPort = vacant.port;
     vacant.stop(true);
-    const unreachable = await dialer.dial(`ws://127.0.0.1:${deadPort}`, SECRET, events).catch((e) => e);
-    expect(unreachable).toBeInstanceOf(Error);
-    expect(unreachable).not.toBeInstanceOf(HubRefusedError);
+    const unreachable = startRealAgent(`ws://127.0.0.1:${deadPort}`, SECRET);
+    await until(() => unreachable.log().some((line) => line.event === "dial-failed"));
+    expect(unreachable.log().some((line) => line.event === "rejected")).toBe(false);
   });
 
   test("rejects a control request without the control token", async () => {
@@ -566,28 +574,9 @@ describe("file transfer over the control API", () => {
     return { file: new Blob([bytes]), checksum: checksum(bytes) };
   }
 
-  // A real agent over a real socket, writing what it receives to disk and verifying it.
+  // A real agent process over a real socket, writing what it receives to disk and verifying it.
   async function attachRealAgent(hub: HubProcess): Promise<void> {
-    let connection: AgentConnection | null = null;
-    const transport = await new WebSocketDialer().dial(`ws://127.0.0.1:${hub.agentPort}`, SECRET, {
-      onMessage: (raw) => connection?.handleMessage(raw),
-      onClose: () => {},
-      onError: () => {},
-    });
-    transports.push(transport);
-    connection = new AgentConnection(transport, {
-      agentName: "hass",
-      agentVersion: "0.1.0",
-      capabilities: ["transfer"],
-      execRunner: null,
-      transferRunner: new FileTransferRunner({ fs: nodeTransferFs, maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES, log: silentLog }),
-      heartbeatMs: 1_000_000_000,
-      missedHeartbeatLimit: 3,
-      maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
-      scheduler: { ...systemScheduler, setInterval: () => 0, clearInterval: () => {} },
-      log: silentLog,
-    });
-    connection.run();
+    startRealAgent(`ws://127.0.0.1:${hub.agentPort}`, SECRET);
     let names: string[] = [];
     await until(async () => {
       names = (await (await control(hub, "/status")).json()).agents.map((a: { name: string }) => a.name);
@@ -862,6 +851,43 @@ describe("leave", () => {
     const response = await control(hub, "/leave", { method: "POST" });
     expect(response.status).toBe(409);
     expect((await response.json()).ok).toBe(false);
+  });
+
+  test("an agent told to leave is dropped and listed as departed, not as attached", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, [], "node3");
+    await control(hub, "/leave?agent=node3", { method: "POST" });
+    await agent.waitFor((f) => f.type === "leave");
+    await agent.waitClose();
+
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents).toEqual([]);
+    expect(status.departed).toEqual([{ name: "node3", departedAt: expect.any(Number) }]);
+    expect(hub.stderr.some((line) => line.includes("agent node3 departed"))).toBe(true);
+  });
+
+  test("an agent's own leave, sent by its uninstaller, records it as departed until it says hello again", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "jake-hub-data-"));
+    dirs.push(dataDir);
+    const first = await launch({ dataDir });
+    const uninstalled = await attach(first.agentPort, [], "jungsu-wsl");
+    await attach(first.agentPort, [], "node2");
+    uninstalled.send({ type: "leave", v: V });
+    await uninstalled.waitClose();
+    await until(async () => (await (await control(first, "/status")).json()).departed.length === 1);
+
+    // The record outlives the hub: a restarted hub still tells the departed agent from a dropped one.
+    await first.stop();
+    running.splice(running.indexOf(first), 1);
+    const second = await launch({ dataDir });
+    const after = await (await control(second, "/status")).json();
+    expect(after.departed.map((entry: { name: string }) => entry.name)).toEqual(["jungsu-wsl"]);
+    expect(after.agents).toEqual([]);
+
+    await attach(second.agentPort, [], "jungsu-wsl");
+    const back = await (await control(second, "/status")).json();
+    expect(back.departed).toEqual([]);
+    expect(back.agents.map((agent: { name: string }) => agent.name)).toEqual(["jungsu-wsl"]);
   });
 });
 

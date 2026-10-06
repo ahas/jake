@@ -1,5 +1,7 @@
 // Starts the hub as its own process for the contract tests, on free loopback ports.
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
@@ -11,6 +13,8 @@ export interface HubSeams {
   pingIntervalMs?: number;
   missedPongLimit?: number;
   socketBacklogBytes?: number;
+  /** The data directory the hub keeps its record in; a fresh one, removed at the stop, when omitted. */
+  dataDir?: string;
 }
 
 /** A running hub process: its two ports, the lines it wrote to stderr, and its teardown. */
@@ -23,8 +27,8 @@ export interface HubProcess {
 
 let built = false;
 
-// The hub is built once per test run; cargo answers at once when nothing changed.
-function ensureBuilt(): void {
+/** Build the hub once per test run; cargo answers at once when nothing changed. */
+export function ensureHubBuilt(): void {
   if (built) return;
   const result = Bun.spawnSync(["cargo", "build", "--offline", "--quiet", "--manifest-path", MANIFEST], {
     stdin: "ignore",
@@ -61,13 +65,14 @@ async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string
 
 /** Start a hub with the given secret and control token, returning once it says it is listening. */
 export async function startHubProcess(secret: string, controlToken: string, seams: HubSeams = {}): Promise<HubProcess> {
-  ensureBuilt();
+  ensureHubBuilt();
   const [agentPort, controlPort] = freePorts();
+  const dataDir = seams.dataDir ?? mkdtempSync(join(tmpdir(), "jake-hub-"));
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
     // No file is read: the test's environment is the whole configuration.
-    JAKE_HUB_ENV: join(ROOT, "hub", "no-such-hub.env"),
+    JAKE_HUB_ENV: join(dataDir, "hub.env"),
     JAKE_HUB_HOST: "127.0.0.1",
     JAKE_HUB_PORT: String(agentPort),
     JAKE_CONTROL_PORT: String(controlPort),
@@ -89,6 +94,7 @@ export async function startHubProcess(secret: string, controlToken: string, seam
     const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
     await child.exited;
     clearTimeout(timer);
+    if (seams.dataDir === undefined) rmSync(dataDir, { recursive: true, force: true });
   };
 
   const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);

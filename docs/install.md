@@ -131,9 +131,12 @@ left as it is.
 Run the uninstall script for the platform:
 
 - Linux/WSL: `./uninstall.sh` (or from the install location). It stops and disables the user service,
-  removes the unit, and deletes the install layout.
-- Windows: `& "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1"`. It stops the programs, removes all
-  three anchors for both run modes, and deletes the install folder.
+  tells the hub the agent has left, removes the unit, and deletes the install layout.
+- Windows: `& "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1"`. It stops the programs, tells the hub
+  the agent has left, removes all three anchors for both run modes, and deletes the install folder.
+
+Telling the hub is what makes it list this agent as departed rather than disconnected. If the hub
+cannot be reached at that moment, the uninstall still completes and says the hub was not told.
 
 The config file (`agent.env`) and the log are kept by default, so a reinstall reuses the URL and
 secret. To leave nothing behind, pass `--remove-config` (Linux) or `-RemoveConfig` (Windows):

@@ -89,7 +89,15 @@ impl Transfers {
     self.downloads.retain(|_, task| !task.is_finished());
     if self.uploads.contains_key(&id) || self.downloads.contains_key(&id) {
       let message = "a transfer with this id is already in progress".to_owned();
-      return self.fail(&id, Failure { code: "duplicate", message }).await;
+      return self
+        .fail(
+          &id,
+          Failure {
+            code: "duplicate",
+            message,
+          },
+        )
+        .await;
     }
     let path = PathBuf::from(path);
     match direction {
@@ -154,7 +162,15 @@ impl Transfers {
     if upload.received != total || upload.sum.finish() != checksum {
       let _ = fs::remove_file(&upload.temp).await;
       let message = format!("assembled {} bytes did not match the declared transfer", upload.received);
-      return self.fail(id, Failure { code: "integrity", message }).await;
+      return self
+        .fail(
+          id,
+          Failure {
+            code: "integrity",
+            message,
+          },
+        )
+        .await;
     }
     if let Err(error) = fs::rename(&upload.temp, &upload.path).await {
       let _ = fs::remove_file(&upload.temp).await;
@@ -173,7 +189,9 @@ impl Transfers {
     if let Some(upload) = self.uploads.remove(id) {
       drop(upload.file);
       if let Err(error) = fs::remove_file(&upload.temp).await {
-        self.log.warn("transfer-cleanup-failed", serde_json::json!({ "id": id, "error": error.to_string() }));
+        self
+          .log
+          .warn("transfer-cleanup-failed", serde_json::json!({ "id": id, "error": error.to_string() }));
       }
     }
     if let Some(task) = self.downloads.remove(id) {
@@ -190,22 +208,58 @@ impl Transfers {
   }
 }
 
-// Read a file piece by piece, handing each piece on until the end or until the taker wants no more.
-async fn each_chunk(path: &Path, mut take: impl AsyncFnMut(&[u8]) -> bool) -> std::io::Result<()> {
-  let mut file = File::open(path).await?;
-  let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
-  loop {
+// A file read piece by piece, each piece as large as a transfer chunk until the last.
+struct Pieces {
+  file: File,
+  buffer: Vec<u8>,
+}
+
+impl Pieces {
+  async fn open(path: &Path) -> std::io::Result<Self> {
+    Ok(Self {
+      file: File::open(path).await?,
+      buffer: vec![0; TRANSFER_CHUNK_BYTES],
+    })
+  }
+
+  /// The next piece, or none at the end of the file.
+  async fn next(&mut self) -> std::io::Result<Option<&[u8]>> {
     let mut filled = 0;
-    while filled < buffer.len() {
-      match file.read(&mut buffer[filled..]).await? {
+    while filled < self.buffer.len() {
+      match self.file.read(&mut self.buffer[filled..]).await? {
         0 => break,
         n => filled += n,
       }
     }
-    if filled == 0 || !take(&buffer[..filled]).await {
-      return Ok(());
+    Ok((filled > 0).then(|| &self.buffer[..filled]))
+  }
+}
+
+async fn hash_file(path: &Path) -> std::io::Result<String> {
+  let mut pieces = Pieces::open(path).await?;
+  let mut sum = Checksum::default();
+  while let Some(piece) = pieces.next().await? {
+    sum.update(piece);
+  }
+  Ok(sum.finish())
+}
+
+// Every piece of the file as a chunk frame; false once the connection has stopped taking them.
+async fn stream_file(id: &str, path: &Path, out: &mpsc::Sender<Frame>) -> std::io::Result<bool> {
+  let mut pieces = Pieces::open(path).await?;
+  let mut seq = 0;
+  while let Some(piece) = pieces.next().await? {
+    let chunk = Frame::TransferChunk {
+      id: id.to_owned(),
+      seq,
+      chunk: EncodedBytes::of(piece),
+    };
+    seq += 1;
+    if out.send(chunk).await.is_err() {
+      return Ok(false);
     }
   }
+  Ok(true)
 }
 
 // The first pass hashes the file, so the answering begin carries the checksum the receiver verifies;
@@ -219,7 +273,12 @@ async fn download(id: String, path: PathBuf, out: mpsc::Sender<Frame>) {
   let total = match fs::metadata(&path).await {
     Ok(meta) if meta.is_dir() => {
       let message = format!("{} is a directory", path.display());
-      let _ = out.send(fail(Failure { code: "is-directory", message })).await;
+      let _ = out
+        .send(fail(Failure {
+          code: "is-directory",
+          message,
+        }))
+        .await;
       return;
     }
     Ok(meta) => meta.len(),
@@ -228,16 +287,13 @@ async fn download(id: String, path: PathBuf, out: mpsc::Sender<Frame>) {
       return;
     }
   };
-  let mut sum = Checksum::default();
-  let hashed = each_chunk(&path, async |piece: &[u8]| {
-    sum.update(piece);
-    true
-  });
-  if let Err(error) = hashed.await {
-    let _ = out.send(fail(Failure::io(&path, &error))).await;
-    return;
-  }
-  let checksum = sum.finish();
+  let checksum = match hash_file(&path).await {
+    Ok(checksum) => checksum,
+    Err(error) => {
+      let _ = out.send(fail(Failure::io(&path, &error))).await;
+      return;
+    }
+  };
   let begin = Frame::TransferBegin {
     id: id.clone(),
     direction: Direction::Download,
@@ -248,19 +304,13 @@ async fn download(id: String, path: PathBuf, out: mpsc::Sender<Frame>) {
   if out.send(begin).await.is_err() {
     return;
   }
-  let mut seq = 0;
-  let streamed = each_chunk(&path, async |piece: &[u8]| {
-    let chunk = Frame::TransferChunk {
+  let last = match stream_file(&id, &path, &out).await {
+    Ok(false) => return,
+    Ok(true) => Frame::TransferEnd {
       id: id.clone(),
-      seq,
-      chunk: EncodedBytes::of(piece),
-    };
-    seq += 1;
-    out.send(chunk).await.is_ok()
-  })
-  .await;
-  let last = match streamed {
-    Ok(()) => Frame::TransferEnd { id: id.clone(), total, checksum },
+      total,
+      checksum,
+    },
     Err(error) => fail(Failure::io(&path, &error)),
   };
   let _ = out.send(last).await;

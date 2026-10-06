@@ -30,8 +30,3 @@ pub async fn run(argv: &[String], within: Duration) -> Result<(), String> {
     Err(_) => Err(format!("{} did not finish within {within:?}", argv[0])),
   }
 }
-
-/// The arguments of a command line, owned.
-pub fn argv(parts: &[&str]) -> Vec<String> {
-  parts.iter().map(|part| (*part).to_owned()).collect()
-}
