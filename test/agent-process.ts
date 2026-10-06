@@ -79,10 +79,12 @@ export class StandInHub {
   readonly connections: HubConnection[] = [];
   private readonly server: ReturnType<typeof Bun.serve<{ connection: HubConnection | null }, never>>;
 
-  constructor(secret: string) {
+  /** A hub over TLS when given a certificate and key, PEM-encoded; plain otherwise. */
+  constructor(secret: string, private readonly tls?: { cert: string; key: string }) {
     this.server = Bun.serve<{ connection: HubConnection | null }, never>({
       hostname: "127.0.0.1",
       port: 0,
+      ...(tls === undefined ? {} : { tls }),
       fetch: (request, server) => {
         if (request.headers.get("authorization") !== `Bearer ${secret}`) {
           return new Response("unauthorized", { status: 401 });
@@ -108,7 +110,7 @@ export class StandInHub {
   }
 
   get url(): string {
-    return `ws://127.0.0.1:${this.server.port}`;
+    return `${this.tls === undefined ? "ws" : "wss"}://127.0.0.1:${this.server.port}`;
   }
 
   /** The connection at `index`, in the order the agent opened them, once its hello has arrived. */

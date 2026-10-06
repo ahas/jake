@@ -135,6 +135,30 @@ describe("the handshake and the connection", () => {
   });
 });
 
+/** A private root and a certificate for 127.0.0.1 signed by it, as PEM files under `dir`. */
+function privateRoot(dir: string): { root: string; cert: string; key: string } {
+  const openssl = (...args: string[]) => {
+    const result = Bun.spawnSync(["openssl", ...args], { cwd: dir, stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+    if (result.exitCode !== 0) throw new Error(`openssl ${args[0]}: ${result.stderr.toString()}`);
+  };
+  const ec = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"];
+  openssl("req", "-x509", ...ec, "-keyout", "root.key", "-out", "root.pem", "-subj", "/CN=test root", "-days", "1");
+  openssl("req", ...ec, "-keyout", "hub.key", "-out", "hub.csr", "-subj", "/CN=127.0.0.1");
+  writeFileSync(join(dir, "hub.ext"), "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n");
+  openssl("x509", "-req", "-in", "hub.csr", "-CA", "root.pem", "-CAkey", "root.key", "-CAcreateserial", "-out", "hub.pem", "-days", "1", "-extfile", "hub.ext");
+  return { root: join(dir, "root.pem"), cert: readFileSync(join(dir, "hub.pem"), "utf8"), key: readFileSync(join(dir, "hub.key"), "utf8") };
+}
+
+describe("a hub over TLS", () => {
+  test("is trusted through the machine's own trust store, where a network that inspects TLS puts its root", async () => {
+    const pki = privateRoot(tempDir());
+    const hub = new StandInHub(SECRET, { cert: pki.cert, key: pki.key });
+    hubs.push(hub);
+    agent(hub.url, { SSL_CERT_FILE: pki.root });
+    expect((await hub.connection(0)).frames[0]).toMatchObject({ type: "hello", agent: "box" });
+  });
+});
+
 describe("a dial that does not open", () => {
   test("a refused secret is logged as rejected, and a hub that does not answer as dial-failed", async () => {
     const hub = standInHub();

@@ -88,6 +88,10 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   hours between tries. A connection that was welcomed and then stayed up long enough to be trusted
   resets the backoff, so an occasional flap does not push the delay toward its ceiling while a
   genuine outage still does.
+- The hub's certificate is checked against the machine's own trust store, with a bundled set of
+  public roots added for a machine whose store is empty. A network that inspects TLS re-signs the
+  hub's certificate with a root of its own that only the machines on it trust, so an agent that
+  trusted the bundled roots alone could not reach the hub from such a network.
 - Liveness is judged by traffic, not by the socket alone. The agent answers the hub's ping promptly
   and sends its own on an interval, and it treats a stretch of silence from the hub — past a window
   of several intervals — as a dead connection worth redialing, even when the socket has not errored.
