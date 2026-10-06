@@ -256,7 +256,7 @@ describe("status", () => {
   });
 
   test("a hub with no agent reads as detached", async () => {
-    const { client } = fakeHub({ "/status": () => jsonResponse({ run: "hub-abc", attached: false, agents: [], departed: [] }) });
+    const { client } = fakeHub({ "/status": () => jsonResponse({ run: "hub-abc", attached: false, agents: [] }) });
     const cap = capture(client);
     await runCli(["status"], cap.deps);
     expect(cap.out.join("")).toContain("detached — no agent connected");

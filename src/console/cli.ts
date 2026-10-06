@@ -540,7 +540,7 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
       `  in-flight commands: ${agent.inFlight.length > 0 ? agent.inFlight.join(", ") : "(none)"}`,
     );
   }
-  for (const agent of snapshot.departed) {
+  for (const agent of snapshot.departed ?? []) {
     lines.push(`${agent.name} departed ${formatDuration(now - agent.departedAt)} ago`);
   }
   return `${lines.join("\n")}\n`;

@@ -26,7 +26,8 @@ export interface StatusSnapshot {
   run: string;
   attached: boolean;
   agents: AgentStatus[];
-  departed: DepartedAgent[];
+  /** Absent from a hub that keeps no record of departures, which the console still reads. */
+  departed?: DepartedAgent[];
 }
 
 /** One frame that crossed the tunnel, reduced to its shape, as the hub's traffic feed carries it. */
