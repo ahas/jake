@@ -1,0 +1,149 @@
+// The agent's configuration: agent.env beside its executable, overridden by the process environment.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
+
+const DEFAULT_HEARTBEAT_MS: i64 = 15_000;
+const DEFAULT_TICK_MS: i64 = 60_000;
+// Three ticks: a peer is declared dead only after it missed three heartbeat writes in a row.
+const DEFAULT_WATCHDOG_STALE_MS: i64 = 180_000;
+const DEFAULT_MAX_PAYLOAD_BYTES: i64 = 16 * 1024 * 1024;
+const DEFAULT_EXEC_MAX_OUTPUT_BYTES: i64 = 8 * 1024 * 1024;
+const DEFAULT_EXEC_TIMEOUT_MS: i64 = 5 * 60 * 1000;
+const DEFAULT_REDIAL_BASE_MS: i64 = 1_000;
+const DEFAULT_REDIAL_CAP_MS: i64 = 60_000;
+
+/// What the agent needs to dial the hub, serve it, and keep itself alive.
+#[derive(Clone, Debug)]
+pub struct AgentConfig {
+  pub hub_url: String,
+  pub secret: String,
+  pub agent_name: String,
+  pub heartbeat: Duration,
+  pub tick: Duration,
+  pub watchdog_stale: Duration,
+  pub max_payload_bytes: usize,
+  pub exec_max_output_bytes: u64,
+  pub exec_timeout: Duration,
+  pub redial_base: Duration,
+  pub redial_cap: Duration,
+}
+
+/// The environment the agent runs against: agent.env beside the executable, under the process's own.
+pub fn merged(install_dir: &Path, process: HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+  let path = install_dir.join("agent.env");
+  let mut merged = HashMap::new();
+  if path.exists() {
+    let entries = dotenvy::from_path_iter(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    for entry in entries {
+      let (key, value) = entry.map_err(|error| format!("{}: {error}", path.display()))?;
+      merged.insert(key, value);
+    }
+  }
+  merged.extend(process);
+  Ok(merged)
+}
+
+// The leading integer of a value, the way JavaScript's parseInt reads one: "12abc" is 12.
+fn leading_int(raw: &str) -> Option<i64> {
+  let text = raw.trim_start();
+  let digits_from = usize::from(text.starts_with(['+', '-']));
+  let digits = text[digits_from..].bytes().take_while(u8::is_ascii_digit).count();
+  if digits == 0 {
+    return None;
+  }
+  text[..digits_from + digits].parse().ok()
+}
+
+struct Source<'a>(&'a HashMap<String, String>);
+
+impl Source<'_> {
+  fn present(&self, name: &str) -> Option<&str> {
+    self.0.get(name).map(String::as_str).filter(|value| !value.is_empty())
+  }
+
+  fn required(&self, name: &str) -> Result<String, String> {
+    self
+      .present(name)
+      .map(str::to_owned)
+      .ok_or_else(|| format!("{name} is not set. Copy the matching .env.example and fill it in."))
+  }
+
+  fn positive(&self, name: &str, fallback: i64) -> Result<u64, String> {
+    let value = match self.present(name) {
+      None => fallback,
+      Some(raw) => leading_int(raw).ok_or_else(|| format!("{name} must be an integer."))?,
+    };
+    u64::try_from(value)
+      .ok()
+      .filter(|value| *value > 0)
+      .ok_or_else(|| format!("{name} must be a positive integer."))
+  }
+
+  fn millis(&self, name: &str, fallback: i64) -> Result<Duration, String> {
+    self.positive(name, fallback).map(Duration::from_millis)
+  }
+}
+
+/// Read the agent's configuration, naming the first key that is missing or malformed.
+pub fn read(env: &HashMap<String, String>) -> Result<AgentConfig, String> {
+  let env = Source(env);
+  Ok(AgentConfig {
+    hub_url: env.required("JAKE_HUB_URL")?,
+    secret: env.required("JAKE_SECRET")?,
+    agent_name: env.required("JAKE_AGENT_NAME")?,
+    heartbeat: env.millis("JAKE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS)?,
+    tick: env.millis("JAKE_TICK_MS", DEFAULT_TICK_MS)?,
+    watchdog_stale: env.millis("JAKE_WATCHDOG_STALE_MS", DEFAULT_WATCHDOG_STALE_MS)?,
+    max_payload_bytes: usize::try_from(env.positive("JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES)?)
+      .map_err(|_| "JAKE_MAX_PAYLOAD_BYTES is too large.".to_owned())?,
+    exec_max_output_bytes: env.positive("JAKE_EXEC_MAX_OUTPUT_BYTES", DEFAULT_EXEC_MAX_OUTPUT_BYTES)?,
+    exec_timeout: env.millis("JAKE_EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS)?,
+    redial_base: env.millis("JAKE_REDIAL_BASE_MS", DEFAULT_REDIAL_BASE_MS)?,
+    redial_cap: env.millis("JAKE_REDIAL_CAP_MS", DEFAULT_REDIAL_CAP_MS)?,
+  })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect()
+  }
+
+  const REQUIRED: [(&str, &str); 3] =
+    [("JAKE_HUB_URL", "ws://hub"), ("JAKE_SECRET", "s"), ("JAKE_AGENT_NAME", "box")];
+
+  #[test]
+  fn reads_the_required_keys_and_applies_the_defaults() {
+    let config = read(&env(&REQUIRED)).unwrap();
+    assert_eq!(config.agent_name, "box");
+    assert_eq!(config.heartbeat, Duration::from_secs(15));
+    assert_eq!(config.watchdog_stale, Duration::from_secs(180));
+    assert_eq!(config.exec_max_output_bytes, 8 * 1024 * 1024);
+    assert_eq!(config.redial_cap, Duration::from_secs(60));
+  }
+
+  #[test]
+  fn names_the_key_that_is_missing_or_malformed() {
+    assert!(read(&env(&REQUIRED[..2])).unwrap_err().starts_with("JAKE_AGENT_NAME is not set"));
+    let mut bad = env(&REQUIRED);
+    bad.insert("JAKE_TICK_MS".into(), "soon".into());
+    assert_eq!(read(&bad).unwrap_err(), "JAKE_TICK_MS must be an integer.");
+    bad.insert("JAKE_TICK_MS".into(), "0".into());
+    assert_eq!(read(&bad).unwrap_err(), "JAKE_TICK_MS must be a positive integer.");
+  }
+
+  #[test]
+  fn the_file_beside_the_executable_sits_under_the_process_environment() {
+    let dir = std::env::temp_dir().join(format!("jake-config-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.env"), "# comment\nJAKE_AGENT_NAME='from file'\nJAKE_SECRET=file\n").unwrap();
+    let merged = merged(&dir, env(&[("JAKE_SECRET", "process")])).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(merged["JAKE_AGENT_NAME"], "from file");
+    assert_eq!(merged["JAKE_SECRET"], "process");
+  }
+}

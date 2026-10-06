@@ -1,0 +1,28 @@
+[package]
+name = "jake-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "jake"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+dotenvy = "0.15"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+humantime = "2"
+jake-protocol = { path = "../protocol" }
+rand = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

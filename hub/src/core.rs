@@ -10,13 +10,14 @@ use futures_util::{Stream, StreamExt};
 use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
 
 use crate::link::{Link, SendOutcome};
-use crate::protocol::{Direction, EncodedBytes, Frame, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame};
+use crate::protocol::{
+  Checksum, Direction, EncodedBytes, Frame, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
+};
 
 /// The version the hub names in its welcome.
 const HUB_VERSION: &str = "0.1.0";
@@ -156,7 +157,7 @@ struct Transfer {
   listener: Listener,
   expected_seq: u64,
   received: u64,
-  hash: Option<Sha256>,
+  hash: Option<Checksum>,
 }
 
 struct State {
@@ -179,10 +180,6 @@ fn now_ms() -> i64 {
   SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as i64)
 }
 
-fn hex(digest: &[u8]) -> String {
-  digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 // Agent names in the order a person reads them: letters alike whatever their case, and of two names
 // that differ only in case, the lowercase one first.
 fn by_name(a: &str, b: &str) -> std::cmp::Ordering {
@@ -193,11 +190,6 @@ fn by_name(a: &str, b: &str) -> std::cmp::Ordering {
       .collect()
   };
   a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| swapped(a).cmp(&swapped(b)))
-}
-
-/// The sha256 of content, in lowercase hex, as a transfer declares it.
-pub fn checksum(data: &[u8]) -> String {
-  hex(&Sha256::digest(data))
 }
 
 // A random tag for this process, so a console can tell a restarted hub from the one its cursor counts against.
@@ -408,9 +400,7 @@ impl State {
         // is accepted only if what the hub assembled matches what it declares.
         let verified = match (transfer.direction, transfer.hash) {
           (Direction::Upload, _) => true,
-          (Direction::Download, Some(hash)) => {
-            transfer.received == total && hex(&hash.finalize()) == checksum
-          }
+          (Direction::Download, Some(hash)) => transfer.received == total && hash.finish() == checksum,
           (Direction::Download, None) => false,
         };
         if verified {
@@ -836,7 +826,7 @@ impl Hub {
         listener,
         expected_seq: 0,
         received: 0,
-        hash: Some(Sha256::new()),
+        hash: Some(Checksum::default()),
       };
       agent.transfers.insert(id.clone(), transfer);
     }
@@ -910,6 +900,7 @@ mod tests {
 
   use super::*;
   use crate::link::Outbound;
+  use crate::protocol::checksum;
 
   const CAP: usize = 16 * 1024 * 1024;
 

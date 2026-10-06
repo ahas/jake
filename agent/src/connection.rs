@@ -1,0 +1,367 @@
+// The agent's tunnel: dialing the hub, serving one connection's frames, and redialing without end.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt as _, StreamExt as _};
+use jake_protocol::{Frame, decode_frame};
+use serde_json::{Number, json};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, interval_at, sleep, timeout};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+use crate::config::AgentConfig;
+use crate::exec::{self, ExecRequest, Limits, RunHandle};
+use crate::log::Log;
+use crate::platform::Platform;
+use crate::transfer::Transfers;
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How many heartbeat windows of silence from the hub mark a connection dead.
+const MISSED_HEARTBEAT_LIMIT: u32 = 3;
+/// How long a dial may take before it counts as failed.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many frames may wait for the socket; a producer past it waits, so memory stays bounded.
+const OUTBOUND_FRAMES: usize = 16;
+/// How long a closing socket may take to carry its close frame.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+// The attempt counter stops growing here; the delay reached the cap long before.
+const MAX_ATTEMPT: u32 = 30;
+
+/// Who this agent is and what it serves with.
+#[derive(Clone)]
+pub struct Agent {
+  pub config: AgentConfig,
+  pub version: String,
+  pub log: Log,
+}
+
+enum DialError {
+  /// The hub answered the upgrade and turned the credential away with this status.
+  Refused(u16),
+  Failed(String),
+}
+
+impl Agent {
+  fn capabilities(&self) -> Vec<String> {
+    let shells = Platform::HOST.shells().iter().map(|shell| format!("exec:{shell}"));
+    shells.chain(["transfer".to_owned()]).collect()
+  }
+
+  fn hello(&self) -> Frame {
+    Frame::Hello {
+      agent: self.config.agent_name.clone(),
+      agent_version: self.version.clone(),
+      capabilities: self.capabilities(),
+    }
+  }
+
+  async fn dial(&self) -> Result<Socket, DialError> {
+    let mut request = self.config.hub_url.as_str().into_client_request().map_err(|error| DialError::Failed(error.to_string()))?;
+    let credential = HeaderValue::from_str(&format!("Bearer {}", self.config.secret))
+      .map_err(|_| DialError::Failed("the shared secret cannot be sent as a header".into()))?;
+    request.headers_mut().insert(AUTHORIZATION, credential);
+    // A frame carries at most one payload at the cap, grown by a third in base64, plus its envelope.
+    let frame_limit = self.config.max_payload_bytes / 3 * 4 + 1024 * 1024;
+    let settings = WebSocketConfig::default().max_message_size(Some(frame_limit)).max_frame_size(Some(frame_limit));
+    let dialing = tokio_tungstenite::connect_async_with_config(request, Some(settings), true);
+    match timeout(DIAL_TIMEOUT, dialing).await {
+      Ok(Ok((socket, _))) => Ok(socket),
+      Ok(Err(WsError::Http(response))) if response.status() == 401 => Err(DialError::Refused(401)),
+      Ok(Err(error)) => Err(DialError::Failed(error.to_string())),
+      Err(_) => Err(DialError::Failed(format!("no answer within {DIAL_TIMEOUT:?}"))),
+    }
+  }
+
+  /// Dial and redial for ever, one connection at a time; it returns only when the hub sends a leave.
+  pub async fn run(&self) {
+    let stable = self.config.heartbeat * 2;
+    let mut attempt: u32 = 0;
+    loop {
+      match self.dial().await {
+        Ok(socket) => {
+          let started = Instant::now();
+          let session = Session::new(self, socket).run().await;
+          if session.leave {
+            return;
+          }
+          if session.welcomed && started.elapsed() >= stable {
+            attempt = 0;
+          }
+        }
+        Err(DialError::Refused(status)) => {
+          self.log.warn("rejected", json!({ "status": status, "reason": "the hub refused the shared secret" }));
+        }
+        Err(DialError::Failed(error)) => self.log.warn("dial-failed", json!({ "error": error })),
+      }
+      let delay = self.backoff(attempt);
+      attempt = (attempt + 1).min(MAX_ATTEMPT);
+      self.log.info("redial-scheduled", json!({ "attempt": attempt, "delayMs": delay.as_millis() as u64 }));
+      sleep(delay).await;
+    }
+  }
+
+  // Full jitter over an exponential window clamped to the cap, so retries neither fall into lockstep
+  // nor drift toward hours apart.
+  fn backoff(&self, attempt: u32) -> Duration {
+    let window = self.config.redial_base.saturating_mul(2u32.saturating_pow(attempt)).min(self.config.redial_cap);
+    window.mul_f64(rand::random::<f64>())
+  }
+
+  /// Tell the hub this agent is uninstalled, so it is forgotten rather than counted as disconnected.
+  pub async fn announce_leave(&self) -> Result<(), String> {
+    let socket = self.dial().await.map_err(|error| match error {
+      DialError::Refused(status) => format!("the hub refused the shared secret (HTTP {status})"),
+      DialError::Failed(error) => format!("the hub could not be reached: {error}"),
+    })?;
+    let (mut sink, mut stream) = socket.split();
+    let send = async |sink: &mut SplitSink<Socket, Message>, frame: Frame| {
+      sink.send(Message::Text(frame.encode().into())).await.map_err(|error| error.to_string())
+    };
+    send(&mut sink, self.hello()).await?;
+    let answer = timeout(DIAL_TIMEOUT, async {
+      while let Some(Ok(message)) = stream.next().await {
+        if let Message::Text(text) = message {
+          match decode_frame(text.as_str(), self.config.max_payload_bytes) {
+            Ok(Frame::Welcome { .. }) => return Ok(()),
+            Ok(Frame::Reject { reason }) => return Err(format!("the hub refused the agent: {reason}")),
+            _ => {}
+          }
+        }
+      }
+      Err("the hub closed the connection before welcoming it".to_owned())
+    });
+    answer.await.map_err(|_| "the hub did not answer the hello".to_owned())??;
+    send(&mut sink, Frame::Leave).await?;
+    let _ = timeout(CLOSE_GRACE, sink.close()).await;
+    self.log.warn("leave-announced", json!({ "agent": self.config.agent_name }));
+    Ok(())
+  }
+}
+
+// The one task that writes to the socket, so no handler ever waits on the writer it would block.
+fn writer(mut sink: SplitSink<Socket, Message>, mut frames: mpsc::Receiver<Frame>, close: oneshot::Receiver<()>) -> JoinHandle<()> {
+  tokio::spawn(async move {
+    tokio::pin!(close);
+    loop {
+      tokio::select! {
+        frame = frames.recv() => {
+          let Some(frame) = frame else { break };
+          if sink.send(Message::Text(frame.encode().into())).await.is_err() {
+            return;
+          }
+        }
+        _ = &mut close => break,
+      }
+    }
+    let _ = timeout(CLOSE_GRACE, sink.close()).await;
+  })
+}
+
+struct Outcome {
+  welcomed: bool,
+  leave: bool,
+}
+
+struct Session<'a> {
+  agent: &'a Agent,
+  stream: SplitStream<Socket>,
+  out: mpsc::Sender<Frame>,
+  writer: JoinHandle<()>,
+  close: Option<oneshot::Sender<()>>,
+  runs: HashMap<String, RunHandle>,
+  transfers: Transfers,
+  welcomed: bool,
+  leave: bool,
+  last_inbound: Instant,
+}
+
+impl<'a> Session<'a> {
+  fn new(agent: &'a Agent, socket: Socket) -> Self {
+    let (sink, stream) = socket.split();
+    let (out, frames) = mpsc::channel(OUTBOUND_FRAMES);
+    let (close, closed) = oneshot::channel();
+    Self {
+      agent,
+      stream,
+      writer: writer(sink, frames, closed),
+      close: Some(close),
+      transfers: Transfers::new(out.clone(), agent.config.max_payload_bytes, agent.log.clone()),
+      out,
+      runs: HashMap::new(),
+      welcomed: false,
+      leave: false,
+      last_inbound: Instant::now(),
+    }
+  }
+
+  async fn send(&self, frame: Frame) {
+    let _ = self.out.send(frame).await;
+  }
+
+  async fn run(mut self) -> Outcome {
+    let log = self.agent.log.clone();
+    log.info("connecting", json!({ "agent": self.agent.config.agent_name, "capabilities": self.agent.capabilities() }));
+    self.send(self.agent.hello()).await;
+    let beat = self.agent.config.heartbeat;
+    let mut heartbeat = interval_at(Instant::now() + beat, beat);
+    let reason = loop {
+      tokio::select! {
+        message = self.stream.next() => match message {
+          None => break "socket closed".to_owned(),
+          Some(Err(error)) => break format!("socket error: {error}"),
+          Some(Ok(Message::Close(frame))) => {
+            break match frame {
+              Some(frame) => format!("socket closed (code {}: {})", u16::from(frame.code), frame.reason),
+              None => "socket closed".to_owned(),
+            };
+          }
+          Some(Ok(Message::Text(text))) => {
+            if let Some(reason) = self.receive(text.as_str()).await {
+              break reason;
+            }
+          }
+          Some(Ok(_)) => {}
+        },
+        _ = heartbeat.tick() => {
+          if self.last_inbound.elapsed() > beat * MISSED_HEARTBEAT_LIMIT {
+            break "no traffic from the hub within the liveness window".to_owned();
+          }
+          self.send(Frame::Ping { ts: Number::from(epoch_ms()) }).await;
+        }
+        _ = &mut self.writer => break "a send failed: the socket is gone".to_owned(),
+      }
+    };
+    self.end().await;
+    log.info("connection-ended", json!({ "reason": reason, "welcomed": self.welcomed }));
+    Outcome {
+      welcomed: self.welcomed,
+      leave: self.leave,
+    }
+  }
+
+  // Nothing in flight outlives the socket it streamed over: every run's tree is ended and every
+  // transfer dropped, and output a run produces afterwards goes nowhere.
+  async fn end(&mut self) {
+    for (_, run) in self.runs.drain() {
+      run.end_now();
+    }
+    self.transfers.abandon().await;
+    if let Some(close) = self.close.take() {
+      let _ = close.send(());
+    }
+    if !self.writer.is_finished() {
+      let _ = timeout(CLOSE_GRACE * 2, &mut self.writer).await;
+    }
+    self.writer.abort();
+  }
+
+  /// Act on one received text; the reason the connection ends, when it does.
+  async fn receive(&mut self, text: &str) -> Option<String> {
+    let log = &self.agent.log;
+    let frame = match decode_frame(text, self.agent.config.max_payload_bytes) {
+      Ok(frame) => frame,
+      Err(error) => {
+        log.warn("frame-rejected", json!({ "code": error.code, "message": error.message }));
+        return None;
+      }
+    };
+    // Any well-formed frame proves the hub alive, which is what lets silence alone end a connection.
+    self.last_inbound = Instant::now();
+    match frame {
+      Frame::Welcome { hub_version } => {
+        self.welcomed = true;
+        log.info("welcomed", json!({ "hubVersion": hub_version }));
+      }
+      Frame::Reject { reason } => {
+        log.warn("rejected", json!({ "reason": reason }));
+        return Some(format!("hub rejected the connection: {reason}"));
+      }
+      Frame::Ping { ts } => self.send(Frame::Pong { ts }).await,
+      Frame::Exec {
+        id,
+        shell,
+        command,
+        cwd,
+        env,
+        distro,
+      } => {
+        let env = env.into_iter().filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned()))).collect();
+        self.exec(ExecRequest {
+          id,
+          shell,
+          command,
+          cwd,
+          env,
+          distro,
+        })
+        .await;
+      }
+      // A cancel for a run that already ended reaches nothing.
+      Frame::Cancel { id } => {
+        if let Some(run) = self.runs.remove(&id) {
+          run.cancel();
+        }
+      }
+      Frame::Leave => {
+        log.warn("leave-received", json!({}));
+        self.leave = true;
+        return Some("the hub asked this agent to leave".to_owned());
+      }
+      // The agent asks nothing of the hub, so an error names a transfer the hub has given up.
+      Frame::Error { id, code, message } => {
+        log.warn("hub-error", json!({ "id": id, "code": code, "message": message }));
+        self.transfers.discard(&id).await;
+      }
+      Frame::TransferBegin {
+        id, direction, path, ..
+      } => self.transfers.begin(id, direction, path).await,
+      Frame::TransferChunk { id, seq, chunk } => self.transfers.chunk(&id, seq, &chunk).await,
+      Frame::TransferEnd { id, total, checksum } => self.transfers.end(&id, total, &checksum).await,
+      // The agent's own kinds, arriving from the hub, are not the agent's to act on.
+      Frame::Hello { .. } | Frame::Stdout { .. } | Frame::Stderr { .. } | Frame::Exit { .. } | Frame::Pong { .. } => {}
+    }
+    None
+  }
+
+  async fn exec(&mut self, request: ExecRequest) {
+    let id = request.id.clone();
+    if !Platform::HOST.shells().contains(&request.shell.as_str()) {
+      let message = format!("this agent runs no {} shell", request.shell);
+      return self.send(Frame::Error { id, code: "unsupported".into(), message }).await;
+    }
+    let limits = Limits {
+      max_output_bytes: self.agent.config.exec_max_output_bytes,
+      timeout: self.agent.config.exec_timeout,
+    };
+    match exec::start(request, limits, self.out.clone(), self.agent.log.clone()) {
+      Ok(run) => {
+        self.runs.retain(|_, run| !run.finished());
+        self.runs.insert(id, run);
+      }
+      Err(message) => self.send(Frame::Error { id, code: "spawn-failed".into(), message }).await,
+    }
+  }
+}
+
+// A session dropped mid-flight — the agent told to stop — still ends every tree it started.
+impl Drop for Session<'_> {
+  fn drop(&mut self) {
+    for (_, run) in self.runs.drain() {
+      run.end_now();
+    }
+  }
+}
+
+fn epoch_ms() -> u64 {
+  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}

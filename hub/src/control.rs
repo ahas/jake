@@ -18,8 +18,8 @@ use tokio::time::{Instant, interval_at};
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 
 use crate::config::leading_int;
-use crate::core::{Event, Events, ExecParams, Hub, Refusal, UploadParams, checksum};
-use crate::protocol::{is_shell_kind, shell_kinds};
+use crate::core::{Event, Events, ExecParams, Hub, Refusal, UploadParams};
+use crate::protocol::{checksum, is_shell_kind, shell_kinds};
 
 /// A stream sends nothing between events, so a comment holds the connection open through a quiet stretch.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);

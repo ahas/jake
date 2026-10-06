@@ -4,12 +4,34 @@ use base64::Engine as _;
 use base64::alphabet;
 use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
 use serde_json::{Map, Number, Value, json};
+use sha2::{Digest as _, Sha256};
 
 /// The version every frame carries; a frame at another version is refused, not guessed at.
 pub const PROTOCOL_VERSION: i64 = 1;
 
 /// The decoded size of one file-transfer chunk, held far below either side's payload cap.
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+
+/// A transfer's content checksum, taken piece by piece: the sha256 of the bytes, in lowercase hex.
+#[derive(Clone, Default)]
+pub struct Checksum(Sha256);
+
+impl Checksum {
+  pub fn update(&mut self, data: &[u8]) {
+    self.0.update(data);
+  }
+
+  pub fn finish(self) -> String {
+    self.0.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+  }
+}
+
+/// The checksum of content held whole.
+pub fn checksum(data: &[u8]) -> String {
+  let mut sum = Checksum::default();
+  sum.update(data);
+  sum.finish()
+}
 
 const SHELL_KINDS: [&str; 3] = ["powershell", "wsl", "linux"];
 

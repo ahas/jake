@@ -5,7 +5,8 @@ mod config;
 mod control;
 mod core;
 mod link;
-mod protocol;
+
+use jake_protocol as protocol;
 
 use std::net::SocketAddr;
 use std::process::ExitCode;

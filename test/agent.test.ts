@@ -231,6 +231,8 @@ function agentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     maxPayloadBytes: DEFAULT_MAX_PAYLOAD_BYTES,
     execMaxOutputBytes: 8 * 1024 * 1024,
     execTimeoutMs: 300_000,
+    redialBaseMs: 1_000,
+    redialCapMs: 60_000,
     ...overrides,
   };
 }

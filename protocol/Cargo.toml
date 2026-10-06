@@ -1,0 +1,13 @@
+[package]
+name = "jake-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"

@@ -27,6 +27,10 @@ export interface AgentConfig {
   execMaxOutputBytes: number;
   /** The wall-clock ceiling on a single exec command before jake stops it, in milliseconds. */
   execTimeoutMs: number;
+  /** The first redial delay's ceiling, doubled per failed attempt up to `redialCapMs`. */
+  redialBaseMs: number;
+  /** The ceiling the redial delay never exceeds, however long the outage. */
+  redialCapMs: number;
 }
 
 // Defaults for the non-credential knobs. Credentials and the hub URL have no default: a process
@@ -40,6 +44,8 @@ const DEFAULT_WATCHDOG_STALE_MS = 180_000;
 const DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_REDIAL_BASE_MS = 1_000;
+const DEFAULT_REDIAL_CAP_MS = 60_000;
 const DEFAULT_CONTROL_PORT = 8791;
 
 function requireEnv(env: Env, name: string): string {
@@ -91,6 +97,8 @@ export function loadAgentConfig(env: Env = process.env): AgentConfig {
     maxPayloadBytes: optionalPositiveIntEnv(env, "JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES),
     execMaxOutputBytes: optionalPositiveIntEnv(env, "JAKE_EXEC_MAX_OUTPUT_BYTES", DEFAULT_EXEC_MAX_OUTPUT_BYTES),
     execTimeoutMs: optionalPositiveIntEnv(env, "JAKE_EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS),
+    redialBaseMs: optionalPositiveIntEnv(env, "JAKE_REDIAL_BASE_MS", DEFAULT_REDIAL_BASE_MS),
+    redialCapMs: optionalPositiveIntEnv(env, "JAKE_REDIAL_CAP_MS", DEFAULT_REDIAL_CAP_MS),
   };
 }
 

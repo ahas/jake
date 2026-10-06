@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
 const MANIFEST = join(ROOT, "hub", "Cargo.toml");
-const BINARY = join(ROOT, "hub", "target", "debug", "jake-hub");
+const BINARY = join(ROOT, "target", "debug", "jake-hub");
 
 /** The test seams the hub reads from its environment, set short so a liveness case takes milliseconds. */
 export interface HubSeams {

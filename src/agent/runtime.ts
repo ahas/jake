@@ -27,7 +27,6 @@ export interface RuntimeDeps {
   stableResetMs?: number;
 }
 
-const DEFAULT_BACKOFF: BackoffOptions = { baseMs: 1_000, capMs: 60_000, factor: 2 };
 const DEFAULT_MISSED_HEARTBEAT_LIMIT = 3;
 // A cap on the attempt counter so `factor ** attempt` cannot overflow on a very long outage; the
 // delay is already clamped to capMs well before this, so the counter only needs to stop growing.
@@ -75,7 +74,7 @@ export class AgentRuntime {
 
   /** Dial and redial forever, running one connection at a time, until `stop` is called. */
   async run(): Promise<void> {
-    const backoff = this.deps.backoff ?? DEFAULT_BACKOFF;
+    const backoff = this.deps.backoff ?? { baseMs: this.config.redialBaseMs, capMs: this.config.redialCapMs, factor: 2 };
     const random = this.deps.random ?? Math.random;
     const stableResetMs = this.deps.stableResetMs ?? this.config.heartbeatMs * 2;
     let attempt = 0;

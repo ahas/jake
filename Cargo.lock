@@ -395,19 +395,27 @@ name = "jake-hub"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64",
  "bytes",
  "dotenvy",
  "form_urlencoded",
  "futures-util",
  "http-body-util",
  "indexmap",
+ "jake-protocol",
  "rand 0.10.3",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "jake-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
