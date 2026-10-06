@@ -86,3 +86,31 @@ $f = "$env:TEMP\jake-page.png"
 & $edge --headless --disable-gpu --user-data-dir="$env:TEMP\jake-edge" --window-size=1280,800 --screenshot=$f https://example.com | Out-Null
 [Convert]::ToBase64String([IO.File]::ReadAllBytes($f)); Remove-Item $f' | base64 -d > page.png
 ```
+
+## ssh, and herdr, to a machine behind the tunnel
+
+- ssh reaches the agent's machine through a byte stream (docs/architecture.md, "Carrying a byte
+  stream"): the hub executable's connect mode is the `ProxyCommand`, so ssh talks to the machine's
+  own sshd as if it had dialled it. The machine needs an sshd, its port among the agent's
+  `JAKE_STREAM_PORTS`, and the main-host key in the account's authorized keys; docs/install.md has
+  the steps.
+- One `Host` block per machine in `~/.ssh/config` on main-host, named after the agent. `HostName`
+  is only the name ssh records the host key under, since the connection never dials it; `User` is
+  the account on that machine.
+
+```sshconfig
+Host jake_wsl
+  HostName jake_wsl
+  User ahas
+  ProxyCommand ~/repos/ahas/jake/target/release/jake-hub connect jake_wsl 22
+  ServerAliveInterval 30
+```
+
+- Then `ssh jake_wsl` logs in, and `scp` and `rsync -e ssh` work the same way.
+- herdr's saved SSH machines ride on the same entry, because herdr reaches a remote machine through
+  ssh. `herdr machine add jake_wsl` prepares the herdr server on the machine and saves it, and
+  `herdr --machine jake_wsl agent list` answers from it.
+- A refusal is written to standard error by the connect mode before ssh gives up: an agent that is
+  not attached, a port the agent does not offer, or a port nothing answers on. When the agent's
+  connection drops, ssh sees its connection close; once the agent has redialled, the next `ssh` gets
+  through.

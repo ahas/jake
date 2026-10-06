@@ -10,7 +10,8 @@ answers to it.
 - Every frame is a JSON object sent as text. Every frame carries a `type` naming its kind and a `v`
   giving the protocol version. A receiver that sees a version other than the one it speaks refuses
   the frame rather than guessing at it.
-- Binary payloads — a chunk of command output, or a chunk of a file transfer — ride inside a frame as
+- Binary payloads — a chunk of command output, a chunk of a file transfer, or a piece of a byte
+  stream — ride inside a frame as
   base64, alongside a declared decoded byte length. The length is declared so a receiver can refuse an
   oversized payload by reading one integer, before it allocates the decoded buffer. Each side carries
   its own size cap in configuration and applies it while decoding.
@@ -18,7 +19,7 @@ answers to it.
 ## Byte payloads
 
 - An **encoded-bytes** value is a declared byte length together with the base64 of exactly that many
-  bytes. Command output chunks and file-transfer chunks carry one.
+  bytes. Command output chunks, file-transfer chunks and byte-stream pieces carry one.
 - Decoding a byte payload re-checks the size cap and verifies that the decoded length equals the
   declared one; a mismatch is rejected as a malformed field.
 - The two sides do not negotiate their caps on the wire, so a frame that exceeds the receiver's cap is
@@ -30,9 +31,10 @@ answers to it.
 
 Connection handshake:
 
-- **hello** — agent to hub, first on a fresh connection: the agent's identity, its version, and the
-  list of shells this build can run. The list is just names; the protocol does not know what they
-  mean.
+- **hello** — agent to hub, first on a fresh connection: the agent's identity, its version, and its
+  capabilities: `exec:<shell>` for each shell this build can run, `transfer`, and `stream:<port>`
+  for each local port the agent lets a byte stream reach. The shell names are just names; the
+  protocol does not know what they mean.
 - **welcome** — hub to agent, accepting the hello and naming the hub's version.
 - **reject** — hub to agent, refusing the hello with a stated reason.
 
@@ -52,8 +54,9 @@ Command execution (streaming):
 - **cancel** — hub to agent: stop the run with this id, ending its whole process tree.
 
 - **error** — agent to hub, or hub to agent: a request failed — a spawn
-  failure, or a file-transfer failure such as a missing file, a permission denial, a full disk, or a
-  content that did not verify — carrying the id it answers, a short code, and a message.
+  failure, a file-transfer failure such as a missing file, a permission denial, a full disk, or a
+  content that did not verify, or a byte stream that could not be opened — carrying the id it
+  answers, a short code, and a message.
 
 File transfer (streaming):
 
@@ -77,6 +80,38 @@ File transfer (streaming):
   **error** frame carrying the transfer id, so a partial transfer is never taken for a whole one.
   The error travels the other way as well: a hub that cannot finish sending an upload says so with an
   **error** frame naming it, and the agent discards the temporary file it was writing.
+
+Byte streams:
+
+- **stream-open** — hub to agent: open a TCP connection to a port on the agent's own machine,
+  reached at `localhost`. It carries a caller-chosen id that every later frame of the stream echoes,
+  and the port. The agent opens only a port its own configuration allows, the same ports its hello
+  advertised as `stream:<port>`; any other is answered with an **error** frame coded
+  `port-not-allowed`, and a connection the port refuses or does not accept in time is answered with
+  one coded `connect-failed`.
+- **stream-opened** — agent to hub: the connection is up and bytes may flow both ways.
+- **stream-data** — either side: one piece of the stream's bytes, carrying the stream id, a sequence
+  number that orders the pieces of that direction from zero, and the bytes as an encoded-bytes
+  value. A piece is at most the stream chunk size, 64 KiB.
+- **stream-ack** — either side: the receiver of a stream's bytes has handed this many more of them
+  on to its own end — the TCP connection on the agent, the caller on the hub — carrying the stream id
+  and the byte count.
+- **stream-close** — either side: the stream is over in both directions, carrying the stream id and
+  a short reason. It is not answered. The agent sends it when the port closes its connection or a
+  write to it fails; the hub sends it when the caller goes away. A close for a stream already over is
+  ignored.
+
+A stream is paced by a window. Each sender may have at most the stream window, 1 MiB, of a stream's
+bytes sent and not yet acknowledged; once it reaches that, it sends nothing more of the stream until
+an ack reopens the window by the count it carries. A receiver acknowledges in batches, once a
+quarter of the window has been handed on since its last ack, so small interactive traffic is never
+held waiting for one. The window is what bounds the memory a stream holds on either side, because a
+receiver never holds more of a stream than the window, whatever the far end's speed. A piece out of
+sequence, or one that takes the receiver past the window, is a fault: the receiver ends the stream
+with a stream-close naming it.
+
+A stream lives on the connection it was opened over. When that connection drops, every stream on it
+is over on both sides, and nothing of a stream crosses to a later connection.
 
 Departure:
 
@@ -108,7 +143,8 @@ which of these went wrong, so a caller can tell them apart:
 - the type was not one of the known kinds;
 - the version was not the one this side speaks;
 - a required field was missing or the wrong type;
-- a declared payload — a byte chunk, or the exec command text — exceeded the size cap.
+- a declared payload — a byte chunk, a stream piece, or the exec command text — exceeded the size
+  cap.
 
 Unknown extra fields on an otherwise-valid frame are ignored, and the validated frame carries only
 the fields its kind defines.

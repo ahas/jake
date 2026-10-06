@@ -28,8 +28,9 @@ upload and download move a whole file over the tunnel's own frames â€” no scp â€
 against a checksum before reporting success; a download is written to <local> only once verified.
 
 Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
-exec; docs/recipes.md has them. The control token and port are read from the hub's configuration,
-never the command line.
+exec; docs/recipes.md has them, and the ProxyCommand line that carries ssh, and herdr, to a machine
+over the tunnel. The control token and port are read from the hub's configuration, never the
+command line.
 
 leave is irreversible: it deletes the executable, config, log, and autostart registrations and the
 agent does not come back. It refuses without --yes.
@@ -539,6 +540,7 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
       `  capabilities: ${agent.capabilities.length > 0 ? agent.capabilities.join(", ") : "(none)"}`,
       `  in-flight commands: ${agent.inFlight.length > 0 ? agent.inFlight.join(", ") : "(none)"}`,
     );
+    if ((agent.streams ?? []).length > 0) lines.push(`  open streams: ${agent.streams!.join(", ")}`);
   }
   for (const agent of snapshot.departed ?? []) {
     lines.push(`${agent.name} departed ${formatDuration(now - agent.departedAt)} ago`);

@@ -159,3 +159,23 @@ The console's `status` runs against the loopback control API, which is never exp
 is how you see, on main-host, which of 하스's agents have dialed in. The hub holds every agent at
 once, one per agent name, so a second machine's agent appears beside the first rather than in its
 place.
+
+## 7. ssh to a machine behind the tunnel
+
+The `ProxyCommand` that carries ssh to an agent's machine is the hub's own release binary, run in its
+connect mode: `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`. It is the binary
+the unit builds in step 2, so a hub restart brings it up to date as well, and it reads the control
+port and token from the same `hub.env`. Where a sweep of the build output has removed it, the first
+`systemctl --user restart jake-hub` builds it again.
+
+The machine side — an SSH server, the agent's `JAKE_STREAM_PORTS`, and main-host's key in the
+account's authorized keys — is in docs/install.md, and the `~/.ssh/config` block, with herdr's saved
+machines on top of it, in docs/recipes.md. With both in place:
+
+```sh
+bun ~/repos/ahas/jake/src/console/main.ts status   # the agent lists stream:22 among its capabilities
+ssh jake_wsl true && echo reached                   # the login runs over the tunnel
+```
+
+A hub restart drops every agent's connection, and every ssh session riding one ends with it; ssh
+connects again once the agents have redialled, a few seconds later.

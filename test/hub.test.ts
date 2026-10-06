@@ -15,7 +15,8 @@ import {
   streamChecksum,
   type Frame,
 } from "../src/protocol";
-import { ensureHubBuilt, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
+import { ensureHubBuilt, startConnect, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
+import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
 import { ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
 
@@ -30,6 +31,9 @@ const agents: FakeAgent[] = [];
 const readers: SseReader[] = [];
 const realAgents: AgentProcess[] = [];
 const dirs: string[] = [];
+const callers: StreamCaller[] = [];
+const connects: Bun.Subprocess[] = [];
+const ports: StandInPort[] = [];
 
 // A build after a change takes far longer than one case may, so both programs are built before any.
 beforeAll(() => {
@@ -39,6 +43,9 @@ beforeAll(() => {
 
 afterEach(async () => {
   for (const reader of readers.splice(0)) reader.close();
+  for (const caller of callers.splice(0)) caller.ws.close();
+  for (const connect of connects.splice(0)) connect.kill("SIGKILL");
+  for (const port of ports.splice(0)) port.stop();
   for (const agent of agents.splice(0)) agent.close();
   await Promise.all(realAgents.splice(0).map((agent) => agent.stop()));
   await Promise.all(running.splice(0).map((hub) => hub.stop()));
@@ -257,10 +264,10 @@ function openSse(url: string, init: RequestInit): SseReader {
 }
 
 /** The agent itself, as its own process, under a home of its own. */
-function startRealAgent(hubUrl: string, secret: string): AgentProcess {
+function startRealAgent(hubUrl: string, secret: string, env: Record<string, string> = {}): AgentProcess {
   const home = mkdtempSync(join(tmpdir(), "jake-hub-agent-"));
   dirs.push(home);
-  const agent = startAgentProcess({ hubUrl, secret, name: "hass", home, env: { JAKE_REDIAL_BASE_MS: "20" } });
+  const agent = startAgentProcess({ hubUrl, secret, name: "hass", home, env: { JAKE_REDIAL_BASE_MS: "20", ...env } });
   realAgents.push(agent);
   return agent;
 }
@@ -279,6 +286,44 @@ async function until(pred: () => boolean | Promise<boolean>, tries = 400): Promi
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("condition was not met in time");
+}
+
+// --- A stream's caller: a WebSocket on the control API's /connect -------------------------------
+
+class StreamCaller {
+  readonly ws: WebSocket;
+  readonly received: Buffer[] = [];
+  closeCode: number | null = null;
+  closeReason = "";
+
+  constructor(hub: HubProcess, query: string) {
+    this.ws = new WebSocket(`ws://127.0.0.1:${hub.controlPort}/connect?${query}`, {
+      headers: { Authorization: `Bearer ${CONTROL}` },
+    } as never);
+    this.ws.binaryType = "arraybuffer";
+    this.ws.addEventListener("message", (event) => {
+      this.received.push(Buffer.from(event.data as ArrayBuffer));
+    });
+    this.ws.addEventListener("close", (event) => {
+      this.closeCode = event.code;
+      this.closeReason = event.reason;
+    });
+  }
+
+  get bytes(): Buffer {
+    return Buffer.concat(this.received);
+  }
+
+  async closed(): Promise<{ code: number | null; reason: string }> {
+    await until(() => this.closeCode !== null);
+    return { code: this.closeCode, reason: this.closeReason };
+  }
+}
+
+function openCaller(hub: HubProcess, query: string): StreamCaller {
+  const caller = new StreamCaller(hub, query);
+  callers.push(caller);
+  return caller;
 }
 
 const utf8 = new TextEncoder();
@@ -831,6 +876,107 @@ describe("file transfer over the control API", () => {
     expect(up.status).toBe(409);
     const down = await control(hub, "/download?path=/x", { method: "POST" });
     expect(down.status).toBe(409);
+  });
+});
+
+describe("byte streams", () => {
+  // A caller's stream as far as the agent's stream-opened: its id.
+  async function opened(hub: HubProcess, agent: FakeAgent): Promise<{ caller: StreamCaller; id: string }> {
+    const caller = openCaller(hub, "port=22");
+    const open = (await agent.waitFor((f) => f.type === "stream-open")) as { id: string; port: number };
+    expect(open.port).toBe(22);
+    agent.send({ type: "stream-opened", v: V, id: open.id });
+    return { caller, id: open.id };
+  }
+
+  test("carries bytes both ways between a caller and the agent, acknowledging what the caller took in batches", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["stream:22"]);
+    const { caller, id } = await opened(hub, agent);
+
+    caller.ws.send(utf8.encode("SSH-2.0-client\r\n"));
+    const up = (await agent.waitFor((f) => f.type === "stream-data" && f.id === id)) as { seq: number; chunk: { base64: string } };
+    expect(up.seq).toBe(0);
+    expect(decodeChunk(up.chunk)).toBe("SSH-2.0-client\r\n");
+
+    const piece = randomBytes(64 * 1024);
+    for (let seq = 0; seq < 5; seq += 1) agent.send({ type: "stream-data", v: V, id, seq, chunk: encodeBytes(piece) });
+    await until(() => caller.bytes.length === 5 * piece.length);
+    expect(caller.bytes.equals(Buffer.concat(Array(5).fill(piece)))).toBe(true);
+    expect(await agent.waitFor((f) => f.type === "stream-ack" && f.id === id)).toMatchObject({ bytes: 4 * piece.length });
+
+    expect((await (await control(hub, "/status")).json()).agents[0].streams).toEqual([id]);
+    agent.send({ type: "stream-close", v: V, id, reason: "the port closed the connection" });
+    expect(await caller.closed()).toEqual({ code: 1000, reason: "the port closed the connection" });
+    expect((await (await control(hub, "/status")).json()).agents[0].streams).toEqual([]);
+  });
+
+  test("a port the agent does not offer is refused before anything crosses the tunnel", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["stream:22"]);
+    const refused = await control(hub, "/connect?port=2222");
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ code: "port-not-offered" });
+    expect(agent.received.some((f) => f.type === "stream-open")).toBe(false);
+  });
+
+  test("an open the agent refuses, or an agent that drops, ends the caller's stream as failed with the reason", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["stream:22"]);
+    const refusedCaller = openCaller(hub, "port=22");
+    const open = (await agent.waitFor((f) => f.type === "stream-open")) as { id: string };
+    agent.send({ type: "error", v: V, id: open.id, code: "connect-failed", message: "localhost:22: Connection refused" });
+    const refused = await refusedCaller.closed();
+    expect(refused.code).toBe(4000);
+    expect(refused.reason).toContain("[connect-failed]");
+
+    const { caller } = await opened(hub, agent);
+    agent.close();
+    expect(await caller.closed()).toEqual({ code: 4000, reason: "agent connection closed" });
+  });
+
+  test("a caller that goes away closes the stream on the agent", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["stream:22"]);
+    const { caller, id } = await opened(hub, agent);
+    caller.ws.close();
+    expect(await agent.waitFor((f) => f.type === "stream-close" && f.id === id)).toMatchObject({ reason: "the caller closed the stream" });
+  });
+
+  test("the connect mode joins a real agent's port to its standard input and output, past the window, and ends when the port closes", async () => {
+    const hub = await launch();
+    const port = new StandInPort(true);
+    ports.push(port);
+    startRealAgent(`ws://127.0.0.1:${hub.agentPort}`, SECRET, { JAKE_STREAM_PORTS: String(port.port) });
+    await until(async () => (await (await control(hub, "/status")).json()).agents.length === 1);
+
+    const connect = startConnect(hub, CONTROL, ["hass", String(port.port)]);
+    connects.push(connect);
+    const echoed: Uint8Array[] = [];
+    let echoedBytes = 0;
+    void (async () => {
+      for await (const piece of connect.stdout) {
+        echoed.push(piece);
+        echoedBytes += piece.byteLength;
+      }
+    })();
+    const content = randomBytes(3 * 1024 * 1024);
+    connect.stdin.write(content);
+    await connect.stdin.flush();
+    await until(() => echoedBytes === content.length, 4_000);
+    expect(checksum(Buffer.concat(echoed))).toBe(checksum(content));
+
+    port.end();
+    expect(await connect.exited).toBe(0);
+  });
+
+  test("the connect mode says why the hub refused the stream, and fails", async () => {
+    const hub = await launch();
+    await attach(hub.agentPort, ["exec:linux"]);
+    const connect = startConnect(hub, CONTROL, ["hass-desktop"]);
+    connects.push(connect);
+    expect(await connect.exited).toBe(1);
+    expect(await new Response(connect.stderr).text()).toContain("(HTTP 403): agent hass-desktop does not offer port 22");
   });
 });
 

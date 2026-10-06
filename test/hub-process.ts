@@ -63,6 +63,19 @@ async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string
   }
 }
 
+/** The hub executable in its connect mode, against a running hub: a byte stream on its standard input and output. */
+export function startConnect(hub: HubProcess, controlToken: string, args: string[]): Bun.Subprocess<"pipe", "pipe", "pipe"> {
+  ensureHubBuilt();
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "",
+    HOME: process.env.HOME ?? "",
+    JAKE_HUB_ENV: join(tmpdir(), "jake-connect-no-such-file.env"),
+    JAKE_CONTROL_PORT: String(hub.controlPort),
+    JAKE_CONTROL_TOKEN: controlToken,
+  };
+  return Bun.spawn([BINARY, "connect", ...args], { cwd: ROOT, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+}
+
 /** Start a hub with the given secret and control token, returning once it says it is listening. */
 export async function startHubProcess(secret: string, controlToken: string, seams: HubSeams = {}): Promise<HubProcess> {
   ensureHubBuilt();

@@ -13,6 +13,10 @@ const DEFAULT_EXEC_MAX_OUTPUT_BYTES: i64 = 8 * 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const DEFAULT_REDIAL_BASE_MS: i64 = 1_000;
 const DEFAULT_REDIAL_CAP_MS: i64 = 60_000;
+// The SSH port: what a byte stream is for, unless the machine's config says otherwise.
+const DEFAULT_STREAM_PORTS: &str = "22";
+// The value of the port list that lets no stream reach the machine.
+const NO_STREAM_PORTS: &str = "none";
 
 /// What the agent needs to dial the hub, serve it, and keep itself alive.
 #[derive(Clone, Debug)]
@@ -28,6 +32,8 @@ pub struct AgentConfig {
   pub exec_timeout: Duration,
   pub redial_base: Duration,
   pub redial_cap: Duration,
+  /// The local ports a byte stream from the hub may reach.
+  pub stream_ports: Vec<u16>,
 }
 
 /// The environment the agent runs against: agent.env beside the executable, under the process's own.
@@ -87,6 +93,24 @@ impl Source<'_> {
   fn millis(&self, name: &str, fallback: i64) -> Result<Duration, String> {
     self.positive(name, fallback).map(Duration::from_millis)
   }
+
+  // A comma-separated list of port numbers, or the word that names none.
+  fn ports(&self, name: &str, fallback: &str) -> Result<Vec<u16>, String> {
+    let raw = self.present(name).unwrap_or(fallback).trim();
+    if raw.eq_ignore_ascii_case(NO_STREAM_PORTS) {
+      return Ok(Vec::new());
+    }
+    let malformed =
+      || format!("{name} must be a comma-separated list of port numbers, or {NO_STREAM_PORTS}.");
+    let mut ports = Vec::new();
+    for item in raw.split(',') {
+      let port = item.trim().parse::<u16>().ok().filter(|port| *port > 0).ok_or_else(malformed)?;
+      if !ports.contains(&port) {
+        ports.push(port);
+      }
+    }
+    Ok(ports)
+  }
 }
 
 /// Read the agent's configuration, naming the first key that is missing or malformed.
@@ -105,6 +129,7 @@ pub fn read(env: &HashMap<String, String>) -> Result<AgentConfig, String> {
     exec_timeout: env.millis("JAKE_EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS)?,
     redial_base: env.millis("JAKE_REDIAL_BASE_MS", DEFAULT_REDIAL_BASE_MS)?,
     redial_cap: env.millis("JAKE_REDIAL_CAP_MS", DEFAULT_REDIAL_CAP_MS)?,
+    stream_ports: env.ports("JAKE_STREAM_PORTS", DEFAULT_STREAM_PORTS)?,
   })
 }
 
@@ -127,6 +152,24 @@ mod tests {
     assert_eq!(config.watchdog_stale, Duration::from_secs(180));
     assert_eq!(config.exec_max_output_bytes, 8 * 1024 * 1024);
     assert_eq!(config.redial_cap, Duration::from_secs(60));
+    assert_eq!(config.stream_ports, [22]);
+  }
+
+  #[test]
+  fn reads_the_stream_ports_as_a_list_or_none() {
+    let with = |ports: &str| {
+      let mut pairs = env(&REQUIRED);
+      pairs.insert("JAKE_STREAM_PORTS".into(), ports.into());
+      read(&pairs)
+    };
+    assert_eq!(with(" 22, 2222,22 ").unwrap().stream_ports, [22, 2222]);
+    assert_eq!(with("none").unwrap().stream_ports, Vec::<u16>::new());
+    for bad in ["22,", "ssh", "0", "70000"] {
+      assert_eq!(
+        with(bad).unwrap_err(),
+        "JAKE_STREAM_PORTS must be a comma-separated list of port numbers, or none."
+      );
+    }
   }
 
   #[test]

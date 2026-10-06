@@ -8,6 +8,7 @@ mod exec;
 mod log;
 mod pair;
 mod platform;
+mod stream;
 mod transfer;
 
 use std::collections::HashMap;

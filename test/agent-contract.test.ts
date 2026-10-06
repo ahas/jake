@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { StandInPort } from "./stand-in-port";
 import { AGENT_COMMAND, ensureAgentBuilt, StandInHub, startAgentProcess, until, type AgentProcess, type HubConnection, type WireFrame } from "./agent-process";
 
 const SECRET = "contract-secret";
@@ -18,6 +19,7 @@ function tempDir(): string {
 
 const hubs: StandInHub[] = [];
 const agents: AgentProcess[] = [];
+const standInPorts: StandInPort[] = [];
 
 // A build after a change takes far longer than one case may, so the agent is built before any.
 beforeAll(ensureAgentBuilt, 600_000);
@@ -25,6 +27,7 @@ beforeAll(ensureAgentBuilt, 600_000);
 afterAll(async () => {
   await Promise.all(agents.map((agent) => agent.stop()));
   for (const hub of hubs) hub.stop();
+  for (const port of standInPorts) port.stop();
   for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -90,7 +93,7 @@ describe("the handshake and the connection", () => {
 
   test("dials with the shared secret and says hello with its name, version and this host's shells", () => {
     const hello = first.frames[0] as WireFrame;
-    expect(hello).toMatchObject({ type: "hello", v: 1, agent: "box", capabilities: ["exec:linux", "transfer"] });
+    expect(hello).toMatchObject({ type: "hello", v: 1, agent: "box", capabilities: ["exec:linux", "transfer", "stream:22"] });
     expect(typeof hello.agentVersion).toBe("string");
     expect(hello.agentVersion).not.toBe("");
   });
@@ -406,6 +409,77 @@ describe("file transfer", () => {
       connection.send({ type: "transfer-begin", id, direction: "download", path, total: null, checksum: null });
       expect(await connection.next((f) => f.id === id, `the ${code} error`)).toMatchObject({ type: "error", code });
     }
+  });
+});
+
+describe("byte streams", () => {
+  const WINDOW = 1024 * 1024;
+  let connection: HubConnection;
+  let port: StandInPort;
+  let silentPort: number;
+
+  beforeAll(async () => {
+    port = new StandInPort();
+    standInPorts.push(port);
+    const vacated = new StandInPort();
+    silentPort = vacated.port;
+    vacated.stop();
+    const hub = standInHub();
+    agent(hub.url, { JAKE_STREAM_PORTS: `${port.port},${silentPort}` });
+    connection = await hub.welcomed(0);
+  });
+
+  const sent = (id: string) => Buffer.concat(connection.all((f) => f.id === id && f.type === "stream-data").map(bytesOf));
+
+  async function open(id: string): Promise<void> {
+    connection.send({ type: "stream-open", id, port: port.port });
+    await connection.next((f) => f.id === id && f.type === "stream-opened", `${id} opened`);
+  }
+
+  test("advertises every port its config allows a stream to reach", () => {
+    expect((connection.frames[0] as WireFrame).capabilities).toEqual(["exec:linux", "transfer", `stream:${port.port}`, `stream:${silentPort}`]);
+  });
+
+  test("carries bytes both ways, and ends the stream when the port closes its connection", async () => {
+    await open("s1");
+    const hello = Buffer.from("SSH-2.0-client\r\n");
+    connection.send({ type: "stream-data", id: "s1", seq: 0, chunk: { bytes: hello.length, base64: hello.toString("base64") } });
+    await until("the bytes at the port", () => port.bytes.equals(hello));
+    port.write(Buffer.from("SSH-2.0-server\r\n"));
+    await until("the port's bytes at the hub", () => sent("s1").toString() === "SSH-2.0-server\r\n");
+    port.end();
+    expect(await connection.next((f) => f.id === "s1" && f.type === "stream-close", "the close")).toMatchObject({ reason: "the port closed the connection" });
+    await until("the port to see its connection closed", () => port.closed === 1);
+  });
+
+  test("sends no more than the window until an ack reopens it, and acknowledges what it wrote in batches", async () => {
+    const closedBefore = port.closed;
+    await open("s2");
+    const content = randomBytes(2 * WINDOW);
+    port.write(content);
+    await until("a window's worth", () => sent("s2").length >= WINDOW);
+    expect((await run(connection, "true")).end.type).toBe("exit");
+    expect(sent("s2").length).toBe(WINDOW);
+    connection.send({ type: "stream-ack", id: "s2", bytes: WINDOW });
+    await until("the rest", () => sent("s2").length === content.length);
+    expect(sent("s2").equals(content)).toBe(true);
+    expect(connection.all((f) => f.id === "s2" && f.type === "stream-data").every((f) => bytesOf(f).length <= 64 * 1024)).toBe(true);
+
+    const piece = randomBytes(64 * 1024);
+    for (let seq = 0; seq < 5; seq += 1) {
+      connection.send({ type: "stream-data", id: "s2", seq, chunk: { bytes: piece.length, base64: piece.toString("base64") } });
+    }
+    expect(await connection.next((f) => f.id === "s2" && f.type === "stream-ack", "the ack")).toMatchObject({ bytes: 4 * piece.length });
+
+    connection.send({ type: "stream-close", id: "s2", reason: "the caller closed the stream" });
+    await until("the port's connection to close", () => port.closed === closedBefore + 1);
+  });
+
+  test("refuses a port its config does not allow, and names a port nothing answers on", async () => {
+    connection.send({ type: "stream-open", id: "s3", port: 9 });
+    expect(await connection.next((f) => f.id === "s3", "the refusal")).toMatchObject({ type: "error", code: "port-not-allowed" });
+    connection.send({ type: "stream-open", id: "s4", port: silentPort });
+    expect(await connection.next((f) => f.id === "s4", "the failure")).toMatchObject({ type: "error", code: "connect-failed" });
   });
 });
 

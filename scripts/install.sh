@@ -29,6 +29,9 @@ Options:
   --hub-url <url>       the hub to attach to (default: $DEFAULT_HUB_URL)
   --secret <secret>     the shared secret, matching the hub's JAKE_SECRET
   --agent-name <name>   this agent's name
+  --stream-ports <list> the local ports a byte stream from the hub may reach, comma-separated, or
+                        none (default: 22, this machine's sshd)
+  --ssh-key <key>       a public key to add to ~/.ssh/authorized_keys, so ssh over the hub logs in
   --non-interactive     never prompt; the secret and name must be passed or already in agent.env
   --print-config        resolve the values, print the hub URL and agent name, and install nothing
   -h, --help            show this help
@@ -40,6 +43,8 @@ EOF
 HUB_URL=""
 SECRET=""
 AGENT_NAME=""
+STREAM_PORTS=""
+SSH_KEY=""
 NON_INTERACTIVE=0
 PRINT_CONFIG=0
 while [ $# -gt 0 ]; do
@@ -50,12 +55,20 @@ while [ $# -gt 0 ]; do
     --secret=*) SECRET="${1#*=}"; shift ;;
     --agent-name) AGENT_NAME="${2:-}"; shift 2 ;;
     --agent-name=*) AGENT_NAME="${1#*=}"; shift ;;
+    --stream-ports) STREAM_PORTS="${2:-}"; shift 2 ;;
+    --stream-ports=*) STREAM_PORTS="${1#*=}"; shift ;;
+    --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
+    --ssh-key=*) SSH_KEY="${1#*=}"; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+if [ -n "$STREAM_PORTS" ] && ! [[ "$STREAM_PORTS" =~ ^(none|[0-9]{1,5}(,[0-9]{1,5})*)$ ]]; then
+  die "--stream-ports takes port numbers separated by commas, or none (got $STREAM_PORTS)"
+fi
 
 # --- host checks ---------------------------------------------------------------------------------
 
@@ -157,6 +170,7 @@ AGENT_NAME="$(resolve "$AGENT_NAME" JAKE_AGENT_NAME 'Agent name' 0)"
 
 if [ "$PRINT_CONFIG" -eq 1 ]; then
   printf 'JAKE_HUB_URL=%s\nJAKE_AGENT_NAME=%s\n' "$HUB_URL" "$AGENT_NAME"
+  [ -z "$STREAM_PORTS" ] || printf 'JAKE_STREAM_PORTS=%s\n' "$STREAM_PORTS"
   exit 0
 fi
 
@@ -206,9 +220,36 @@ fi
 set_env_key "$tmp_env" JAKE_HUB_URL "$HUB_URL"
 set_env_key "$tmp_env" JAKE_SECRET "$SECRET"
 set_env_key "$tmp_env" JAKE_AGENT_NAME "$AGENT_NAME"
+[ -z "$STREAM_PORTS" ] || set_env_key "$tmp_env" JAKE_STREAM_PORTS "$STREAM_PORTS"
 mv -f "$tmp_env" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 ok "config written (the secret stays on this machine only)"
+
+# --- the SSH side of a byte stream: the key it logs in with, and an sshd to answer -----------------
+
+if [ -n "$SSH_KEY" ]; then
+  step "adding the SSH key to ~/.ssh/authorized_keys"
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  touch "$HOME/.ssh/authorized_keys"
+  chmod 600 "$HOME/.ssh/authorized_keys"
+  if grep -qxF -- "$SSH_KEY" "$HOME/.ssh/authorized_keys"; then
+    ok "the key was already there"
+  else
+    printf '%s\n' "$SSH_KEY" >> "$HOME/.ssh/authorized_keys"
+    ok "key added"
+  fi
+fi
+
+ports="$(env_value "$ENV_FILE" JAKE_STREAM_PORTS)"
+ports="${ports:-22}"
+if [ "$ports" != "none" ]; then
+  for port in ${ports//,/ }; do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      warn "nothing answers on port $port here, so a stream to it will fail. For ssh, install and start an sshd (on Debian or Ubuntu: sudo apt install openssh-server && sudo systemctl enable --now ssh)."
+    fi
+  done
+fi
 
 # --- register the systemd user service and the uninstaller ---------------------------------------
 

@@ -12,6 +12,8 @@ export interface AgentStatus {
   lastPongAt: number;
   /** The ids of the commands still streaming on this agent. */
   inFlight: string[];
+  /** The ids of the byte streams open to this agent's machine; absent from a hub that carries none. */
+  streams?: string[];
 }
 
 /** An agent that was uninstalled, and when the hub recorded it as gone. */

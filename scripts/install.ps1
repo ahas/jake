@@ -30,6 +30,13 @@
 .PARAMETER AgentName
   This agent's identity. Prompted for if omitted.
 
+.PARAMETER StreamPorts
+  The local ports a byte stream from the hub may reach, comma-separated, or none. Left out, agent.env
+  keeps what it has, and the agent's default is 22, this machine's OpenSSH server.
+
+.PARAMETER SshKey
+  A public key to add to this user's ~\.ssh\authorized_keys, so ssh over the hub logs in with it.
+
 .PARAMETER InstallDir
   Where to install. Defaults to %LOCALAPPDATA%\Programs\jake (a per-user, space-free location).
 
@@ -42,6 +49,8 @@ param(
   [string]$HubUrl,
   [string]$Secret,
   [string]$AgentName,
+  [string]$StreamPorts,
+  [string]$SshKey,
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\jake",
   [switch]$NonInteractive
 )
@@ -112,6 +121,10 @@ function Resolve-Value($current, $key, $prompt, [switch]$secret, $fallback) {
 
 Write-Host "jake agent installer" -ForegroundColor White
 
+if ($StreamPorts -and $StreamPorts -notmatch '^(none|[0-9]{1,5}(,[0-9]{1,5})*)$') {
+  throw "-StreamPorts takes port numbers separated by commas, or none (got $StreamPorts)"
+}
+
 # Resolve the payload: the build folder this script sits in, or a temp folder downloaded from the base
 # when the script is run through the one-liner (irm | iex), where there is no build folder beside it.
 $TempPayload = $null
@@ -178,8 +191,43 @@ function Set-EnvKey([System.Collections.Generic.List[string]]$lines, $key, $valu
 Set-EnvKey $lines 'JAKE_HUB_URL' $HubUrl
 Set-EnvKey $lines 'JAKE_SECRET' $Secret
 Set-EnvKey $lines 'JAKE_AGENT_NAME' $AgentName
+if ($StreamPorts) { Set-EnvKey $lines 'JAKE_STREAM_PORTS' $StreamPorts }
 Set-Content -LiteralPath $envPath -Value $lines -Encoding UTF8
 Write-Ok "config written (credential stays on this machine only)"
+
+# --- the SSH side of a byte stream: the key it logs in with, and an sshd to answer -----------------
+
+if ($SshKey) {
+  Write-Step "adding the SSH key to ~\.ssh\authorized_keys"
+  $sshDir = Join-Path $env:USERPROFILE '.ssh'
+  $keys = Join-Path $sshDir 'authorized_keys'
+  New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+  if ((Test-Path $keys) -and ((Get-Content -LiteralPath $keys) -contains $SshKey)) {
+    Write-Ok "the key was already there"
+  } else {
+    Add-Content -LiteralPath $keys -Value $SshKey -Encoding ascii
+    Write-Ok "key added"
+  }
+  # OpenSSH reads an administrator's keys from one machine-wide file instead, which needs elevation.
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator) -or
+    ((whoami /groups) -match 'S-1-5-32-544')
+  if ($admin) {
+    Write-Warn2 "this account is an administrator, so OpenSSH reads its keys from C:\ProgramData\ssh\administrators_authorized_keys; add the key there from an elevated PowerShell (see INSTALL.md)."
+  }
+}
+
+$ports = Get-EnvValue $envPath 'JAKE_STREAM_PORTS'
+if (-not $ports) { $ports = '22' }
+if ($ports -ne 'none') {
+  foreach ($port in $ports.Split(',')) {
+    $probe = New-Object System.Net.Sockets.TcpClient
+    try { $answered = $probe.ConnectAsync('127.0.0.1', [int]$port).Wait(1000) } catch { $answered = $false } finally { $probe.Dispose() }
+    if (-not $answered) {
+      Write-Warn2 "nothing answers on port $port here, so a stream to it will fail. For ssh, install and start the OpenSSH server (see INSTALL.md)."
+    }
+  }
+}
 
 # --- register the three anchors for both run modes ----------------------------------------------
 # These mirror the agent's own anchor commands exactly, so the watchdog's per-tick rewrite keeps the

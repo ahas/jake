@@ -2,6 +2,7 @@
 
 mod agent_server;
 mod config;
+mod connect;
 mod control;
 mod core;
 mod departed;
@@ -88,6 +89,19 @@ async fn run() -> Result<(), String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  if args.first().map(String::as_str) == Some(connect::MODE) {
+    let code = match connect::run(&args[1..]).await {
+      Ok(()) => 0,
+      Err(message) => {
+        eprintln!("jake-hub connect: {message}");
+        1
+      }
+    };
+    // A read of standard input cannot be cancelled, so the process ends here rather than waiting on
+    // one at the runtime's shutdown.
+    std::process::exit(code);
+  }
   match run().await {
     Ok(()) => ExitCode::SUCCESS,
     Err(message) => {

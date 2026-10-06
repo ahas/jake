@@ -44,6 +44,12 @@ export function isTransferDirection(value: unknown): value is TransferDirection 
  */
 export const TRANSFER_CHUNK_BYTES = 256 * 1024;
 
+/** The most bytes one stream-data frame carries. */
+export const STREAM_CHUNK_BYTES = 64 * 1024;
+
+/** The most bytes of a stream a sender may have sent and not yet seen acknowledged. */
+export const STREAM_WINDOW_BYTES = 1024 * 1024;
+
 /** The hash a transfer's content checksum is computed with, so both sides agree byte-for-byte. */
 export const CHECKSUM_ALGORITHM = "sha256";
 
@@ -209,6 +215,46 @@ export interface TransferEndFrame {
   checksum: string;
 }
 
+/** Hub → agent: open a TCP connection to `port` on the agent's own machine, for the stream `id`. */
+export interface StreamOpenFrame {
+  type: "stream-open";
+  v: number;
+  id: string;
+  port: number;
+}
+
+/** Agent → hub: the stream's connection is up and bytes may flow both ways. */
+export interface StreamOpenedFrame {
+  type: "stream-opened";
+  v: number;
+  id: string;
+}
+
+/** Either side: one piece of a stream's bytes, in order by `seq` within its direction. */
+export interface StreamDataFrame {
+  type: "stream-data";
+  v: number;
+  id: string;
+  seq: number;
+  chunk: EncodedBytes;
+}
+
+/** Either side: the receiver has handed on `bytes` more of the stream, reopening the sender's window. */
+export interface StreamAckFrame {
+  type: "stream-ack";
+  v: number;
+  id: string;
+  bytes: number;
+}
+
+/** Either side: the stream is over in both directions, and why. */
+export interface StreamCloseFrame {
+  type: "stream-close";
+  v: number;
+  id: string;
+  reason: string;
+}
+
 /** Either side: a liveness probe carrying the sender's clock. */
 export interface PingFrame {
   type: "ping";
@@ -237,6 +283,11 @@ export type Frame =
   | TransferBeginFrame
   | TransferChunkFrame
   | TransferEndFrame
+  | StreamOpenFrame
+  | StreamOpenedFrame
+  | StreamDataFrame
+  | StreamAckFrame
+  | StreamCloseFrame
   | PingFrame
   | PongFrame;
 
@@ -295,6 +346,11 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<FrameType>([
   "transfer-begin",
   "transfer-chunk",
   "transfer-end",
+  "stream-open",
+  "stream-opened",
+  "stream-data",
+  "stream-ack",
+  "stream-close",
   "ping",
   "pong",
 ]);
@@ -523,6 +579,40 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
       if (!isInt(parsed.total) || parsed.total < 0) return fail("bad-field", "transfer-end.total must be a non-negative integer");
       if (!isString(parsed.checksum)) return fail("bad-field", "transfer-end.checksum must be a string");
       return { ok: true, frame: { type, v, id: parsed.id, total: parsed.total, checksum: parsed.checksum } };
+    }
+
+    case "stream-open": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-open.id must be a string");
+      if (!isInt(parsed.port) || parsed.port < 0 || parsed.port > 65535) {
+        return fail("bad-field", "stream-open.port must be a port number");
+      }
+      return { ok: true, frame: { type, v, id: parsed.id, port: parsed.port } };
+    }
+
+    case "stream-opened": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-opened.id must be a string");
+      return { ok: true, frame: { type, v, id: parsed.id } };
+    }
+
+    case "stream-data": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-data.id must be a string");
+      if (!isInt(parsed.seq) || parsed.seq < 0) return fail("bad-field", "stream-data.seq must be a non-negative integer");
+      const chunkError = checkEncodedBytes(parsed.chunk, "stream-data.chunk", maxPayloadBytes);
+      if (chunkError) return { ok: false, error: chunkError };
+      const chunk = parsed.chunk as EncodedBytes;
+      return { ok: true, frame: { type, v, id: parsed.id, seq: parsed.seq, chunk: { bytes: chunk.bytes, base64: chunk.base64 } } };
+    }
+
+    case "stream-ack": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-ack.id must be a string");
+      if (!isInt(parsed.bytes) || parsed.bytes < 0) return fail("bad-field", "stream-ack.bytes must be a non-negative integer");
+      return { ok: true, frame: { type, v, id: parsed.id, bytes: parsed.bytes } };
+    }
+
+    case "stream-close": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-close.id must be a string");
+      if (!isString(parsed.reason)) return fail("bad-field", "stream-close.reason must be a string");
+      return { ok: true, frame: { type, v, id: parsed.id, reason: parsed.reason } };
     }
 
     case "ping":

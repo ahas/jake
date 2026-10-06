@@ -50,4 +50,14 @@ describe("install.sh prompts", () => {
     expect(code).toBe(0);
     expect(output).toContain("JAKE_HUB_URL=wss://jake.example.org");
   });
+
+  test("the stream ports are taken as a list of port numbers, and anything else stops the install", async () => {
+    const given = ["--non-interactive", "--secret", "s", "--agent-name", "n", "--stream-ports"];
+    const listed = await run([...given, "22,2222"], "");
+    expect(listed.code).toBe(0);
+    expect(listed.output).toContain("JAKE_STREAM_PORTS=22,2222");
+    const refused = await run([...given, "ssh"], "");
+    expect(refused.code).not.toBe(0);
+    expect(refused.output).toContain("--stream-ports takes port numbers separated by commas, or none (got ssh)");
+  });
 });

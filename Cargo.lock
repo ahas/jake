@@ -481,6 +481,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -490,6 +491,7 @@ dependencies = [
  "base64",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

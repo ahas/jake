@@ -6,6 +6,10 @@ use base64::engine::{GeneralPurpose, GeneralPurposeConfig};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest as _, Sha256};
 
+mod stream;
+
+pub use stream::{ReceiveWindow, STREAM_ACK_BYTES, STREAM_CHUNK_BYTES, STREAM_WINDOW_BYTES, SendWindow};
+
 /// The version every frame carries; a frame at another version is refused, not guessed at.
 pub const PROTOCOL_VERSION: i64 = 1;
 
@@ -177,6 +181,26 @@ pub enum Frame {
     total: u64,
     checksum: String,
   },
+  StreamOpen {
+    id: String,
+    port: u16,
+  },
+  StreamOpened {
+    id: String,
+  },
+  StreamData {
+    id: String,
+    seq: u64,
+    chunk: EncodedBytes,
+  },
+  StreamAck {
+    id: String,
+    bytes: u64,
+  },
+  StreamClose {
+    id: String,
+    reason: String,
+  },
   Ping {
     ts: Number,
   },
@@ -202,6 +226,11 @@ impl Frame {
       Self::TransferBegin { .. } => "transfer-begin",
       Self::TransferChunk { .. } => "transfer-chunk",
       Self::TransferEnd { .. } => "transfer-end",
+      Self::StreamOpen { .. } => "stream-open",
+      Self::StreamOpened { .. } => "stream-opened",
+      Self::StreamData { .. } => "stream-data",
+      Self::StreamAck { .. } => "stream-ack",
+      Self::StreamClose { .. } => "stream-close",
       Self::Ping { .. } => "ping",
       Self::Pong { .. } => "pong",
     }
@@ -241,7 +270,8 @@ impl Frame {
       }
       Self::Stdout { id, seq, chunk }
       | Self::Stderr { id, seq, chunk }
-      | Self::TransferChunk { id, seq, chunk } => {
+      | Self::TransferChunk { id, seq, chunk }
+      | Self::StreamData { id, seq, chunk } => {
         json!({ "id": id, "seq": seq, "chunk": chunk.to_json() })
       }
       Self::Exit {
@@ -250,7 +280,7 @@ impl Frame {
         signal,
         canceled,
       } => json!({ "id": id, "code": code, "signal": signal, "canceled": canceled }),
-      Self::Cancel { id } => json!({ "id": id }),
+      Self::Cancel { id } | Self::StreamOpened { id } => json!({ "id": id }),
       Self::Leave => json!({}),
       Self::Error { id, code, message } => json!({ "id": id, "code": code, "message": message }),
       Self::TransferBegin {
@@ -267,6 +297,9 @@ impl Frame {
         total,
         checksum,
       } => json!({ "id": id, "total": total, "checksum": checksum }),
+      Self::StreamOpen { id, port } => json!({ "id": id, "port": port }),
+      Self::StreamAck { id, bytes } => json!({ "id": id, "bytes": bytes }),
+      Self::StreamClose { id, reason } => json!({ "id": id, "reason": reason }),
       Self::Ping { ts } | Self::Pong { ts } => json!({ "ts": ts }),
     }
   }
@@ -279,7 +312,8 @@ impl Frame {
       } => json!({ "id": id, "shell": shell, "command": command }),
       Self::Stdout { id, seq, chunk }
       | Self::Stderr { id, seq, chunk }
-      | Self::TransferChunk { id, seq, chunk } => {
+      | Self::TransferChunk { id, seq, chunk }
+      | Self::StreamData { id, seq, chunk } => {
         json!({ "id": id, "seq": seq, "bytes": chunk.bytes })
       }
       Self::TransferBegin {
@@ -375,7 +409,7 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
     return fail("missing-type", "frame is missing a string type");
   };
   let kind = kind.as_str();
-  const KNOWN: [&str; 15] = [
+  const KNOWN: [&str; 20] = [
     "hello",
     "welcome",
     "reject",
@@ -389,6 +423,11 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
     "transfer-begin",
     "transfer-chunk",
     "transfer-end",
+    "stream-open",
+    "stream-opened",
+    "stream-data",
+    "stream-ack",
+    "stream-close",
     "ping",
     "pong",
   ];
@@ -525,6 +564,33 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
         checksum,
       })
     }
+    "stream-open" => {
+      let id = string_field(o, "id", "stream-open.id must be a string")?;
+      let Some(port) = o.get("port").and_then(as_int).and_then(|port| u16::try_from(port).ok()) else {
+        return bad("stream-open.port must be a port number");
+      };
+      Ok(Frame::StreamOpen { id, port })
+    }
+    "stream-opened" => Ok(Frame::StreamOpened {
+      id: string_field(o, "id", "stream-opened.id must be a string")?,
+    }),
+    "stream-data" => {
+      let id = string_field(o, "id", "stream-data.id must be a string")?;
+      let seq = seq_field(o, "stream-data")?;
+      let chunk = encoded_bytes(o.get("chunk"), "stream-data.chunk", max_payload_bytes)?;
+      Ok(Frame::StreamData { id, seq, chunk })
+    }
+    "stream-ack" => {
+      let id = string_field(o, "id", "stream-ack.id must be a string")?;
+      let Some(bytes) = o.get("bytes").and_then(as_count) else {
+        return bad("stream-ack.bytes must be a non-negative integer");
+      };
+      Ok(Frame::StreamAck { id, bytes })
+    }
+    "stream-close" => Ok(Frame::StreamClose {
+      id: string_field(o, "id", "stream-close.id must be a string")?,
+      reason: string_field(o, "reason", "stream-close.reason must be a string")?,
+    }),
     _ => {
       // ping and pong: the probe's clock, any finite number, echoed as it came.
       let Some(Value::Number(ts)) = o.get("ts") else {

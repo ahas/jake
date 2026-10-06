@@ -18,7 +18,8 @@ use tokio::time::{Instant, interval_at};
 use crate::departed::Departed;
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
-  Checksum, Direction, EncodedBytes, Frame, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
+  Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SendWindow,
+  TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
 };
 
 /// The version the hub names in its welcome.
@@ -121,6 +122,20 @@ pub struct UploadParams<B> {
   pub body: B,
 }
 
+/// What a stream's caller receives from the agent's side of it.
+#[derive(Debug)]
+pub enum StreamEvent {
+  /// The agent has connected to the port; bytes may flow both ways.
+  Opened,
+  /// Bytes the port sent.
+  Data(Vec<u8>),
+  /// The agent closed the stream, its port having closed the connection or failed, and why.
+  Closed(String),
+  /// The stream could not be opened, or was cut off — the agent's connection lost, or a piece that
+  /// broke the window — and why.
+  Failed(String),
+}
+
 /// One frame that crossed the tunnel, reduced to its shape.
 #[derive(Debug, Serialize)]
 pub struct TrafficEntry {
@@ -143,6 +158,7 @@ struct Agent {
   probe: Option<JoinHandle<()>>,
   commands: IndexMap<String, Listener>,
   transfers: HashMap<String, Transfer>,
+  streams: IndexMap<String, OpenStream>,
 }
 
 impl Agent {
@@ -162,6 +178,21 @@ struct Transfer {
   expected_seq: u64,
   received: u64,
   hash: Option<Checksum>,
+}
+
+// A byte stream in flight: its caller, the credit the hub holds toward the agent, and the account of
+// what the agent has sent.
+struct OpenStream {
+  caller: mpsc::UnboundedSender<StreamEvent>,
+  window: Arc<SendWindow>,
+  inbound: ReceiveWindow,
+}
+
+impl OpenStream {
+  fn end(self, event: StreamEvent) {
+    self.window.close();
+    let _ = self.caller.send(event);
+  }
 }
 
 struct State {
@@ -247,6 +278,14 @@ impl State {
     self.agents.get(name).is_some_and(|agent| agent.link.socket_id == socket_id)
   }
 
+  fn owns_stream(&mut self, name: &str, socket_id: u64, id: &str) -> Option<&mut OpenStream> {
+    self
+      .agents
+      .get_mut(name)
+      .filter(|agent| agent.link.socket_id == socket_id)
+      .and_then(|agent| agent.streams.get_mut(id))
+  }
+
   fn owns_transfer(&self, name: &str, socket_id: u64, id: &str) -> bool {
     self
       .agents
@@ -289,6 +328,7 @@ impl State {
       probe: None,
       commands: IndexMap::new(),
       transfers: HashMap::new(),
+      streams: IndexMap::new(),
     };
     self.agents.insert(name.clone(), agent);
     self.by_socket.insert(link.socket_id, name.clone());
@@ -318,6 +358,9 @@ impl State {
     }
     for (_, transfer) in agent.transfers.drain() {
       transfer.listener.push("ended", json!({ "reason": reason }));
+    }
+    for (_, stream) in agent.streams.drain(..) {
+      stream.end(StreamEvent::Failed(reason.to_owned()));
     }
   }
 
@@ -358,9 +401,13 @@ impl State {
         }
       }
       Frame::Error { id, code, message } => {
-        // An error answers a command the agent refused before it could stream, or a transfer that failed.
+        // An error answers a command the agent refused before it could stream, a stream it could not
+        // open, or a transfer that failed.
         if let Some(listener) = agent.commands.shift_remove(&id) {
           listener.push("error", json!({ "code": code, "message": message }));
+        } else if let Some(stream) = agent.streams.shift_remove(&id) {
+          stream
+            .end(StreamEvent::Failed(format!("the agent could not open the stream [{code}]: {message}")));
         } else {
           self.fail_transfer(name, &id, &code, &message);
         }
@@ -426,6 +473,40 @@ impl State {
           let message =
             format!("assembled {} bytes did not match the declared transfer", transfer.received);
           transfer.listener.push("error", json!({ "code": "integrity", "message": message }));
+        }
+      }
+      Frame::StreamOpened { id } => {
+        if let Some(stream) = agent.streams.get(&id) {
+          let _ = stream.caller.send(StreamEvent::Opened);
+        }
+      }
+      Frame::StreamData { id, seq, chunk } => {
+        let Some(stream) = agent.streams.get_mut(&id) else {
+          return;
+        };
+        let accepted = decode_bytes(&chunk, max_payload_bytes)
+          .map_err(|error| error.message)
+          .and_then(|data| stream.inbound.accept(seq, data.len() as u64).map(|()| data));
+        match accepted {
+          Ok(data) => {
+            let _ = stream.caller.send(StreamEvent::Data(data));
+          }
+          Err(reason) => {
+            if let Some(stream) = agent.streams.shift_remove(&id) {
+              stream.end(StreamEvent::Failed(reason.clone()));
+            }
+            self.send(name, &Frame::StreamClose { id, reason });
+          }
+        }
+      }
+      Frame::StreamAck { id, bytes } => {
+        if let Some(stream) = agent.streams.get(&id) {
+          stream.window.grant(bytes);
+        }
+      }
+      Frame::StreamClose { id, reason } => {
+        if let Some(stream) = agent.streams.shift_remove(&id) {
+          stream.end(StreamEvent::Closed(reason));
         }
       }
       // A handshake or hub-outbound frame arriving from the agent is not the hub's to act on.
@@ -861,6 +942,47 @@ impl Hub {
     Ok(events)
   }
 
+  /// Whether the named agent's hello offered byte streams to `port`.
+  pub fn offers_stream(&self, name: &str, port: u16) -> bool {
+    let capability = format!("stream:{port}");
+    self
+      .lock()
+      .agents
+      .get(name)
+      .is_some_and(|agent| agent.capabilities.contains(&capability))
+  }
+
+  /// Open a byte stream to `port` on the named agent's machine: the caller's end of it, and the
+  /// events the agent's side sends, the first of which says whether it opened.
+  pub fn open_stream(
+    self: &Arc<Self>,
+    name: &str,
+    port: u16,
+  ) -> Result<(StreamEnd, mpsc::UnboundedReceiver<StreamEvent>), String> {
+    let mut state = self.lock();
+    let id = state.next_id('s');
+    let Some(agent) = state.agents.get_mut(name) else {
+      return Err(format!("no agent named {name} is attached"));
+    };
+    let (caller, events) = mpsc::unbounded_channel();
+    let window = Arc::new(SendWindow::default());
+    let stream = OpenStream {
+      caller,
+      window: Arc::clone(&window),
+      inbound: ReceiveWindow::default(),
+    };
+    agent.streams.insert(id.clone(), stream);
+    let end = StreamEnd {
+      hub: Arc::clone(self),
+      name: name.to_owned(),
+      socket_id: agent.link.socket_id,
+      id: id.clone(),
+      window,
+    };
+    state.send(name, &Frame::StreamOpen { id, port });
+    Ok((end, events))
+  }
+
   /// Tell the target agent to erase itself and depart; the name of the agent told. The leave is
   /// queued ahead of the socket's close, so the agent reads it before the connection ends.
   pub fn leave(&self, target: Option<&str>) -> Result<String, String> {
@@ -886,6 +1008,7 @@ impl Hub {
             "connectedAt": agent.connected_at,
             "lastPongAt": agent.last_pong_at,
             "inFlight": agent.commands.keys().collect::<Vec<_>>(),
+            "streams": agent.streams.keys().collect::<Vec<_>>(),
         })
       })
       .collect();
@@ -911,6 +1034,79 @@ impl Hub {
       state.detach(&name, "hub shutting down", true);
     }
     links
+  }
+}
+
+/// The caller's end of a byte stream: its bytes go to the agent through it, and what the caller has
+/// taken of the agent's bytes is acknowledged through it. Dropping it ends the stream, telling the
+/// agent when the stream was still open.
+pub struct StreamEnd {
+  hub: Arc<Hub>,
+  name: String,
+  socket_id: u64,
+  id: String,
+  window: Arc<SendWindow>,
+}
+
+impl StreamEnd {
+  /// Send the caller's bytes to the port in pieces the window lets out; false once the stream is over.
+  pub async fn send(&self, seq: &mut u64, data: &[u8]) -> bool {
+    let mut sent = 0;
+    while sent < data.len() {
+      let wanted = (data.len() - sent).min(STREAM_CHUNK_BYTES);
+      let Some(room) = self.window.take(wanted).await else {
+        return false;
+      };
+      let frame = Frame::StreamData {
+        id: self.id.clone(),
+        seq: *seq,
+        chunk: EncodedBytes::of(&data[sent..sent + room]),
+      };
+      *seq += 1;
+      sent += room;
+      let mut state = self.hub.lock();
+      if state.owns_stream(&self.name, self.socket_id, &self.id).is_none() {
+        return false;
+      }
+      if state.send(&self.name, &frame) == SendOutcome::Dropped {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// The caller has taken `bytes` of the agent's; the agent is acknowledged once a batch is due.
+  pub fn delivered(&self, bytes: u64) {
+    let mut state = self.hub.lock();
+    let ack = state
+      .owns_stream(&self.name, self.socket_id, &self.id)
+      .and_then(|stream| stream.inbound.handed_on(bytes));
+    if let Some(bytes) = ack {
+      let frame = Frame::StreamAck {
+        id: self.id.clone(),
+        bytes,
+      };
+      state.send(&self.name, &frame);
+    }
+  }
+}
+
+impl Drop for StreamEnd {
+  fn drop(&mut self) {
+    let mut state = self.hub.lock();
+    if state.owns_stream(&self.name, self.socket_id, &self.id).is_none() {
+      return;
+    }
+    if let Some(stream) =
+      state.agents.get_mut(&self.name).and_then(|agent| agent.streams.shift_remove(&self.id))
+    {
+      stream.window.close();
+    }
+    let frame = Frame::StreamClose {
+      id: self.id.clone(),
+      reason: "the caller closed the stream".into(),
+    };
+    state.send(&self.name, &frame);
   }
 }
 

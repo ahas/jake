@@ -22,6 +22,7 @@ use crate::config::AgentConfig;
 use crate::exec::{self, ExecRequest, Limits, RunHandle};
 use crate::log::Log;
 use crate::platform::Platform;
+use crate::stream::Streams;
 use crate::transfer::Transfers;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -54,7 +55,8 @@ enum DialError {
 impl Agent {
   fn capabilities(&self) -> Vec<String> {
     let shells = Platform::HOST.shells().iter().map(|shell| format!("exec:{shell}"));
-    shells.chain(["transfer".to_owned()]).collect()
+    let ports = self.config.stream_ports.iter().map(|port| format!("stream:{port}"));
+    shells.chain(["transfer".to_owned()]).chain(ports).collect()
   }
 
   fn hello(&self) -> Frame {
@@ -192,6 +194,7 @@ struct Session<'a> {
   close: Option<oneshot::Sender<()>>,
   runs: HashMap<String, RunHandle>,
   transfers: Transfers,
+  streams: Streams,
   welcomed: bool,
   leave: bool,
   last_inbound: Instant,
@@ -208,6 +211,12 @@ impl<'a> Session<'a> {
       writer: writer(sink, frames, closed),
       close: Some(close),
       transfers: Transfers::new(out.clone(), agent.config.max_payload_bytes, agent.log.clone()),
+      streams: Streams::new(
+        out.clone(),
+        agent.config.stream_ports.clone(),
+        agent.config.max_payload_bytes,
+        agent.log.clone(),
+      ),
       out,
       runs: HashMap::new(),
       welcomed: false,
@@ -264,13 +273,15 @@ impl<'a> Session<'a> {
     }
   }
 
-  // Nothing in flight outlives the socket it streamed over: every run's tree is ended and every
-  // transfer dropped, and output a run produces afterwards goes nowhere.
+  // Nothing in flight outlives the socket it streamed over: every run's tree is ended, every
+  // transfer dropped and every stream's connection closed, and output a run produces afterwards
+  // goes nowhere.
   async fn end(&mut self) {
     for (_, run) in self.runs.drain() {
       run.end_now();
     }
     self.transfers.abandon().await;
+    self.streams.abandon();
     if let Some(close) = self.close.take() {
       let _ = close.send(());
     }
@@ -353,11 +364,16 @@ impl<'a> Session<'a> {
         total,
         checksum,
       } => self.transfers.end(&id, total, &checksum).await,
+      Frame::StreamOpen { id, port } => self.streams.open(id, port).await,
+      Frame::StreamData { id, seq, chunk } => self.streams.data(&id, seq, &chunk).await,
+      Frame::StreamAck { id, bytes } => self.streams.ack(&id, bytes),
+      Frame::StreamClose { id, .. } => self.streams.close(&id),
       // The agent's own kinds, arriving from the hub, are not the agent's to act on.
       Frame::Hello { .. }
       | Frame::Stdout { .. }
       | Frame::Stderr { .. }
       | Frame::Exit { .. }
+      | Frame::StreamOpened { .. }
       | Frame::Pong { .. } => {}
     }
     None

@@ -25,6 +25,12 @@ pub struct HubConfig {
   pub departed_path: PathBuf,
 }
 
+/// What a client of the running hub needs to reach its control API, from the hub's own file.
+pub struct ControlConfig {
+  pub port: u16,
+  pub token: String,
+}
+
 /// Where the hub's file is: `JAKE_HUB_ENV` when set, else `hub.env` under the data directory.
 fn env_path(process: &HashMap<String, String>) -> PathBuf {
   if let Some(path) = process.get("JAKE_HUB_ENV") {
@@ -104,6 +110,15 @@ pub fn load() -> Result<HubConfig, String> {
   let process: HashMap<String, String> = std::env::vars().collect();
   let departed = departed_path(&process);
   read(&Source(merged(process)?), departed)
+}
+
+/// Read the control API's port and token, naming the key that is missing or malformed.
+pub fn load_control() -> Result<ControlConfig, String> {
+  let env = Source(merged(std::env::vars().collect())?);
+  Ok(ControlConfig {
+    port: env.port("JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,
+    token: env.required("JAKE_CONTROL_TOKEN")?,
+  })
 }
 
 fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {

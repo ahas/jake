@@ -100,6 +100,68 @@ example config, the install and uninstall scripts, and this guide.
   administrator rights, so it is not used — the boot-time recovery a Linux host gets from systemd is
   the trade a Windows host makes for staying per-user.
 
+## SSH over the tunnel
+
+BMO on main-host reaches this machine with ssh, and herdr with it, through the tunnel: the hub opens
+a connection to a port on this machine and carries its bytes, so nothing has to dial in. For that
+the machine needs an SSH server listening on it, and the key main-host logs in with.
+
+The agent lets the hub reach only the ports listed in `JAKE_STREAM_PORTS` in `agent.env`, port 22
+by default. The install takes two options for this, and both may be left out:
+
+- **Stream ports** — `--stream-ports 22` (Linux/WSL) or `-StreamPorts 22` (Windows): the ports, comma
+  separated, or `none` to refuse every stream. Left out, `agent.env` keeps what it has.
+- **SSH key** — `--ssh-key '<public key>'` (Linux/WSL) or `-SshKey '<public key>'` (Windows): the
+  public key main-host logs in with, added to this account's `~/.ssh/authorized_keys` if it is not
+  there yet.
+
+The install warns when nothing answers on a listed port, because a stream to it would fail. The SSH
+server itself needs administrator rights to install, so it is a step taken by hand, once.
+
+### Linux and WSL
+
+1. Install and start the OpenSSH server:
+
+   ```sh
+   sudo apt install openssh-server
+   sudo systemctl enable --now ssh
+   ```
+
+   On a WSL distribution this needs systemd running as its init, the same condition the agent itself
+   needs. Inside WSL the server listens in the distribution, which is where the agent connects.
+2. Run the install with the key, or add it to `~/.ssh/authorized_keys` by hand:
+
+   ```sh
+   curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash -s -- --ssh-key 'ssh-ed25519 AAAA... ahas@main-host'
+   ```
+
+3. Check that something answers: `ssh localhost true` on this machine.
+
+### Windows
+
+1. From an elevated PowerShell, install and start the OpenSSH server and have it start at boot:
+
+   ```powershell
+   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+   Start-Service sshd
+   Set-Service -Name sshd -StartupType Automatic
+   ```
+
+2. Run the install with `-SshKey '<public key>'`. For an account in the Administrators group, the
+   OpenSSH server reads the keys from `C:\ProgramData\ssh\administrators_authorized_keys` rather
+   than the account's own file, so the install says so, and the key goes there from the elevated
+   PowerShell:
+
+   ```powershell
+   Add-Content -Path C:\ProgramData\ssh\administrators_authorized_keys -Value 'ssh-ed25519 AAAA... ahas@main-host'
+   icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
+   ```
+
+3. A stream reaches the server from `localhost`, so it needs no opening in the Windows firewall.
+
+How main-host uses the stream — the `ProxyCommand` line and herdr's saved machines — is in
+docs/recipes.md.
+
 ## Checking it worked
 
 The install starts the agent, watches briefly whether it reaches the hub, and reports:

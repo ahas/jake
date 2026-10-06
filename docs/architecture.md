@@ -20,7 +20,9 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   loopback control API that the console and 비모 drive them through. It is reachable from 하스's
   network through a `*.ahas.io` name fronted by NPM. It holds no capability itself; it relays. The
   hub is the back end every agent shares, not a machine of its own: each attached agent is one
-  machine, and the hub is how all of them are reached.
+  machine, and the hub is how all of them are reached. Run with the connect argument the same
+  executable is not the hub but a client of it: it joins its standard input and output to a byte
+  stream through the running hub, which is what makes it usable as an SSH `ProxyCommand`.
 - **agent** — a Rust program, the `agent` crate in this repository, that runs on one of 하스's
   machines from a single executable. It dials the hub,
   authenticates, and then serves what the hub asks of it: shell commands, with live-streamed output,
@@ -39,11 +41,11 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   the stated reason `superseded by a new connection` — because a redial after a half-dead TCP
   connection must not leave two peers streaming as the same machine. A hello under a new name
   displaces nobody.
-- Everything that belongs to a connection lives and dies with it: its liveness probe, its commands
-  and its transfers. An agent that drops, is declared dead, or is superseded ends only what was
+- Everything that belongs to a connection lives and dies with it: its liveness probe, its commands,
+  its transfers and its streams. An agent that drops, is declared dead, or is superseded ends only what was
   running on it; the other agents' work carries on.
-- Every control request that reaches a machine — a command, an upload, a download, a leave — names
-  its target agent. A request that names none goes to the one agent attached when exactly one is,
+- Every control request that reaches a machine — a command, an upload, a download, a stream, a
+  leave — names its target agent. A request that names none goes to the one agent attached when exactly one is,
   and is refused when there are several, so a request never lands on a machine nobody chose. A
   request naming an agent that is not attached is refused rather than sent elsewhere. Cancelling a
   command needs no name, because a command's id is unique across the whole hub.
@@ -74,6 +76,12 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   check of the whole content against a declared byte count and checksum, so a torn or partial
   transfer is caught rather than accepted. The frames are stated in docs/protocol.md; the transfer
   mechanism is described under "Moving files" below.
+- **Byte streams.** The hub can open a TCP connection to a port on the agent's own machine and carry
+  its bytes both ways over the tunnel. Its use is SSH: the machine's own sshd answers on the far end,
+  so ssh — and herdr, which reaches a remote machine through ssh — gets to a machine nothing can dial
+  into. This too is a capability of the agent rather than a shell command, because a stream is
+  bidirectional and lives as long as the connection it carries. The mechanism is described under
+  "Carrying a byte stream" below.
 - The build still bundles nothing beside the executable and the install layout — the agent needs no
   screen-capture helper, no HTTP client, and no browser driver, because those are shell commands, and
   no external file tool, because file transfer rides the tunnel. A new need that a shell command
@@ -96,8 +104,8 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and sends its own on an interval, and it treats a stretch of silence from the hub — past a window
   of several intervals — as a dead connection worth redialing, even when the socket has not errored.
 - Nothing in flight survives the socket it streamed over. On any loss every running command is
-  stopped; a command is never resumed across a broken socket, and output that a run produces after
-  the loss is dropped rather than sent.
+  stopped and every byte stream's connection is closed; neither is resumed across a broken socket,
+  and output that a run produces after the loss is dropped rather than sent.
 - The hello list names the shells the agent can run, and the shell runner contributes those names
   itself. The core owns the wire — framing, sequence numbers, sending — and the runner owns only
   spawning, streaming, and stopping.
@@ -308,6 +316,40 @@ give very different footing for keeping a per-user process running.
       if assembled bytes != total or hash(assembled) != checksum: send error(id); discard temp
       else: atomically move temp into place; acknowledge id
   ```
+
+## Carrying a byte stream
+
+- A byte stream joins a caller on main-host to a TCP port on the agent's machine. The caller opens it
+  through the control API, naming the agent and the port; the hub sends the agent a stream-open, the
+  agent connects to that port on its own `localhost`, and from then on the bytes cross the tunnel in
+  both directions as stream pieces until either end closes. The frames and the window that paces
+  them are stated in docs/protocol.md.
+- The machine decides what it exposes. The agent's configuration holds the list of local ports a
+  stream may reach, `JAKE_STREAM_PORTS`, which is the SSH port alone unless the install or a hand edit
+  says otherwise, and `none` turns streams off. The agent advertises each allowed port in its hello
+  and refuses an open for any other, so a hub, or anyone holding its control token, reaches only what
+  that machine's own config lets it. The hub reads the advertised ports too and refuses a request
+  for a port the agent does not offer before anything crosses the tunnel, so a caller learns at once
+  that the agent must be configured, or updated, rather than waiting on a refusal.
+- No side holds more of a stream than its window. Each side carries the two directions
+  independently, neither waiting on the other, so a slow reader on one end stalls only the bytes
+  headed to it: the sender's window fills, it stops
+  reading its own end, and the pressure travels back to whoever is writing, as it would over one TCP
+  connection. A command or a transfer on the same connection is never held up behind a stream.
+- On the agent's machine a stream is a plain local TCP connection, so the program at the port sees a
+  client from `localhost`. sshd authenticates that client as it would any other; jake adds no
+  credential of its own beyond the hub's, and grants nothing the SSH login does not.
+- On main-host the caller is the hub executable run with the connect argument and the agent's name,
+  with the port defaulting to SSH's. It reads the control port and token from the hub's own
+  configuration, as the console does, opens the stream through the control API, and joins it to its
+  standard input and output, writing why the stream ended to standard error. Because that is
+  exactly what ssh asks of a `ProxyCommand`, one `ProxyCommand` line in the SSH client configuration
+  makes the agent's machine an ordinary SSH host, and herdr's saved SSH machines work on top of it.
+  The connect client is a small Rust process rather than a mode of the bun console because it stays
+  up for the whole life of the SSH connection it carries, and main-host runs many of them at once.
+- A stream lives on the agent's connection. When the agent's socket drops, the hub ends every stream
+  on it and the agent closes every TCP connection it opened for one, so ssh sees its connection
+  close and can dial again; once the agent has redialled, a new stream reaches the machine as before.
 
 ## The console
 
