@@ -5,6 +5,7 @@ resolver = "3"
 # The contract tests run the debug builds through transfers of hundreds of megabytes; the hashing,
 # base64 and WebSocket framing they pass through are dependencies, built optimised even there.
 [profile.dev.package."*"]
+debug = false
 opt-level = 3
 
 [profile.release]
@@ -12,3 +13,7 @@ codegen-units = 1
 lto = true
 panic = "abort"
 strip = true
+
+# Dependencies carry no debug information in a test build either.
+[profile.test.package."*"]
+debug = false
