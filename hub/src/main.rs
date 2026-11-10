@@ -41,6 +41,7 @@ async fn run() -> Result<(), String> {
   let config = config::load()?;
   let hub = Hub::new(HubOptions {
     secret: config.secret,
+    agent_key: config.agent_key,
     control_token: config.control_token.clone(),
     max_payload_bytes: config.max_payload_bytes,
     ping_interval: config.ping_interval,

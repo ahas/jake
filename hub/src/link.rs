@@ -36,10 +36,18 @@ struct Shared {
 #[derive(Clone)]
 pub struct Link {
   pub socket_id: u64,
+  /// The one name this connection may take, where its credential was made for one; none takes any.
+  pub only: Option<Arc<str>>,
   shared: Arc<Shared>,
 }
 
 impl Link {
+  /// The link held to the one name its credential was made for.
+  pub fn held_to(mut self, name: Option<String>) -> Self {
+    self.only = name.map(Arc::from);
+    self
+  }
+
   /// A link and the receiving end its socket's writer drains.
   pub fn new(socket_id: u64, backlog_limit: usize) -> (Self, mpsc::UnboundedReceiver<Outbound>) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -53,6 +61,7 @@ impl Link {
     (
       Self {
         socket_id,
+        only: None,
         shared: Arc::new(shared),
       },
       rx,

@@ -39,7 +39,7 @@ pub async fn entry(
   upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
   let credential = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
-  if !hub.authorize_agent(credential) {
+  let Some(only) = hub.authorize_agent(credential) else {
     // Only an upgrade is an agent's attempt; the line says whether a credential came, never what it was.
     let is_upgrade = headers
       .get(UPGRADE)
@@ -49,7 +49,7 @@ pub async fn entry(
       eprintln!("jake hub: refused an agent connection from {} ({what})", peer_of(&headers, address));
     }
     return json(401, &serde_json::json!({ "error": "unauthorized" }));
-  }
+  };
   let Ok(upgrade) = upgrade else {
     return json(426, &serde_json::json!({ "error": "expected a WebSocket upgrade" }));
   };
@@ -59,12 +59,13 @@ pub async fn entry(
   upgrade
     .max_message_size(frame_limit)
     .max_frame_size(frame_limit)
-    .on_upgrade(move |socket| serve(hub, socket, socket_id))
+    .on_upgrade(move |socket| serve(hub, socket, socket_id, only))
 }
 
-async fn serve(hub: Arc<Hub>, socket: WebSocket, socket_id: u64) {
+async fn serve(hub: Arc<Hub>, socket: WebSocket, socket_id: u64, only: Option<String>) {
   let (sink, mut stream) = socket.split();
   let (link, queue) = Link::new(socket_id, hub.socket_backlog_bytes());
+  let link = link.held_to(only);
   let writer = tokio::spawn(write(sink, queue, link.clone()));
 
   // Once the hub has closed this socket, the agent's answering close is waited for only so long.

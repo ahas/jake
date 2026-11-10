@@ -125,6 +125,13 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 - One shared secret authenticates the agent to the hub, presented as a Bearer credential at the
   connection's upgrade. A separate token guards the hub's loopback control API. The two are distinct
   so that the console's reach and the agent's reach are not the same key.
+- **An agent may instead present a credential of its own name:** `<name>.<mac>`, where the mac is the
+  lowercase hex of HMAC-SHA256 over the name, keyed by the hub's agent key (`JAKE_AGENT_KEY`). The
+  hub accepts it only where it holds an agent key and the mac is the name's, and the connection may
+  then take that one name: a hello under any other is answered by closing the socket with code 4003,
+  and recorded. Whoever holds the agent key mints such credentials — the account service, for a
+  machine an invited person installs — so a person is given a credential for their own machine's name
+  and never the shared secret. A hub with no agent key accepts the shared secret alone.
 - A refused credential and an unreachable hub are told apart. The hub answers an upgrade with a
   missing or wrong secret with 401 before any socket opens, and writes one line saying where the
   attempt came from and whether the credential was missing or wrong — never the value presented.

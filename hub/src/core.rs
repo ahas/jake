@@ -30,9 +30,26 @@ const RING_SIZE: usize = 200;
 const TAIL_BACKLOG: usize = 1024;
 /// The close code of a socket the hub drops on purpose, from the range kept for applications.
 const CLOSE_HUB_INITIATED: u16 = 4000;
+/// The close code of a socket whose hello named another name than its credential was made for.
+const CLOSE_OTHER_NAME: u16 = 4003;
+
+/// The credential of one agent name: the name, a dot, and the lowercase hex of HMAC-SHA256 over the name keyed
+/// by the agent key.
+pub fn agent_credential(key: &str, name: &str) -> String {
+  use hmac::{Hmac, Mac};
+
+  let mut mac =
+    Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any length");
+  mac.update(name.as_bytes());
+  let digest = mac.finalize().into_bytes();
+  let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+  format!("{name}.{hex}")
+}
 
 pub struct HubOptions {
   pub secret: String,
+  /// The key a credential of one agent name is made with; none admits the shared secret alone.
+  pub agent_key: Option<String>,
   pub control_token: String,
   pub max_payload_bytes: usize,
   pub ping_interval: Duration,
@@ -580,9 +597,17 @@ impl Hub {
     self.options.socket_backlog_bytes
   }
 
-  /// True when the header presents the agent secret.
-  pub fn authorize_agent(&self, header: Option<&[u8]>) -> bool {
-    header == Some(format!("Bearer {}", self.options.secret).as_bytes())
+  /// Whom the header admits: none where it presents no credential the hub takes; any name for the shared
+  /// secret; one name for a credential made for it with the agent key, `<name>.<hex mac>`.
+  pub fn authorize_agent(&self, header: Option<&[u8]>) -> Option<Option<String>> {
+    let presented = std::str::from_utf8(header?).ok()?.strip_prefix("Bearer ")?;
+    if presented == self.options.secret {
+      return Some(None);
+    }
+    let key = self.options.agent_key.as_deref()?;
+    let (name, mac) = presented.rsplit_once('.')?;
+    (!name.is_empty() && agent_credential(key, name) == format!("{name}.{mac}"))
+      .then(|| Some(name.to_owned()))
   }
 
   /// True when the header presents the control token.
@@ -619,6 +644,18 @@ impl Hub {
       capabilities,
     } = &frame
     {
+      if let Some(only) = &link.only
+        && **only != **agent
+      {
+        state.record(
+          Some(agent),
+          "in",
+          "refused",
+          json!({ "reason": "the credential is for another name" }),
+        );
+        link.close(CLOSE_OTHER_NAME, "the credential is for another name");
+        return;
+      }
       let summary = frame.summary();
       state.attach(link, agent.clone(), agent_version.clone(), capabilities.clone(), summary);
       let probe = self.probe(agent.clone(), link.socket_id);
@@ -1125,6 +1162,7 @@ mod tests {
   fn hub(socket_backlog_bytes: usize) -> Arc<Hub> {
     Hub::new(HubOptions {
       secret: "s".into(),
+      agent_key: Some("k".into()),
       control_token: "c".into(),
       max_payload_bytes: CAP,
       ping_interval: Duration::from_secs(3600),
@@ -1180,6 +1218,59 @@ mod tests {
 
   fn received(events: &mut Events) -> Vec<Event> {
     std::iter::from_fn(|| events.try_recv().ok()).collect()
+  }
+
+  fn attached_names(hub: &Arc<Hub>) -> Vec<String> {
+    hub.status()["agents"]
+      .as_array()
+      .map(|agents| agents.iter().filter_map(|agent| agent["name"].as_str().map(str::to_owned)).collect())
+      .unwrap_or_default()
+  }
+
+  #[tokio::test]
+  async fn a_credential_of_one_name_admits_that_name_alone() {
+    let hub = hub(CAP);
+    let credential = agent_credential("k", "u7");
+    let bearer = format!("Bearer {credential}");
+    assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), Some(Some("u7".to_owned())));
+    assert_eq!(hub.authorize_agent(Some(b"Bearer s")), Some(None));
+    assert_eq!(hub.authorize_agent(Some(b"Bearer u7.00")), None);
+    assert_eq!(
+      hub.authorize_agent(Some(format!("Bearer {}", agent_credential("other", "u7")).as_bytes())),
+      None
+    );
+    assert_eq!(hub.authorize_agent(None), None);
+
+    // A hello under its own name attaches; one under another closes the socket and attaches nothing.
+    let (own, _queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    let own = own.held_to(Some("u7".into()));
+    hub.on_message(&own, r#"{"type":"hello","v":1,"agent":"u7","agentVersion":"0.1.0","capabilities":[]}"#);
+    assert!(attached_names(&hub).contains(&"u7".to_owned()));
+    let (other, mut other_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    let other = other.held_to(Some("u7".into()));
+    hub.on_message(
+      &other,
+      r#"{"type":"hello","v":1,"agent":"hass","agentVersion":"0.1.0","capabilities":[]}"#,
+    );
+    assert!(matches!(other_queue.try_recv(), Ok(Outbound::Close(4003, _))));
+    assert!(!attached_names(&hub).contains(&"hass".to_owned()));
+  }
+
+  #[test]
+  fn without_an_agent_key_only_the_shared_secret_admits() {
+    let hub = Hub::new(HubOptions {
+      secret: "s".into(),
+      agent_key: None,
+      control_token: "c".into(),
+      max_payload_bytes: CAP,
+      ping_interval: Duration::from_secs(3600),
+      missed_pong_limit: 3,
+      socket_backlog_bytes: CAP,
+      departed_path: None,
+    });
+    let bearer = format!("Bearer {}", agent_credential("k", "u7"));
+    assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), None);
+    assert_eq!(hub.authorize_agent(Some(b"Bearer s")), Some(None));
   }
 
   #[test]

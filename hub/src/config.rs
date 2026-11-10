@@ -16,6 +16,8 @@ pub struct HubConfig {
   pub host: String,
   pub port: u16,
   pub secret: String,
+  /// The key a credential of one agent name is made with; none admits the shared secret alone.
+  pub agent_key: Option<String>,
   pub control_port: u16,
   pub control_token: String,
   pub max_payload_bytes: usize,
@@ -126,6 +128,7 @@ fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
     host: env.present("JAKE_HUB_HOST").unwrap_or(DEFAULT_HUB_HOST).to_owned(),
     port: env.port("JAKE_HUB_PORT", DEFAULT_HUB_PORT)?,
     secret: env.required("JAKE_SECRET")?,
+    agent_key: env.present("JAKE_AGENT_KEY").map(|key| key.trim().to_owned()),
     control_port: env.port("JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,
     control_token: env.required("JAKE_CONTROL_TOKEN")?,
     max_payload_bytes: env.count("JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES)?,
