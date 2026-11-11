@@ -21,16 +21,44 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // One stream as the connection holds it. Dropping it ends the stream: the task that owns the TCP
 // connection is stopped, which closes the connection.
 struct Open {
-  task: JoinHandle<()>,
+  task: Option<JoinHandle<()>>,
   inbound: mpsc::UnboundedSender<Vec<u8>>,
   receive: Arc<Mutex<ReceiveWindow>>,
   send: Arc<SendWindow>,
 }
 
+impl Open {
+  fn new(
+    task: JoinHandle<()>,
+    inbound: mpsc::UnboundedSender<Vec<u8>>,
+    receive: Arc<Mutex<ReceiveWindow>>,
+    send: Arc<SendWindow>,
+  ) -> Self {
+    Self {
+      task: Some(task),
+      inbound,
+      receive,
+      send,
+    }
+  }
+
+  fn is_finished(&self) -> bool {
+    self.task.as_ref().is_none_or(JoinHandle::is_finished)
+  }
+
+  // End the stream as the hub closed it: the task goes on until it has written every piece already
+  // handed to it, then closes the connection. The task is handed back so it can still be stopped.
+  fn finish(mut self) -> Option<Task> {
+    self.task.take().map(Task)
+  }
+}
+
 impl Drop for Open {
   fn drop(&mut self) {
-    self.send.close();
-    self.task.abort();
+    if let Some(task) = self.task.take() {
+      self.send.close();
+      task.abort();
+    }
   }
 }
 
@@ -41,10 +69,18 @@ pub struct Accepted {
   socket: TcpStream,
 }
 
-// A port the agent listens on for the hub; dropping it stops listening.
-struct Listening(JoinHandle<()>);
+// A task the connection owns, a listen or a stream finishing its writes; dropping it stops the task.
+struct Task(JoinHandle<()>);
 
-impl Drop for Listening {
+impl Task {
+  // Stop the task and wait until it is gone, so what it held, a listened port above all, is released.
+  async fn stop(mut self) {
+    self.0.abort();
+    let _ = (&mut self.0).await;
+  }
+}
+
+impl Drop for Task {
   fn drop(&mut self) {
     self.0.abort();
   }
@@ -60,7 +96,9 @@ pub struct Streams {
   max_payload_bytes: usize,
   log: Log,
   open: HashMap<String, Open>,
-  listens: HashMap<String, Listening>,
+  // The streams the hub closed whose connections are still being written what the hub sent first.
+  closing: Vec<Task>,
+  listens: HashMap<String, Task>,
 }
 
 impl Streams {
@@ -80,6 +118,7 @@ impl Streams {
       max_payload_bytes,
       log,
       open: HashMap::new(),
+      closing: Vec::new(),
       listens: HashMap::new(),
     }
   }
@@ -91,7 +130,11 @@ impl Streams {
       let message = format!("port {port} is not among this machine's listen ports");
       return self.refuse(id, "port-not-allowed", message).await;
     }
-    self.listens.remove(&id);
+    // A listen already standing is kept: binding the port again would find it still held by that listen.
+    if self.listens.get(&id).is_some_and(|task| !task.0.is_finished()) {
+      let _ = self.out.send(Frame::Listening { id }).await;
+      return;
+    }
     let listener = match TcpListener::bind(("127.0.0.1", port)).await {
       Ok(listener) => listener,
       Err(error) => return self.refuse(id, "bind-failed", format!("127.0.0.1:{port}: {error}")).await,
@@ -112,14 +155,17 @@ impl Streams {
         }
       }
     });
-    self.listens.insert(id.clone(), Listening(task));
+    self.listens.insert(id.clone(), Task(task));
     self.log.info("listening", json!({ "id": id, "port": port }));
     let _ = self.out.send(Frame::Listening { id }).await;
   }
 
-  /// Stop listening; streams already accepted go on.
-  pub fn unlisten(&mut self, id: &str) {
-    self.listens.remove(id);
+  /// Stop listening, and release the port before the next frame is read, so a listen asked for at once
+  /// after binds it again; streams already accepted go on.
+  pub async fn unlisten(&mut self, id: &str) {
+    if let Some(task) = self.listens.remove(id) {
+      task.stop().await;
+    }
   }
 
   /// A connection accepted on a listened port, told to the hub and carried as a stream like any other.
@@ -143,15 +189,7 @@ impl Streams {
       log: self.log.clone(),
     };
     let task = tokio::spawn(carrier.carry(socket, inbound_rx));
-    self.open.insert(
-      id,
-      Open {
-        task,
-        inbound,
-        receive,
-        send,
-      },
-    );
+    self.open.insert(id, Open::new(task, inbound, receive, send));
   }
 
   async fn refuse(&self, id: String, code: &str, message: String) {
@@ -165,7 +203,7 @@ impl Streams {
 
   /// Open a connection to `port` on this machine, if the machine's config lets a stream reach it.
   pub async fn open(&mut self, id: String, port: u16) {
-    self.open.retain(|_, stream| !stream.task.is_finished());
+    self.open.retain(|_, stream| !stream.is_finished());
     if self.open.contains_key(&id) {
       let message = "a stream with this id is already open".to_owned();
       return self.refuse(id, "duplicate", message).await;
@@ -185,13 +223,7 @@ impl Streams {
       log: self.log.clone(),
     };
     let task = tokio::spawn(carrier.serve(port, inbound_rx));
-    let stream = Open {
-      task,
-      inbound,
-      receive,
-      send,
-    };
-    self.open.insert(id, stream);
+    self.open.insert(id, Open::new(task, inbound, receive, send));
   }
 
   /// One piece of the hub's bytes for a stream's connection.
@@ -226,14 +258,19 @@ impl Streams {
     }
   }
 
-  /// The hub has closed a stream: its connection is dropped, and nothing is answered.
+  /// The hub has closed a stream: what it sent before the close is still written to the connection,
+  /// which then closes; nothing is answered.
   pub fn close(&mut self, id: &str) {
-    self.open.remove(id);
+    self.closing.retain(|task| !task.0.is_finished());
+    if let Some(task) = self.open.remove(id).and_then(Open::finish) {
+      self.closing.push(task);
+    }
   }
 
   /// Drop every stream and stop every listen, the socket they belonged to being gone.
   pub fn abandon(&mut self) {
     self.open.clear();
+    self.closing.clear();
     self.listens.clear();
   }
 }

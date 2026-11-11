@@ -377,7 +377,7 @@ impl<'a> Session<'a> {
       Frame::StreamAck { id, bytes } => self.streams.ack(&id, bytes),
       Frame::StreamClose { id, .. } => self.streams.close(&id),
       Frame::Listen { id, port } => self.streams.listen(id, port).await,
-      Frame::Unlisten { id } => self.streams.unlisten(&id),
+      Frame::Unlisten { id } => self.streams.unlisten(&id).await,
       // The agent's own kinds, arriving from the hub, are not the agent's to act on.
       Frame::Hello { .. }
       | Frame::Stdout { .. }

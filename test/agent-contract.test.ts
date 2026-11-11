@@ -500,9 +500,12 @@ describe("streams back", () => {
     expect((connection.frames[0] as WireFrame).capabilities).toContain(`listen:${listenPort}`);
   });
 
-  test("listens at its loopback, and carries an accepted connection back as a stream of its own", async () => {
+  test("listens at its loopback, keeps a listen asked for again, and carries an accepted connection back as a stream of its own", async () => {
     connection.send({ type: "listen", id: "l1", port: listenPort });
     await connection.next((f) => f.id === "l1" && f.type === "listening", "the listen");
+    connection.send({ type: "listen", id: "l1", port: listenPort });
+    await connection.next((f) => f.id === "l1" && f.type === "listening", "the listen kept as it stands");
+    expect(connection.all((f) => f.id === "l1" && f.type === "error")).toEqual([]);
     const client = await Bun.connect({ hostname: "127.0.0.1", port: listenPort, socket: { data() {} } });
     const accept = await connection.next((f) => f.type === "stream-accept", "the accept");
     expect(accept).toMatchObject({ listen: "l1" });
@@ -514,7 +517,36 @@ describe("streams back", () => {
     );
     client.end();
     await connection.next((f) => f.id === id && f.type === "stream-close", "the close");
+  });
+
+  test("writes a target's answer the hub closes the stream right after, before closing the connection", async () => {
+    let heard = Buffer.alloc(0);
+    let ended = false;
+    await Bun.connect({
+      hostname: "127.0.0.1",
+      port: listenPort,
+      socket: {
+        data(_socket, data) {
+          heard = Buffer.concat([heard, data]);
+        },
+        close() {
+          ended = true;
+        },
+      },
+    });
+    const id = (await connection.next((f) => f.type === "stream-accept", "the accept")).id as string;
+    const answer = Buffer.from("HTTP/1.1 204 \r\n\r\n");
+    connection.send({ type: "stream-data", id, seq: 0, chunk: { bytes: answer.length, base64: answer.toString("base64") } });
+    connection.send({ type: "stream-close", id, reason: "the caller closed the stream" });
+    await until("the connection to close", () => ended);
+    expect(heard.equals(answer)).toBe(true);
+  });
+
+  test("stops a listen and binds the port again for a listen asked for at once", async () => {
     connection.send({ type: "unlisten", id: "l1" });
+    connection.send({ type: "listen", id: "l2", port: listenPort });
+    expect(await connection.next((f) => f.id === "l2", "the second listen")).toMatchObject({ type: "listening" });
+    connection.send({ type: "unlisten", id: "l2" });
   });
 
   test("refuses to listen on a port its config does not allow", async () => {

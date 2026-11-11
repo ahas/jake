@@ -374,7 +374,9 @@ give very different footing for keeping a per-user process running.
 - A caller asks through the control API: `POST /listen?agent=<name>&port=<port>` with `target` in its body
   listens for that agent on that port, `DELETE /listen?agent=<name>&port=<port>` stops, and `GET
   /listens?agent=<name>` answers what the hub holds for the agent, each port with its target and whether
-  the agent listens on it now. A target the hub does not allow is refused 403 `target-not-allowed`; a port
+  the agent listens on it now. Asking again for a port the agent already listens on keeps that listen
+  standing, takes the target named this time, and answers `standing: true`; the agent is asked to
+  listen again only where it does not listen yet, which the answer gives as `standing: false`. A target the hub does not allow is refused 403 `target-not-allowed`; a port
   the agent does not offer, 403 `port-not-offered` once the agent is attached.
 - The hub keeps what it was asked to listen for, by agent and port, for as long as it runs: it asks the
   agent to listen as the agent attaches, and again on every later connection, so a machine that

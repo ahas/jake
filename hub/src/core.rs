@@ -1083,8 +1083,9 @@ impl Hub {
   }
 
   /// Have the named agent listen on `port` for streams back joined to `target`, now where it is attached
-  /// and on every later connection; a target the hub's configuration does not allow is refused.
-  pub fn listen(&self, name: &str, port: u16, target: &str) -> Result<(), ListenRefusal> {
+  /// and on every later connection; a target the hub's configuration does not allow is refused. A listen
+  /// the agent already holds is kept as it stands, joined to `target` from now on.
+  pub fn listen(&self, name: &str, port: u16, target: &str) -> Result<ListenOutcome, ListenRefusal> {
     if !self.options.reverse_targets.iter().any(|allowed| allowed == target) {
       return Err(ListenRefusal::TargetNotAllowed);
     }
@@ -1095,6 +1096,9 @@ impl Hub {
       return Err(ListenRefusal::PortNotOffered);
     }
     state.listens.entry(name.to_owned()).or_default().insert(port, target.to_owned());
+    if state.agents.get(name).is_some_and(|agent| agent.listening.contains(&port)) {
+      return Ok(ListenOutcome::Standing);
+    }
     state.send(
       name,
       &Frame::Listen {
@@ -1102,7 +1106,7 @@ impl Hub {
         port,
       },
     );
-    Ok(())
+    Ok(ListenOutcome::Asked)
   }
 
   /// Stop the named agent listening on `port`; streams already accepted go on.
@@ -1192,6 +1196,15 @@ impl Hub {
     }
     links
   }
+}
+
+/// What a listen the hub took came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListenOutcome {
+  /// The agent is asked to listen, now where it is attached, else on its next connection.
+  Asked,
+  /// The agent already listens on the port; that listen is kept and nothing is asked of it.
+  Standing,
 }
 
 /// Why a listen was refused.
@@ -1471,7 +1484,7 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes: CAP,
       departed_path: None,
-      reverse_targets: vec![address.clone()],
+      reverse_targets: vec![address.clone(), "127.0.0.1:4555".into()],
     });
 
     // A target the hub does not allow is refused; so is a port an attached agent does not offer.
@@ -1484,11 +1497,19 @@ mod tests {
     assert_eq!(hub.listen("pc", 4200, &address), Err(ListenRefusal::PortNotOffered));
 
     // A listen asked of an attached agent goes out at once, and is asked again on its next connection.
-    assert_eq!(hub.listen("pc", 4100, &address), Ok(()));
+    assert_eq!(hub.listen("pc", 4100, "127.0.0.1:4555"), Ok(ListenOutcome::Asked));
     let frames = queued(&mut queue);
     assert_eq!(kinds(&frames), ["welcome", "listen"]);
     hub.on_message(&link, r#"{"type":"listening","v":1,"id":"l4100"}"#);
     assert_eq!(hub.listens("pc")["listens"][0]["listening"], json!(true));
+
+    // Asked again while it stands, the listen is kept: nothing goes to the agent, and the new target holds.
+    assert_eq!(hub.listen("pc", 4100, &address), Ok(ListenOutcome::Standing));
+    assert!(queued(&mut queue).is_empty());
+    assert_eq!(
+      hub.listens("pc")["listens"][0],
+      json!({ "port": 4100, "target": address, "listening": true })
+    );
     let (again, mut again_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
     hub.on_message(
       &again,

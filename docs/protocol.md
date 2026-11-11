@@ -98,8 +98,10 @@ Byte streams:
   and the byte count.
 - **stream-close** — either side: the stream is over in both directions, carrying the stream id and
   a short reason. It is not answered. The agent sends it when the port closes its connection or a
-  write to it fails; the hub sends it when the caller goes away. A close for a stream already over is
-  ignored.
+  write to it fails; the hub sends it when the caller goes away. Every piece sent before the close is
+  still delivered: the receiver writes what it already holds of the stream to its own end and only then
+  closes that end, so a target that answers and closes at once is heard in full. A close for a stream
+  already over is ignored.
 
 A stream is paced by a window. Each sender may have at most the stream window, 1 MiB, of a stream's
 bytes sent and not yet acknowledged; once it reaches that, it sends nothing more of the stream until
@@ -118,10 +120,12 @@ Streams back:
 - **listen** — hub to agent: listen on a port of the agent's own loopback, carrying a hub-chosen id and
   the port. The agent listens only on a port its configuration allows, the ports its hello advertised
   as `listen:<port>`; any other is answered with an **error** frame coded `port-not-allowed`, and a port
-  it cannot bind with one coded `bind-failed`.
+  it cannot bind with one coded `bind-failed`. A listen for an id the agent already listens on is
+  answered with listening at once, and the standing listen goes on undisturbed.
 - **listening** — agent to hub: the port is listened on, carrying the listen's id.
 - **unlisten** — hub to agent: stop listening, carrying the listen's id. Streams already accepted on it
-  go on. It is not answered.
+  go on. The agent releases the port before it reads the next frame, so a listen that follows at once
+  binds it again. It is not answered.
 - **stream-accept** — agent to hub: a connection came in on a listened port. It carries an
   agent-chosen stream id and the listen's id. From here the stream is a byte stream like any other:
   stream-data, stream-ack and stream-close carry it both ways, each side paced by the window, and the

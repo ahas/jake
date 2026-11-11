@@ -19,7 +19,9 @@ use tokio::time::{Instant, interval_at};
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 
 use crate::config::leading_int;
-use crate::core::{Event, Events, ExecParams, Hub, ListenRefusal, Refusal, StreamEvent, UploadParams};
+use crate::core::{
+  Event, Events, ExecParams, Hub, ListenOutcome, ListenRefusal, Refusal, StreamEvent, UploadParams,
+};
 use crate::protocol::{checksum, is_shell_kind, shell_kinds};
 
 /// A stream sends nothing between events, so a comment holds the connection open through a quiet stretch.
@@ -396,7 +398,7 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
         return error(400, "target must be a host:port string");
       };
       match hub.listen(&name, port, &target) {
-        Ok(()) => json(200, &json!({ "ok": true })),
+        Ok(outcome) => json(200, &json!({ "ok": true, "standing": outcome == ListenOutcome::Standing })),
         Err(ListenRefusal::TargetNotAllowed) => json(
           403,
           &json!({ "error": format!("{target} is not among the hub's JAKE_REVERSE_TARGETS"), "code": "target-not-allowed" }),
