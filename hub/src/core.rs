@@ -57,6 +57,8 @@ pub struct HubOptions {
   pub socket_backlog_bytes: usize,
   /// Where the departed agents are recorded; none keeps the record in memory alone.
   pub departed_path: Option<PathBuf>,
+  /// The `host:port` targets a stream back from an agent may reach.
+  pub reverse_targets: Vec<String>,
 }
 
 /// One event in a command's or a transfer's life, as its control caller receives it.
@@ -176,6 +178,8 @@ struct Agent {
   commands: IndexMap<String, Listener>,
   transfers: HashMap<String, Transfer>,
   streams: IndexMap<String, OpenStream>,
+  // The ports the agent says it listens on now for streams back.
+  listening: std::collections::BTreeSet<u16>,
 }
 
 impl Agent {
@@ -220,6 +224,9 @@ struct State {
   traffic_tx: broadcast::Sender<Arc<TrafficEntry>>,
   id_seq: u64,
   departed: Departed,
+  // What each agent is to listen on for streams back, by name and port, with the target each joins:
+  // asked again on every connection the agent makes.
+  listens: HashMap<String, std::collections::BTreeMap<u16, String>>,
 }
 
 pub struct Hub {
@@ -346,6 +353,7 @@ impl State {
       commands: IndexMap::new(),
       transfers: HashMap::new(),
       streams: IndexMap::new(),
+      listening: std::collections::BTreeSet::new(),
     };
     self.agents.insert(name.clone(), agent);
     self.by_socket.insert(link.socket_id, name.clone());
@@ -355,6 +363,20 @@ impl State {
         hub_version: HUB_VERSION.into(),
       },
     );
+    let ports: Vec<u16> = self
+      .listens
+      .get(&name)
+      .map(|wanted| wanted.keys().copied().collect())
+      .unwrap_or_default();
+    for port in ports {
+      self.send(
+        &name,
+        &Frame::Listen {
+          id: listen_id(port),
+          port,
+        },
+      );
+    }
   }
 
   fn detach(&mut self, name: &str, reason: &str, close_socket: bool) {
@@ -417,10 +439,18 @@ impl State {
           listener.push("exit", json!({ "code": code, "signal": signal, "canceled": canceled }));
         }
       }
+      Frame::Listening { id } => {
+        if let Some(port) = port_of_listen(&id) {
+          agent.listening.insert(port);
+        }
+      }
       Frame::Error { id, code, message } => {
         // An error answers a command the agent refused before it could stream, a stream it could not
-        // open, or a transfer that failed.
-        if let Some(listener) = agent.commands.shift_remove(&id) {
+        // open, a listen it could not make, or a transfer that failed.
+        if let Some(port) = port_of_listen(&id) {
+          agent.listening.remove(&port);
+          eprintln!("jake hub: agent {name} could not listen on port {port} [{code}]: {message}");
+        } else if let Some(listener) = agent.commands.shift_remove(&id) {
           listener.push("error", json!({ "code": code, "message": message }));
         } else if let Some(stream) = agent.streams.shift_remove(&id) {
           stream
@@ -572,6 +602,7 @@ impl Hub {
       traffic_tx,
       id_seq: 0,
       departed: Departed::load(options.departed_path.clone()),
+      listens: HashMap::new(),
     };
     Arc::new(Self {
       options,
@@ -671,6 +702,37 @@ impl Hub {
       return;
     };
     state.record(Some(&name), "in", frame.kind(), frame.summary());
+    if let Frame::StreamAccept { id, listen } = frame {
+      let target = port_of_listen(&listen).and_then(|port| state.listens.get(&name)?.get(&port).cloned());
+      let Some(target) = target else {
+        let reason = format!("no target stands for listen {listen}");
+        state.send(&name, &Frame::StreamClose { id, reason });
+        return;
+      };
+      let Some(agent) = state.agents.get_mut(&name) else {
+        return;
+      };
+      let (caller, events) = mpsc::unbounded_channel();
+      let window = Arc::new(SendWindow::default());
+      agent.streams.insert(
+        id.clone(),
+        OpenStream {
+          caller,
+          window: Arc::clone(&window),
+          inbound: ReceiveWindow::default(),
+        },
+      );
+      let end = StreamEnd {
+        hub: Arc::clone(self),
+        name: name.clone(),
+        socket_id: agent.link.socket_id,
+        id,
+        window,
+      };
+      drop(state);
+      tokio::spawn(carry_back(end, events, target));
+      return;
+    }
     state.route(&name, frame, self.options.max_payload_bytes);
   }
 
@@ -1020,6 +1082,64 @@ impl Hub {
     Ok((end, events))
   }
 
+  /// Have the named agent listen on `port` for streams back joined to `target`, now where it is attached
+  /// and on every later connection; a target the hub's configuration does not allow is refused.
+  pub fn listen(&self, name: &str, port: u16, target: &str) -> Result<(), ListenRefusal> {
+    if !self.options.reverse_targets.iter().any(|allowed| allowed == target) {
+      return Err(ListenRefusal::TargetNotAllowed);
+    }
+    let mut state = self.lock();
+    if let Some(agent) = state.agents.get(name)
+      && !agent.capabilities.contains(&format!("listen:{port}"))
+    {
+      return Err(ListenRefusal::PortNotOffered);
+    }
+    state.listens.entry(name.to_owned()).or_default().insert(port, target.to_owned());
+    state.send(
+      name,
+      &Frame::Listen {
+        id: listen_id(port),
+        port,
+      },
+    );
+    Ok(())
+  }
+
+  /// Stop the named agent listening on `port`; streams already accepted go on.
+  pub fn unlisten(&self, name: &str, port: u16) {
+    let mut state = self.lock();
+    if let Some(wanted) = state.listens.get_mut(name) {
+      wanted.remove(&port);
+    }
+    if let Some(agent) = state.agents.get_mut(name) {
+      agent.listening.remove(&port);
+    }
+    state.send(
+      name,
+      &Frame::Unlisten {
+        id: listen_id(port),
+      },
+    );
+  }
+
+  /// What the hub holds for the named agent to listen on: each port, its target, and whether the agent
+  /// listens on it now.
+  pub fn listens(&self, name: &str) -> Value {
+    let state = self.lock();
+    let listening = state.agents.get(name).map(|agent| agent.listening.clone()).unwrap_or_default();
+    let items: Vec<Value> = state
+      .listens
+      .get(name)
+      .map(|wanted| {
+        wanted
+          .iter()
+          .map(|(port, target)| json!({ "port": port, "target": target, "listening": listening.contains(port) }))
+          .collect()
+      })
+      .unwrap_or_default();
+    json!({ "agent": name, "listens": items })
+  }
+
   /// Tell the target agent to erase itself and depart; the name of the agent told. The leave is
   /// queued ahead of the socket's close, so the agent reads it before the connection ends.
   pub fn leave(&self, target: Option<&str>) -> Result<String, String> {
@@ -1071,6 +1191,67 @@ impl Hub {
       state.detach(&name, "hub shutting down", true);
     }
     links
+  }
+}
+
+/// Why a listen was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListenRefusal {
+  TargetNotAllowed,
+  PortNotOffered,
+}
+
+// The id a listen on a port goes by on the wire.
+fn listen_id(port: u16) -> String {
+  format!("l{port}")
+}
+
+// The port a listen's id names, where it names one.
+fn port_of_listen(id: &str) -> Option<u16> {
+  id.strip_prefix('l').and_then(|port| port.parse().ok())
+}
+
+// One stream back: the agent's accepted connection joined to a fresh connection to its target here, each
+// direction on its own until either ends.
+async fn carry_back(end: StreamEnd, mut events: mpsc::UnboundedReceiver<StreamEvent>, target: String) {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+  let Ok(socket) = tokio::net::TcpStream::connect(&target).await else {
+    return;
+  };
+  let _ = socket.set_nodelay(true);
+  let (mut reader, mut writer) = socket.into_split();
+  let upstream = async {
+    let mut buffer = vec![0; STREAM_CHUNK_BYTES];
+    let mut seq = 0;
+    loop {
+      match reader.read(&mut buffer).await {
+        Ok(0) | Err(_) => return,
+        Ok(read) => {
+          if !end.send(&mut seq, &buffer[..read]).await {
+            return;
+          }
+        }
+      }
+    }
+  };
+  let downstream = async {
+    while let Some(event) = events.recv().await {
+      match event {
+        StreamEvent::Data(data) => {
+          if writer.write_all(&data).await.is_err() {
+            return;
+          }
+          end.delivered(data.len() as u64);
+        }
+        StreamEvent::Closed(_) | StreamEvent::Failed(_) => return,
+        StreamEvent::Opened => {}
+      }
+    }
+  };
+  tokio::select! {
+    () = upstream => {}
+    () = downstream => {}
   }
 }
 
@@ -1169,6 +1350,7 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes,
       departed_path: None,
+      reverse_targets: Vec::new(),
     })
   }
 
@@ -1267,10 +1449,85 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes: CAP,
       departed_path: None,
+      reverse_targets: Vec::new(),
     });
     let bearer = format!("Bearer {}", agent_credential("k", "u7"));
     assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), None);
     assert_eq!(hub.authorize_agent(Some(b"Bearer s")), Some(None));
+  }
+
+  #[tokio::test]
+  async fn a_connection_the_agent_accepts_is_carried_back_to_the_listens_target() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a target");
+    let address = target.local_addr().expect("its address").to_string();
+    let hub = Hub::new(HubOptions {
+      secret: "s".into(),
+      agent_key: None,
+      control_token: "c".into(),
+      max_payload_bytes: CAP,
+      ping_interval: Duration::from_secs(3600),
+      missed_pong_limit: 3,
+      socket_backlog_bytes: CAP,
+      departed_path: None,
+      reverse_targets: vec![address.clone()],
+    });
+
+    // A target the hub does not allow is refused; so is a port an attached agent does not offer.
+    assert_eq!(hub.listen("pc", 4100, "127.0.0.1:1"), Err(ListenRefusal::TargetNotAllowed));
+    let (link, mut queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(
+      &link,
+      r#"{"type":"hello","v":1,"agent":"pc","agentVersion":"0.1.0","capabilities":["listen:4100"]}"#,
+    );
+    assert_eq!(hub.listen("pc", 4200, &address), Err(ListenRefusal::PortNotOffered));
+
+    // A listen asked of an attached agent goes out at once, and is asked again on its next connection.
+    assert_eq!(hub.listen("pc", 4100, &address), Ok(()));
+    let frames = queued(&mut queue);
+    assert_eq!(kinds(&frames), ["welcome", "listen"]);
+    hub.on_message(&link, r#"{"type":"listening","v":1,"id":"l4100"}"#);
+    assert_eq!(hub.listens("pc")["listens"][0]["listening"], json!(true));
+    let (again, mut again_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(
+      &again,
+      r#"{"type":"hello","v":1,"agent":"pc","agentVersion":"0.1.0","capabilities":["listen:4100"]}"#,
+    );
+    assert_eq!(kinds(&queued(&mut again_queue)), ["welcome", "listen"]);
+
+    // A connection the agent accepted reaches the target, and the target's answer goes back to the agent.
+    hub.on_message(&again, r#"{"type":"stream-accept","v":1,"id":"l4100.1","listen":"l4100"}"#);
+    let (mut accepted, _) = target.accept().await.expect("the hub's connection");
+    let piece = Frame::StreamData {
+      id: "l4100.1".into(),
+      seq: 0,
+      chunk: EncodedBytes::of(b"ping"),
+    };
+    hub.on_message(&again, &piece.encode());
+    let mut heard = [0u8; 4];
+    accepted.read_exact(&mut heard).await.expect("the agent's bytes");
+    assert_eq!(&heard, b"ping");
+    accepted.write_all(b"pong").await.expect("the answer");
+    let mut back = Vec::new();
+    for _ in 0..200 {
+      settle().await;
+      back.extend(queued(&mut again_queue));
+      if back.iter().any(|(frame, _)| matches!(frame, Frame::StreamData { .. })) {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let answered = back.iter().find_map(|(frame, _)| match frame {
+      Frame::StreamData { id, chunk, .. } if id == "l4100.1" => decode_bytes(chunk, CAP).ok(),
+      _ => None,
+    });
+    assert_eq!(answered.as_deref(), Some(&b"pong"[..]));
+
+    // Stopping a listen tells the agent and drops it from what the hub holds.
+    hub.unlisten("pc", 4100);
+    assert!(kinds(&queued(&mut again_queue)).contains(&"unlisten"));
+    assert_eq!(hub.listens("pc")["listens"], json!([]));
   }
 
   #[test]

@@ -22,7 +22,7 @@ use crate::config::AgentConfig;
 use crate::exec::{self, ExecRequest, Limits, RunHandle};
 use crate::log::Log;
 use crate::platform::Platform;
-use crate::stream::Streams;
+use crate::stream::{Accepted, Streams};
 use crate::transfer::Transfers;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -56,7 +56,8 @@ impl Agent {
   fn capabilities(&self) -> Vec<String> {
     let shells = Platform::HOST.shells().iter().map(|shell| format!("exec:{shell}"));
     let ports = self.config.stream_ports.iter().map(|port| format!("stream:{port}"));
-    shells.chain(["transfer".to_owned()]).chain(ports).collect()
+    let listens = self.config.listen_ports.iter().map(|port| format!("listen:{port}"));
+    shells.chain(["transfer".to_owned()]).chain(ports).chain(listens).collect()
   }
 
   fn hello(&self) -> Frame {
@@ -195,6 +196,8 @@ struct Session<'a> {
   runs: HashMap<String, RunHandle>,
   transfers: Transfers,
   streams: Streams,
+  // The connections accepted on the ports the hub asked the agent to listen on, each a stream back.
+  accepted: mpsc::UnboundedReceiver<Accepted>,
   welcomed: bool,
   leave: bool,
   last_inbound: Instant,
@@ -205,6 +208,7 @@ impl<'a> Session<'a> {
     let (sink, stream) = socket.split();
     let (out, frames) = mpsc::channel(OUTBOUND_FRAMES);
     let (close, closed) = oneshot::channel();
+    let (accepts, accepted) = mpsc::unbounded_channel();
     Self {
       agent,
       stream,
@@ -214,9 +218,12 @@ impl<'a> Session<'a> {
       streams: Streams::new(
         out.clone(),
         agent.config.stream_ports.clone(),
+        agent.config.listen_ports.clone(),
+        accepts,
         agent.config.max_payload_bytes,
         agent.log.clone(),
       ),
+      accepted,
       out,
       runs: HashMap::new(),
       welcomed: false,
@@ -262,6 +269,7 @@ impl<'a> Session<'a> {
           }
           self.send(Frame::Ping { ts: Number::from(epoch_ms()) }).await;
         }
+        Some(accepted) = self.accepted.recv() => self.streams.adopt(accepted).await,
         _ = &mut self.writer => break "a send failed: the socket is gone".to_owned(),
       }
     };
@@ -368,12 +376,16 @@ impl<'a> Session<'a> {
       Frame::StreamData { id, seq, chunk } => self.streams.data(&id, seq, &chunk).await,
       Frame::StreamAck { id, bytes } => self.streams.ack(&id, bytes),
       Frame::StreamClose { id, .. } => self.streams.close(&id),
+      Frame::Listen { id, port } => self.streams.listen(id, port).await,
+      Frame::Unlisten { id } => self.streams.unlisten(&id),
       // The agent's own kinds, arriving from the hub, are not the agent's to act on.
       Frame::Hello { .. }
       | Frame::Stdout { .. }
       | Frame::Stderr { .. }
       | Frame::Exit { .. }
       | Frame::StreamOpened { .. }
+      | Frame::Listening { .. }
+      | Frame::StreamAccept { .. }
       | Frame::Pong { .. } => {}
     }
     None

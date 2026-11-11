@@ -201,6 +201,20 @@ pub enum Frame {
     id: String,
     reason: String,
   },
+  Listen {
+    id: String,
+    port: u16,
+  },
+  Listening {
+    id: String,
+  },
+  Unlisten {
+    id: String,
+  },
+  StreamAccept {
+    id: String,
+    listen: String,
+  },
   Ping {
     ts: Number,
   },
@@ -231,6 +245,10 @@ impl Frame {
       Self::StreamData { .. } => "stream-data",
       Self::StreamAck { .. } => "stream-ack",
       Self::StreamClose { .. } => "stream-close",
+      Self::Listen { .. } => "listen",
+      Self::Listening { .. } => "listening",
+      Self::Unlisten { .. } => "unlisten",
+      Self::StreamAccept { .. } => "stream-accept",
       Self::Ping { .. } => "ping",
       Self::Pong { .. } => "pong",
     }
@@ -280,7 +298,11 @@ impl Frame {
         signal,
         canceled,
       } => json!({ "id": id, "code": code, "signal": signal, "canceled": canceled }),
-      Self::Cancel { id } | Self::StreamOpened { id } => json!({ "id": id }),
+      Self::Cancel { id } | Self::StreamOpened { id } | Self::Listening { id } | Self::Unlisten { id } => {
+        json!({ "id": id })
+      }
+      Self::Listen { id, port } => json!({ "id": id, "port": port }),
+      Self::StreamAccept { id, listen } => json!({ "id": id, "listen": listen }),
       Self::Leave => json!({}),
       Self::Error { id, code, message } => json!({ "id": id, "code": code, "message": message }),
       Self::TransferBegin {
@@ -409,7 +431,7 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
     return fail("missing-type", "frame is missing a string type");
   };
   let kind = kind.as_str();
-  const KNOWN: [&str; 20] = [
+  const KNOWN: [&str; 24] = [
     "hello",
     "welcome",
     "reject",
@@ -428,6 +450,10 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
     "stream-data",
     "stream-ack",
     "stream-close",
+    "listen",
+    "listening",
+    "unlisten",
+    "stream-accept",
     "ping",
     "pong",
   ];
@@ -590,6 +616,23 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
     "stream-close" => Ok(Frame::StreamClose {
       id: string_field(o, "id", "stream-close.id must be a string")?,
       reason: string_field(o, "reason", "stream-close.reason must be a string")?,
+    }),
+    "listen" => {
+      let id = string_field(o, "id", "listen.id must be a string")?;
+      let Some(port) = o.get("port").and_then(as_int).and_then(|port| u16::try_from(port).ok()) else {
+        return bad("listen.port must be a port number");
+      };
+      Ok(Frame::Listen { id, port })
+    }
+    "listening" => Ok(Frame::Listening {
+      id: string_field(o, "id", "listening.id must be a string")?,
+    }),
+    "unlisten" => Ok(Frame::Unlisten {
+      id: string_field(o, "id", "unlisten.id must be a string")?,
+    }),
+    "stream-accept" => Ok(Frame::StreamAccept {
+      id: string_field(o, "id", "stream-accept.id must be a string")?,
+      listen: string_field(o, "listen", "stream-accept.listen must be a string")?,
     }),
     _ => {
       // ping and pong: the probe's clock, any finite number, echoed as it came.

@@ -10,6 +10,8 @@ const BINARY = join(ROOT, "target", "debug", "jake-hub");
 
 /** The test seams the hub reads from its environment, set short so a liveness case takes milliseconds. */
 export interface HubSeams {
+  // The targets a stream back may reach, as JAKE_REVERSE_TARGETS names them.
+  reverseTargets?: string;
   pingIntervalMs?: number;
   missedPongLimit?: number;
   socketBacklogBytes?: number;
@@ -95,6 +97,7 @@ export async function startHubProcess(secret: string, controlToken: string, seam
   if (seams.pingIntervalMs !== undefined) env.JAKE_HUB_PING_INTERVAL_MS = String(seams.pingIntervalMs);
   if (seams.missedPongLimit !== undefined) env.JAKE_HUB_MISSED_PONG_LIMIT = String(seams.missedPongLimit);
   if (seams.socketBacklogBytes !== undefined) env.JAKE_HUB_SOCKET_BACKLOG_BYTES = String(seams.socketBacklogBytes);
+  if (seams.reverseTargets !== undefined) env.JAKE_REVERSE_TARGETS = seams.reverseTargets;
 
   const child = Bun.spawn([BINARY], { cwd: ROOT, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const stderr: string[] = [];

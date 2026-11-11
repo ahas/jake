@@ -255,6 +255,36 @@ export interface StreamCloseFrame {
   reason: string;
 }
 
+/** Hub → agent: listen on `port` at the agent's loopback for streams back, under the listen `id`. */
+export interface ListenFrame {
+  type: "listen";
+  v: number;
+  id: string;
+  port: number;
+}
+
+/** Agent → hub: the listen `id` is listened on. */
+export interface ListeningFrame {
+  type: "listening";
+  v: number;
+  id: string;
+}
+
+/** Hub → agent: stop the listen `id`; streams already accepted go on. */
+export interface UnlistenFrame {
+  type: "unlisten";
+  v: number;
+  id: string;
+}
+
+/** Agent → hub: a connection came in on the listen `listen`, carried as the stream `id`. */
+export interface StreamAcceptFrame {
+  type: "stream-accept";
+  v: number;
+  id: string;
+  listen: string;
+}
+
 /** Either side: a liveness probe carrying the sender's clock. */
 export interface PingFrame {
   type: "ping";
@@ -288,6 +318,10 @@ export type Frame =
   | StreamDataFrame
   | StreamAckFrame
   | StreamCloseFrame
+  | ListenFrame
+  | ListeningFrame
+  | UnlistenFrame
+  | StreamAcceptFrame
   | PingFrame
   | PongFrame;
 
@@ -351,6 +385,10 @@ const KNOWN_TYPES: ReadonlySet<string> = new Set<FrameType>([
   "stream-data",
   "stream-ack",
   "stream-close",
+  "listen",
+  "listening",
+  "unlisten",
+  "stream-accept",
   "ping",
   "pong",
 ]);
@@ -613,6 +651,26 @@ export function decodeFrame(raw: string, options: DecodeOptions): DecodeResult {
       if (!isString(parsed.id)) return fail("bad-field", "stream-close.id must be a string");
       if (!isString(parsed.reason)) return fail("bad-field", "stream-close.reason must be a string");
       return { ok: true, frame: { type, v, id: parsed.id, reason: parsed.reason } };
+    }
+
+    case "listen": {
+      if (!isString(parsed.id)) return fail("bad-field", "listen.id must be a string");
+      if (!isInt(parsed.port) || parsed.port < 0 || parsed.port > 65535) {
+        return fail("bad-field", "listen.port must be a port number");
+      }
+      return { ok: true, frame: { type, v, id: parsed.id, port: parsed.port } };
+    }
+
+    case "listening":
+    case "unlisten": {
+      if (!isString(parsed.id)) return fail("bad-field", `${type}.id must be a string`);
+      return { ok: true, frame: { type, v, id: parsed.id } };
+    }
+
+    case "stream-accept": {
+      if (!isString(parsed.id)) return fail("bad-field", "stream-accept.id must be a string");
+      if (!isString(parsed.listen)) return fail("bad-field", "stream-accept.listen must be a string");
+      return { ok: true, frame: { type, v, id: parsed.id, listen: parsed.listen } };
     }
 
     case "ping":

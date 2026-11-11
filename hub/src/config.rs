@@ -25,6 +25,8 @@ pub struct HubConfig {
   pub missed_pong_limit: u32,
   pub socket_backlog_bytes: usize,
   pub departed_path: PathBuf,
+  /// The `host:port` targets a stream back from an agent may reach; none unless set.
+  pub reverse_targets: Vec<String>,
 }
 
 /// What a client of the running hub needs to reach its control API, from the hub's own file.
@@ -140,6 +142,17 @@ fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
     )
     .map_err(|_| "JAKE_HUB_MISSED_PONG_LIMIT is too large.".to_owned())?,
     socket_backlog_bytes: env.count("JAKE_HUB_SOCKET_BACKLOG_BYTES", DEFAULT_SOCKET_BACKLOG_BYTES)?,
+    reverse_targets: env
+      .present("JAKE_REVERSE_TARGETS")
+      .map(|targets| {
+        targets
+          .split(',')
+          .map(str::trim)
+          .filter(|target| !target.is_empty())
+          .map(str::to_owned)
+          .collect()
+      })
+      .unwrap_or_default(),
     departed_path,
   })
 }

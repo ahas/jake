@@ -483,6 +483,46 @@ describe("byte streams", () => {
   });
 });
 
+describe("streams back", () => {
+  let connection: HubConnection;
+  let listenPort: number;
+
+  beforeAll(async () => {
+    const vacated = new StandInPort();
+    listenPort = vacated.port;
+    vacated.stop();
+    const hub = standInHub();
+    agent(hub.url, { JAKE_LISTEN_PORTS: `${listenPort}` });
+    connection = await hub.welcomed(0);
+  });
+
+  test("advertises every port its config lets it listen on", () => {
+    expect((connection.frames[0] as WireFrame).capabilities).toContain(`listen:${listenPort}`);
+  });
+
+  test("listens at its loopback, and carries an accepted connection back as a stream of its own", async () => {
+    connection.send({ type: "listen", id: "l1", port: listenPort });
+    await connection.next((f) => f.id === "l1" && f.type === "listening", "the listen");
+    const client = await Bun.connect({ hostname: "127.0.0.1", port: listenPort, socket: { data() {} } });
+    const accept = await connection.next((f) => f.type === "stream-accept", "the accept");
+    expect(accept).toMatchObject({ listen: "l1" });
+    const hello = Buffer.from("tool call");
+    client.write(hello);
+    const id = accept.id as string;
+    await until("the client's bytes at the hub", () =>
+      Buffer.concat(connection.all((f) => f.id === id && f.type === "stream-data").map(bytesOf)).equals(hello)
+    );
+    client.end();
+    await connection.next((f) => f.id === id && f.type === "stream-close", "the close");
+    connection.send({ type: "unlisten", id: "l1" });
+  });
+
+  test("refuses to listen on a port its config does not allow", async () => {
+    connection.send({ type: "listen", id: "l9", port: 9 });
+    expect(await connection.next((f) => f.id === "l9", "the refusal")).toMatchObject({ type: "error", code: "port-not-allowed" });
+  });
+});
+
 describe("leaving", () => {
   test("a leave stops the agent, hands its removal to a detached systemd unit, and exits", async () => {
     const home = tempDir();

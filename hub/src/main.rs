@@ -48,6 +48,7 @@ async fn run() -> Result<(), String> {
     missed_pong_limit: config.missed_pong_limit,
     socket_backlog_bytes: config.socket_backlog_bytes,
     departed_path: Some(config.departed_path),
+    reverse_targets: config.reverse_targets,
   });
 
   let agent_listener = bind(&config.host, config.port).await?;

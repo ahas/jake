@@ -107,7 +107,8 @@ a connection to a port on this machine and carries its bytes, so nothing has to 
 the machine needs an SSH server listening on it, and the key main-host logs in with.
 
 The agent lets the hub reach only the ports listed in `JAKE_STREAM_PORTS` in `agent.env`, port 22
-by default. The install takes two options for this, and both may be left out:
+by default. It listens for streams back only on the ports listed in `JAKE_LISTEN_PORTS`, none by
+default, at its loopback alone (docs/architecture.md, 「Carrying a byte stream back」). The install takes two options for this, and both may be left out:
 
 - **Stream ports** — `--stream-ports 22` (Linux/WSL) or `-StreamPorts 22` (Windows): the ports, comma
   separated, or `none` to refuse every stream. Left out, `agent.env` keeps what it has.

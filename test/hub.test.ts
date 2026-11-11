@@ -980,6 +980,30 @@ describe("byte streams", () => {
   });
 });
 
+describe("streams back", () => {
+  test("a listen is asked of the agent, refused for a target the hub does not allow, and listed with its state", async () => {
+    const hub = await launch({ reverseTargets: "127.0.0.1:4555" });
+    const agent = await attach(hub.agentPort, ["listen:4100"], "pc-a");
+
+    const refused = await control(hub, "/listen?agent=pc-a&port=4100", { method: "POST", body: JSON.stringify({ target: "127.0.0.1:1" }) });
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ code: "target-not-allowed" });
+    const unoffered = await control(hub, "/listen?agent=pc-a&port=4200", { method: "POST", body: JSON.stringify({ target: "127.0.0.1:4555" }) });
+    expect(await unoffered.json()).toMatchObject({ code: "port-not-offered" });
+
+    const asked = await control(hub, "/listen?agent=pc-a&port=4100", { method: "POST", body: JSON.stringify({ target: "127.0.0.1:4555" }) });
+    expect(asked.status).toBe(200);
+    const listen = (await agent.waitFor((f) => f.type === "listen")) as { id: string; port: number };
+    expect(listen.port).toBe(4100);
+    agent.send({ type: "listening", v: V, id: listen.id });
+    await until(async () => (await (await control(hub, "/listens?agent=pc-a")).json()).listens[0]?.listening === true);
+
+    expect((await control(hub, "/listen?agent=pc-a&port=4100", { method: "DELETE" })).status).toBe(200);
+    await agent.waitFor((f) => f.type === "unlisten");
+    expect((await (await control(hub, "/listens?agent=pc-a")).json()).listens).toEqual([]);
+  });
+});
+
 describe("leave", () => {
   test("relays a leave frame to the attached agent", async () => {
     const hub = await launch();

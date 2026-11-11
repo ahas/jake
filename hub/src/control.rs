@@ -19,7 +19,7 @@ use tokio::time::{Instant, interval_at};
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 
 use crate::config::leading_int;
-use crate::core::{Event, Events, ExecParams, Hub, Refusal, StreamEvent, UploadParams};
+use crate::core::{Event, Events, ExecParams, Hub, ListenRefusal, Refusal, StreamEvent, UploadParams};
 use crate::protocol::{checksum, is_shell_kind, shell_kinds};
 
 /// A stream sends nothing between events, so a comment holds the connection open through a quiet stretch.
@@ -322,7 +322,7 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
   let query = Query::of(&request);
   let (mut parts, body) = request.into_parts();
 
-  match (method, path.as_str()) {
+  match (method.clone(), path.as_str()) {
     (Method::GET, "/status") => json(200, &hub.status()),
     (Method::GET, "/events") => {
       let after = query.get("after").and_then(leading_int).unwrap_or(0).max(0) as u64;
@@ -379,6 +379,40 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
         Err(reason) => json(409, &json!({ "ok": false, "reason": reason })),
       },
     },
+    (Method::POST | Method::DELETE, "/listen") => {
+      let Some(name) = query.agent().filter(|name| !name.is_empty()).map(str::to_owned) else {
+        return error(400, "the agent query parameter is required");
+      };
+      let Some(port) = query.get("port").and_then(|port| port.parse::<u16>().ok()).filter(|port| *port > 0)
+      else {
+        return error(400, "the port query parameter must be a port number");
+      };
+      if method == Method::DELETE {
+        hub.unlisten(&name, port);
+        return json(200, &json!({ "ok": true }));
+      }
+      let Some(target) = body_json(body).await.get("target").and_then(Value::as_str).map(str::to_owned)
+      else {
+        return error(400, "target must be a host:port string");
+      };
+      match hub.listen(&name, port, &target) {
+        Ok(()) => json(200, &json!({ "ok": true })),
+        Err(ListenRefusal::TargetNotAllowed) => json(
+          403,
+          &json!({ "error": format!("{target} is not among the hub's JAKE_REVERSE_TARGETS"), "code": "target-not-allowed" }),
+        ),
+        Err(ListenRefusal::PortNotOffered) => json(
+          403,
+          &json!({ "error": format!("agent {name} does not offer to listen on port {port}: its JAKE_LISTEN_PORTS must list it"), "code": "port-not-offered" }),
+        ),
+      }
+    }
+    (Method::GET, "/listens") => {
+      let Some(name) = query.agent().filter(|name| !name.is_empty()) else {
+        return error(400, "the agent query parameter is required");
+      };
+      json(200, &hub.listens(name))
+    }
     (Method::GET, "/connect") => {
       let Some(port) = query.get("port").and_then(|port| port.parse::<u16>().ok()).filter(|port| *port > 0)
       else {

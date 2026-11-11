@@ -113,6 +113,24 @@ with a stream-close naming it.
 A stream lives on the connection it was opened over. When that connection drops, every stream on it
 is over on both sides, and nothing of a stream crosses to a later connection.
 
+Streams back:
+
+- **listen** — hub to agent: listen on a port of the agent's own loopback, carrying a hub-chosen id and
+  the port. The agent listens only on a port its configuration allows, the ports its hello advertised
+  as `listen:<port>`; any other is answered with an **error** frame coded `port-not-allowed`, and a port
+  it cannot bind with one coded `bind-failed`.
+- **listening** — agent to hub: the port is listened on, carrying the listen's id.
+- **unlisten** — hub to agent: stop listening, carrying the listen's id. Streams already accepted on it
+  go on. It is not answered.
+- **stream-accept** — agent to hub: a connection came in on a listened port. It carries an
+  agent-chosen stream id and the listen's id. From here the stream is a byte stream like any other:
+  stream-data, stream-ack and stream-close carry it both ways, each side paced by the window, and the
+  agent may send its bytes at once. The hub joins it to the target it named for that listen; a target
+  that cannot be reached is answered with a stream-close.
+
+A listen lives on the connection it was asked over, as a stream does. When the connection drops the
+agent stops listening; the hub asks again on the agent's next connection.
+
 Departure:
 
 - **leave** — hub to agent: uninstall jake from the machine and depart. It carries nothing beyond the

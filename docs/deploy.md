@@ -27,7 +27,9 @@ chmod 600 ~/.local/share/jake/hub.env
 ```
 
 `JAKE_AGENT_KEY` is optional: set it (`openssl rand -hex 32`) to admit agents by a credential of their own name
-(docs/architecture.md), and give the same value to whoever mints those credentials. `JAKE_SECRET` and
+(docs/architecture.md), and give the same value to whoever mints those credentials. `JAKE_REVERSE_TARGETS` is
+optional too: the `host:port` targets, comma separated, a stream back from an agent may reach (docs/architecture.md,
+「Carrying a byte stream back」); left out, none may. `JAKE_SECRET` and
 `JAKE_CONTROL_TOKEN` are required and have no default; leave the others commented to
 take their defaults. The hub listens on `JAKE_HUB_PORT` (8790 by default) bound to `JAKE_HUB_HOST`
 (0.0.0.0, so it accepts the connection NPM forwards). If you change the port here, change it in the

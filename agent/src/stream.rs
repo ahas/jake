@@ -1,5 +1,4 @@
-// Byte streams to the machine's own ports: one local TCP connection per stream, its bytes carried
-// both ways in pieces the stream's window paces.
+// Byte streams to and from the machine's own ports, each one local TCP connection paced by its window.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -8,8 +7,8 @@ use std::time::Duration;
 use jake_protocol::{EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SendWindow, decode_bytes};
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -35,24 +34,124 @@ impl Drop for Open {
   }
 }
 
-/// Every stream open on one connection. The connection feeds it the stream frames in order.
+/// A connection accepted on a listened port: the stream id the agent gives it, the listen's id and the socket.
+pub struct Accepted {
+  id: String,
+  listen: String,
+  socket: TcpStream,
+}
+
+// A port the agent listens on for the hub; dropping it stops listening.
+struct Listening(JoinHandle<()>);
+
+impl Drop for Listening {
+  fn drop(&mut self) {
+    self.0.abort();
+  }
+}
+
+/// Every stream open on one connection, and every port listened on for streams back. The connection
+/// feeds it the stream frames in order.
 pub struct Streams {
   out: mpsc::Sender<Frame>,
   allowed: Vec<u16>,
+  listen_ports: Vec<u16>,
+  accepts: mpsc::UnboundedSender<Accepted>,
   max_payload_bytes: usize,
   log: Log,
   open: HashMap<String, Open>,
+  listens: HashMap<String, Listening>,
 }
 
 impl Streams {
-  pub fn new(out: mpsc::Sender<Frame>, allowed: Vec<u16>, max_payload_bytes: usize, log: Log) -> Self {
+  pub fn new(
+    out: mpsc::Sender<Frame>,
+    allowed: Vec<u16>,
+    listen_ports: Vec<u16>,
+    accepts: mpsc::UnboundedSender<Accepted>,
+    max_payload_bytes: usize,
+    log: Log,
+  ) -> Self {
     Self {
       out,
       allowed,
+      listen_ports,
+      accepts,
       max_payload_bytes,
       log,
       open: HashMap::new(),
+      listens: HashMap::new(),
     }
+  }
+
+  /// Listen on `port` at this machine's loopback, if the machine's config lets the agent listen there; each
+  /// connection accepted is handed to the connection as a stream back.
+  pub async fn listen(&mut self, id: String, port: u16) {
+    if !self.listen_ports.contains(&port) {
+      let message = format!("port {port} is not among this machine's listen ports");
+      return self.refuse(id, "port-not-allowed", message).await;
+    }
+    self.listens.remove(&id);
+    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+      Ok(listener) => listener,
+      Err(error) => return self.refuse(id, "bind-failed", format!("127.0.0.1:{port}: {error}")).await,
+    };
+    let accepts = self.accepts.clone();
+    let listen = id.clone();
+    let task = tokio::spawn(async move {
+      let mut count = 0u64;
+      while let Ok((socket, _)) = listener.accept().await {
+        count += 1;
+        let accepted = Accepted {
+          id: format!("{listen}.{count}"),
+          listen: listen.clone(),
+          socket,
+        };
+        if accepts.send(accepted).is_err() {
+          return;
+        }
+      }
+    });
+    self.listens.insert(id.clone(), Listening(task));
+    self.log.info("listening", json!({ "id": id, "port": port }));
+    let _ = self.out.send(Frame::Listening { id }).await;
+  }
+
+  /// Stop listening; streams already accepted go on.
+  pub fn unlisten(&mut self, id: &str) {
+    self.listens.remove(id);
+  }
+
+  /// A connection accepted on a listened port, told to the hub and carried as a stream like any other.
+  pub async fn adopt(&mut self, accepted: Accepted) {
+    let Accepted { id, listen, socket } = accepted;
+    let frame = Frame::StreamAccept {
+      id: id.clone(),
+      listen,
+    };
+    if self.out.send(frame).await.is_err() {
+      return;
+    }
+    let (inbound, inbound_rx) = mpsc::unbounded_channel();
+    let receive = Arc::new(Mutex::new(ReceiveWindow::default()));
+    let send = Arc::new(SendWindow::default());
+    let carrier = Carrier {
+      id: id.clone(),
+      out: self.out.clone(),
+      receive: Arc::clone(&receive),
+      send: Arc::clone(&send),
+      log: self.log.clone(),
+    };
+    let task = tokio::spawn(carrier.carry(socket, inbound_rx));
+    self.open.insert(
+      id,
+      Open {
+        task,
+        inbound,
+        receive,
+        send,
+      },
+    );
   }
 
   async fn refuse(&self, id: String, code: &str, message: String) {
@@ -132,9 +231,10 @@ impl Streams {
     self.open.remove(id);
   }
 
-  /// Drop every stream, the socket they belonged to being gone.
+  /// Drop every stream and stop every listen, the socket they belonged to being gone.
   pub fn abandon(&mut self) {
     self.open.clear();
+    self.listens.clear();
   }
 }
 
@@ -156,7 +256,6 @@ impl Carrier {
         return self.refuse(format!("localhost:{port} did not accept within {CONNECT_TIMEOUT:?}")).await;
       }
     };
-    let _ = socket.set_nodelay(true);
     if self
       .out
       .send(Frame::StreamOpened {
@@ -168,6 +267,12 @@ impl Carrier {
       return;
     }
     self.log.info("stream-opened", json!({ "id": self.id, "port": port }));
+    self.carry(socket, inbound).await;
+  }
+
+  // The connection's bytes carried both ways until either way ends, then the stream closed.
+  async fn carry(self, socket: TcpStream, inbound: mpsc::UnboundedReceiver<Vec<u8>>) {
+    let _ = socket.set_nodelay(true);
     let (reader, writer) = socket.into_split();
     // Whichever way ends first ends the stream; the other is dropped with the connection.
     let reason = tokio::select! {

@@ -358,6 +358,30 @@ give very different footing for keeping a per-user process running.
   on it and the agent closes every TCP connection it opened for one, so ssh sees its connection
   close and can dial again; once the agent has redialled, a new stream reaches the machine as before.
 
+
+## Carrying a byte stream back
+
+- A stream back joins a program on the agent's machine to a TCP target on main-host: a program that
+  connects to a port on the machine's own loopback reaches a service on main-host as if it ran there.
+  Its use is what a work node's link carries the other way — the tool host's port and the home bridge
+  — so a machine reached through the hub alone needs no SSH for it.
+- The hub decides where a stream back may go, and the machine decides where it may listen. The hub's
+  configuration holds the targets a stream back may reach, `JAKE_REVERSE_TARGETS`, none unless set; a
+  caller names one for a port of an agent through the control API, and the hub refuses any other. The
+  agent's configuration holds the ports it may listen on, `JAKE_LISTEN_PORTS`, none unless set; the
+  agent advertises each in its hello and refuses a listen on any other. The agent listens at its
+  loopback alone, so nothing beyond the machine reaches the port.
+- A caller asks through the control API: `POST /listen?agent=<name>&port=<port>` with `target` in its body
+  listens for that agent on that port, `DELETE /listen?agent=<name>&port=<port>` stops, and `GET
+  /listens?agent=<name>` answers what the hub holds for the agent, each port with its target and whether
+  the agent listens on it now. A target the hub does not allow is refused 403 `target-not-allowed`; a port
+  the agent does not offer, 403 `port-not-offered` once the agent is attached.
+- The hub keeps what it was asked to listen for, by agent and port, for as long as it runs: it asks the
+  agent to listen as the agent attaches, and again on every later connection, so a machine that
+  dropped listens again once it is back. A caller asks again after the hub itself restarts.
+- Each connection the agent accepts is a stream of its own, carried and paced as a stream the hub
+  opened is (「Carrying a byte stream」), and joined on main-host to a fresh connection to the target.
+
 ## The console
 
 - 하스 must be able to see, from a console, which agents are attached and whether commands are

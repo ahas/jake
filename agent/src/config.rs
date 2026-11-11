@@ -34,6 +34,8 @@ pub struct AgentConfig {
   pub redial_cap: Duration,
   /// The local ports a byte stream from the hub may reach.
   pub stream_ports: Vec<u16>,
+  /// The local ports the agent may listen on for streams back to the hub, at its loopback alone.
+  pub listen_ports: Vec<u16>,
 }
 
 /// The environment the agent runs against: agent.env beside the executable, under the process's own.
@@ -130,6 +132,7 @@ pub fn read(env: &HashMap<String, String>) -> Result<AgentConfig, String> {
     redial_base: env.millis("JAKE_REDIAL_BASE_MS", DEFAULT_REDIAL_BASE_MS)?,
     redial_cap: env.millis("JAKE_REDIAL_CAP_MS", DEFAULT_REDIAL_CAP_MS)?,
     stream_ports: env.ports("JAKE_STREAM_PORTS", DEFAULT_STREAM_PORTS)?,
+    listen_ports: env.ports("JAKE_LISTEN_PORTS", NO_STREAM_PORTS)?,
   })
 }
 
