@@ -17,6 +17,8 @@ const DEFAULT_REDIAL_CAP_MS: i64 = 60_000;
 const DEFAULT_STREAM_PORTS: &str = "22";
 // The value of the port list that lets no stream reach the machine.
 const NO_STREAM_PORTS: &str = "none";
+// The byte order mark Windows tools put before UTF-8 text, which the env parser would read as part of the first key.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// What the agent needs to dial the hub, serve it, and keep itself alive.
 #[derive(Clone, Debug)]
@@ -46,8 +48,9 @@ pub fn merged(
   let path = install_dir.join("agent.env");
   let mut merged = HashMap::new();
   if path.exists() {
-    let entries = dotenvy::from_path_iter(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    for entry in entries {
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(&bytes);
+    for entry in dotenvy::from_read_iter(body) {
       let (key, value) = entry.map_err(|error| format!("{}: {error}", path.display()))?;
       merged.insert(key, value);
     }
@@ -195,5 +198,18 @@ mod tests {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(merged["JAKE_AGENT_NAME"], "from file");
     assert_eq!(merged["JAKE_SECRET"], "process");
+  }
+
+  #[test]
+  fn a_byte_order_mark_before_the_file_is_skipped() {
+    let dir = std::env::temp_dir().join(format!("jake-config-bom-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.env"), "\u{FEFF}JAKE_HUB_URL=wss://hub\r\nJAKE_SECRET=file\r\n")
+      .unwrap();
+    let merged = merged(&dir, HashMap::new());
+    std::fs::remove_dir_all(&dir).unwrap();
+    let merged = merged.unwrap();
+    assert_eq!(merged["JAKE_HUB_URL"], "wss://hub");
+    assert_eq!(merged["JAKE_SECRET"], "file");
   }
 }

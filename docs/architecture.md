@@ -424,7 +424,8 @@ give very different footing for keeping a per-user process running.
 - The installer runs in 하스's own user session without elevation. It places the binary in a per-user
   location and writes the hub URL, the shared secret, and the agent name into the config file beside
   it — the credential is entered at install time and exists only in that file, never in the repository
-  and never in the executable. It then registers the agent so it stays running by the means the host
+  and never in the executable. The file is written as UTF-8 without a byte order mark, and the agent
+  skips one at its start all the same, since a Windows editor may save the file with one. It then registers the agent so it stays running by the means the host
   offers: on Windows all three anchors for both run modes, starting the pair; on Linux a
   `systemd --user` unit with lingering enabled, started at once, failing loudly where systemd is not
   available. It verifies by reading the agent's own local log for a record that it reached the hub,

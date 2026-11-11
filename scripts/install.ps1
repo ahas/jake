@@ -192,7 +192,10 @@ Set-EnvKey $lines 'JAKE_HUB_URL' $HubUrl
 Set-EnvKey $lines 'JAKE_SECRET' $Secret
 Set-EnvKey $lines 'JAKE_AGENT_NAME' $AgentName
 if ($StreamPorts) { Set-EnvKey $lines 'JAKE_STREAM_PORTS' $StreamPorts }
-Set-Content -LiteralPath $envPath -Value $lines -Encoding UTF8
+# Windows PowerShell's UTF8 encoding writes a byte order mark, so the file is written through .NET
+# without one; .NET resolves a relative path against the process directory, so it gets the full path.
+$envFullPath = Join-Path (Resolve-Path -LiteralPath $InstallDir).ProviderPath 'agent.env'
+[System.IO.File]::WriteAllLines($envFullPath, $lines, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "config written (credential stays on this machine only)"
 
 # --- the SSH side of a byte stream: the key it logs in with, and an sshd to answer -----------------
