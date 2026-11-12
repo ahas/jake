@@ -447,6 +447,8 @@ give very different footing for keeping a per-user process running.
   newer than it, then replaces itself with the hub, so the unit's main process is the hub alone and
   a restart always runs what the checkout holds. A start after the build output was swept compiles
   first and listens once that build ends; the crates it needs are fetched once, at deployment.
+  Before every start the unit also installs the release binary at `~/.local/bin/jake-hub`, and the
+  build leaves the copy ssh calls in the checkout, so a restart restores the CLI as well as the hub.
 - The hub is one thread. Everything it does is relaying — frames in, frames out, a running hash over
   a download — so it waits on sockets rather than on the processor, and an idle hub with every agent
   attached sits at a few megabytes. Every accepted connection sends each write at once, without

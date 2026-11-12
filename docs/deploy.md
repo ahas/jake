@@ -8,8 +8,9 @@ Nothing here is run as part of building the hub. Opening the firewall port, crea
 writing the NPM proxy host and reloading nginx, and enabling the service all change live
 infrastructure, so they belong to a deployment turn, not to a build. Run them from main-host unless a step says otherwise.
 
-The four committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
-config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, and this document.
+The five committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
+config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the hub CLI install
+script `scripts/install-hub-cli.sh`, and this document.
 
 ## 1. The config file
 
@@ -47,6 +48,14 @@ cargo fetch --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
 cargo build --release --frozen --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
 ```
 
+The unit's `ExecStartPre` runs `scripts/install-hub-cli.sh` on every start. It builds
+`target/release/jake-hub` and copies it to `~/.local/bin/jake-hub`, so the CLI that ssh calls
+survives a sweep of the checkout's target directory. Run it by hand once after the build above:
+
+```sh
+bash ~/repos/ahas/jake/scripts/install-hub-cli.sh
+```
+
 Then link the unit into the user unit directory, enable it, and turn on lingering so it runs across
 a reboot without an interactive login.
 
@@ -58,9 +67,15 @@ systemctl --user enable --now jake-hub
 loginctl enable-linger "$USER"
 ```
 
-The unit will not start until the config file from step 1 exists — that is what the
+The unit will not start until the config file from step 1 exists, which is what the
 `ConditionPathExists` guards. A restart runs whatever the checkout holds, rebuilding first if the
-crate changed, so putting a new hub live is `systemctl --user restart jake-hub`. Confirm it came up:
+crate changed, so putting a new hub live is `systemctl --user restart jake-hub`. The ssh
+`ProxyCommand` runs `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`, so the
+checkout must keep that binary. The same start runs the install script, which rebuilds it and copies
+it to `~/.local/bin/jake-hub`; a restart therefore leaves both paths working.
+
+After the unit file itself changes, run `systemctl --user daemon-reload` once so systemd reads the
+new start step; after that a restart is enough. Confirm it came up:
 
 ```sh
 systemctl --user status jake-hub
@@ -167,10 +182,13 @@ place.
 ## 7. ssh to a machine behind the tunnel
 
 The `ProxyCommand` that carries ssh to an agent's machine is the hub's own release binary, run in its
-connect mode: `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`. It is the binary
-the unit builds in step 2, so a hub restart brings it up to date as well, and it reads the control
-port and token from the same `hub.env`. Where a sweep of the build output has removed it, the first
-`systemctl --user restart jake-hub` builds it again.
+connect mode: `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`. ssh is configured
+to call that checkout path, so a build must leave the binary there. The unit's `ExecStartPre` runs
+`scripts/install-hub-cli.sh`, which builds it, and the script keeps a second copy at
+`~/.local/bin/jake-hub` for use outside ssh. Both read the control port and token from the same
+`hub.env`. `bun run check` builds the CLI and fails when either path is missing, so a swept target
+directory is reported by the check rather than by the next ssh. A sweep while the hub is running
+still breaks ssh until the next restart, because the running hub holds the deleted file.
 
 The machine side — an SSH server, the agent's `JAKE_STREAM_PORTS`, and main-host's key in the
 account's authorized keys — is in docs/install.md, and the `~/.ssh/config` block, with herdr's saved

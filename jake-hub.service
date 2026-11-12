@@ -16,6 +16,10 @@ StartLimitBurst=5
 # are newer than the binary, offline from the crates already fetched, and then replaces itself with
 # the hub, so the unit's main process is the hub and a restart runs whatever the checkout holds.
 WorkingDirectory=%h/repos/ahas/jake
+# The release build above leaves the CLI in the checkout's target directory, where a sweep of that
+# directory would take it from ssh. This installs the same binary outside the checkout and rebuilds
+# the checkout's copy on every start, so a restart leaves both paths working.
+ExecStartPre=%h/repos/ahas/jake/scripts/install-hub-cli.sh
 ExecStart=%h/.cargo/bin/cargo run --release --frozen --quiet --manifest-path hub/Cargo.toml
 # The journal names the hub, not the cargo that started it.
 SyslogIdentifier=jake-hub

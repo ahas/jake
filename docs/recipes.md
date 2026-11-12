@@ -106,6 +106,8 @@ Host jake_wsl
   ServerAliveInterval 30
 ```
 
+- The proxy path is the checkout's release binary. The unit's start and `scripts/install-hub-cli.sh`
+  build it, and `bun run check` fails when it is missing after a build.
 - Then `ssh jake_wsl` logs in, and `scp` and `rsync -e ssh` work the same way.
 - herdr's saved SSH machines ride on the same entry, because herdr reaches a remote machine through
   ssh. `herdr machine add jake_wsl` prepares the herdr server on the machine and saves it, and

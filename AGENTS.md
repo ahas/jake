@@ -9,7 +9,8 @@
   --target x86_64-pc-windows-gnu --all-targets -- -D warnings` checks its Windows half, which the
   Linux check does not compile.
 - `bun run check` is the whole check: the TypeScript typecheck, clippy and rustfmt over the
-  workspace, its own Rust tests, then the bun suite.
+  workspace, a release build of the hub CLI whose documented paths are then verified, its own Rust
+  tests, then the bun suite.
 - The agent's contract tests build the agent and start it as its own process against a stand-in hub,
   so they hold whatever the agent is written in to the tunnel it speaks.
 - The hub's contract tests in the bun suite build the hub and start it as its own process, so they
