@@ -1150,6 +1150,42 @@ describe("the hub executable's exec", () => {
     own.send({ type: "exit", v: V, id: exec.id, code: null, signal: null, canceled: true });
     expect(await run.exited).toBe(130);
   });
+
+  test("an agent cut off in the middle of a command ends the run as failed, saying why", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, [], "u4");
+    const run = hubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["exec", "--shell", "linux", "sleep", "60"]);
+    await agent.waitFor((f) => f.type === "exec", 10_000);
+
+    agent.ws.close();
+    expect(await run.exited).toBe(4);
+    expect(await new Response(run.stderr).text()).toContain("connection ended: agent connection closed");
+  });
+
+  test("a hub killed in the middle of a command fails the run, and once it is back the same scoped credential reaches the redialled agent", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "jake-hub-restart-"));
+    dirs.push(dataDir);
+    const first = await launch({ controlKey: "ck", dataDir });
+    const ports: [number, number] = [first.agentPort, first.controlPort];
+    startRealAgent(`ws://127.0.0.1:${first.agentPort}`, SECRET);
+    const attached = (hub: HubProcess) => async (): Promise<boolean> =>
+      (await (await control(hub, "/status")).json()).agents.some((a: { name: string }) => a.name === "hass");
+    await until(attached(first), 2_000);
+    const scoped = { JAKE_CONTROL_CREDENTIAL: await mint(first, "ck", ["hass"]) };
+
+    const cut = hubClient(first, scoped, ["exec", "--shell", "linux", "sleep", "60"]);
+    await until(async () => (await (await control(first, "/status")).json()).agents[0]?.inFlight.length === 1, 2_000);
+    await first.crash();
+    expect(await cut.exited).toBe(4);
+    expect(await new Response(cut.stderr).text()).toContain("connection ended");
+
+    // The credential holds no state of the hub's, so the hub started again on the same key takes it.
+    const second = await launch({ controlKey: "ck", dataDir, ports });
+    await until(attached(second), 2_000);
+    const again = hubClient(second, scoped, ["exec", "--shell", "linux", "echo", "back"]);
+    expect(await again.exited).toBe(0);
+    expect(await new Response(again.stdout).text()).toBe("back\n");
+  });
 });
 
 describe("the control API carries no capability calls", () => {

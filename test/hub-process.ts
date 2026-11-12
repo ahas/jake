@@ -14,6 +14,8 @@ export interface HubSeams {
   reverseTargets?: string;
   // The key scoped control credentials are made with, as JAKE_CONTROL_KEY.
   controlKey?: string;
+  /** The agent and control ports to bind, so a hub started again answers where the last one did; free ones when omitted. */
+  ports?: [number, number];
   pingIntervalMs?: number;
   missedPongLimit?: number;
   socketBacklogBytes?: number;
@@ -27,6 +29,8 @@ export interface HubProcess {
   controlPort: number;
   stderr: string[];
   stop(): Promise<void>;
+  /** End the process at once, with no shutdown of its own, as a crash would. */
+  crash(): Promise<void>;
 }
 
 let built = false;
@@ -90,7 +94,7 @@ export function startHubClient(
 /** Start a hub with the given secret and control token, returning once it says it is listening. */
 export async function startHubProcess(secret: string, controlToken: string, seams: HubSeams = {}): Promise<HubProcess> {
   ensureHubBuilt();
-  const [agentPort, controlPort] = freePorts();
+  const [agentPort, controlPort] = seams.ports ?? freePorts();
   const dataDir = seams.dataDir ?? mkdtempSync(join(tmpdir(), "jake-hub-"));
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
@@ -123,11 +127,16 @@ export async function startHubProcess(secret: string, controlToken: string, seam
     if (seams.dataDir === undefined) rmSync(dataDir, { recursive: true, force: true });
   };
 
+  const crash = async (): Promise<void> => {
+    child.kill("SIGKILL");
+    await child.exited;
+  };
+
   const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
   for await (const line of lines(child.stdout)) {
     if (line.startsWith("jake hub: agent server on")) {
       clearTimeout(timer);
-      return { agentPort, controlPort, stderr, stop };
+      return { agentPort, controlPort, stderr, stop, crash };
     }
   }
   clearTimeout(timer);
