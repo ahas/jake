@@ -7,6 +7,8 @@ for the common cases. Moving a whole file is the exception — `jake upload <loc
 (docs/architecture.md, "Moving files"), so the base64-through-a-command trick below is for a binary
 that a command produces inline, not for transferring a file that already exists.
 
+`jake-hub exec` takes the same flags as `jake exec` and runs every exec recipe here without bun.
+
 The recipes are written for a hub with one agent attached. With several attached, every one of them
 takes `--agent <name>` to say which machine it runs on; `jake status` lists the names.
 

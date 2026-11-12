@@ -28,7 +28,10 @@ chmod 600 ~/.local/share/jake/hub.env
 ```
 
 `JAKE_AGENT_KEY` is optional: set it (`openssl rand -hex 32`) to admit agents by a credential of their own name
-(docs/architecture.md), and give the same value to whoever mints those credentials. `JAKE_REVERSE_TARGETS` is
+(docs/architecture.md), and give the same value to whoever mints those credentials. `JAKE_CONTROL_KEY` is
+optional as well: set it to another `openssl rand -hex 32`, never the agent key's value, to let the control API take a
+credential scoped to named agents (docs/architecture.md, 「Configuration and secrets」); `jake-hub credential
+<agent>...` then prints one, and a tool given it in `JAKE_CONTROL_CREDENTIAL` reaches those agents alone. `JAKE_REVERSE_TARGETS` is
 optional too: the `host:port` targets, comma separated, a stream back from an agent may reach (docs/architecture.md,
 「Carrying a byte stream back」); left out, none may. `JAKE_SECRET` and
 `JAKE_CONTROL_TOKEN` are required and have no default; leave the others commented to
@@ -185,8 +188,8 @@ The `ProxyCommand` that carries ssh to an agent's machine is the hub's own relea
 connect mode: `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`. ssh is configured
 to call that checkout path, so a build must leave the binary there. The unit's `ExecStartPre` runs
 `scripts/install-hub-cli.sh`, which builds it, and the script keeps a second copy at
-`~/.local/bin/jake-hub` for use outside ssh. Both read the control port and token from the same
-`hub.env`. `bun run check` builds the CLI and fails when either path is missing, so a swept target
+`~/.local/bin/jake-hub` for use outside ssh, where `jake-hub exec` runs a command on a machine
+without bun. Both read the control port and token from the same `hub.env`. `bun run check` builds the CLI and fails when either path is missing, so a swept target
 directory is reported by the check rather than by the next ssh. A sweep while the hub is running
 still breaks ssh until the next restart, because the running hub holds the deleted file.
 

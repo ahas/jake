@@ -43,7 +43,11 @@ function optionalPositiveIntEnv(env: Env, name: string, fallback: number): numbe
 export interface ConsoleConfig {
   /** The port the loopback control API listens on. */
   controlPort: number;
-  /** The token every control-API request carries. Read from the hub's config, not a flag. */
+  /**
+   * What every control-API request carries: a credential scoped to named agents where
+   * JAKE_CONTROL_CREDENTIAL holds one, else the control token. Read from the environment and the hub's
+   * config, not a flag.
+   */
   controlToken: string;
 }
 
@@ -55,7 +59,7 @@ export interface ConsoleConfig {
 export function loadConsoleConfig(env: Env = process.env): ConsoleConfig {
   return {
     controlPort: optionalPositiveIntEnv(env, "JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT),
-    controlToken: requireEnv(env, "JAKE_CONTROL_TOKEN"),
+    controlToken: env.JAKE_CONTROL_CREDENTIAL || requireEnv(env, "JAKE_CONTROL_TOKEN"),
   };
 }
 

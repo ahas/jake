@@ -20,6 +20,8 @@ pub struct HubConfig {
   pub agent_key: Option<String>,
   pub control_port: u16,
   pub control_token: String,
+  /// The key a control credential scoped to named agents is made with; none admits the control token alone.
+  pub control_key: Option<String>,
   pub max_payload_bytes: usize,
   pub ping_interval: Duration,
   pub missed_pong_limit: u32,
@@ -32,7 +34,9 @@ pub struct HubConfig {
 /// What a client of the running hub needs to reach its control API, from the hub's own file.
 pub struct ControlConfig {
   pub port: u16,
-  pub token: String,
+  /// What the client presents: a scoped credential where `JAKE_CONTROL_CREDENTIAL` holds one, else the
+  /// control token.
+  pub credential: String,
 }
 
 /// Where the hub's file is: `JAKE_HUB_ENV` when set, else `hub.env` under the data directory.
@@ -116,23 +120,43 @@ pub fn load() -> Result<HubConfig, String> {
   read(&Source(merged(process)?), departed)
 }
 
-/// Read the control API's port and token, naming the key that is missing or malformed.
+/// Read the control API's port and what a client presents to it, naming the key that is missing or
+/// malformed.
 pub fn load_control() -> Result<ControlConfig, String> {
+  control(&Source(merged(std::env::vars().collect())?))
+}
+
+/// Read the key scoped control credentials are made with, naming it when it is not set.
+pub fn load_control_key() -> Result<String, String> {
   let env = Source(merged(std::env::vars().collect())?);
+  env.required("JAKE_CONTROL_KEY").map(|key| key.trim().to_owned())
+}
+
+fn control(env: &Source) -> Result<ControlConfig, String> {
+  let credential = match env.present("JAKE_CONTROL_CREDENTIAL") {
+    Some(credential) => credential.to_owned(),
+    None => env.required("JAKE_CONTROL_TOKEN")?,
+  };
   Ok(ControlConfig {
     port: env.port("JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,
-    token: env.required("JAKE_CONTROL_TOKEN")?,
+    credential,
   })
 }
 
 fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
+  let agent_key = env.present("JAKE_AGENT_KEY").map(|key| key.trim().to_owned());
+  let control_key = env.present("JAKE_CONTROL_KEY").map(|key| key.trim().to_owned());
+  if control_key.is_some() && control_key == agent_key {
+    return Err("JAKE_CONTROL_KEY must differ from JAKE_AGENT_KEY.".into());
+  }
   Ok(HubConfig {
     host: env.present("JAKE_HUB_HOST").unwrap_or(DEFAULT_HUB_HOST).to_owned(),
     port: env.port("JAKE_HUB_PORT", DEFAULT_HUB_PORT)?,
     secret: env.required("JAKE_SECRET")?,
-    agent_key: env.present("JAKE_AGENT_KEY").map(|key| key.trim().to_owned()),
+    agent_key,
     control_port: env.port("JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,
     control_token: env.required("JAKE_CONTROL_TOKEN")?,
+    control_key,
     max_payload_bytes: env.count("JAKE_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES)?,
     ping_interval: Duration::from_millis(
       env.count("JAKE_HUB_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS)? as u64
@@ -231,6 +255,28 @@ mod tests {
     assert_eq!(
       (config.secret.as_str(), config.control_token.as_str(), config.port),
       ("from-env", "quoted", 9001)
+    );
+  }
+
+  #[test]
+  fn a_control_key_is_refused_where_it_is_the_agent_key() {
+    let shared = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "k")];
+    assert_eq!(error_of(&shared), "JAKE_CONTROL_KEY must differ from JAKE_AGENT_KEY.");
+    let distinct = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "ck")];
+    let config = read(&source(&distinct), PathBuf::new()).expect("loads");
+    assert_eq!(config.control_key.as_deref(), Some("ck"));
+  }
+
+  #[test]
+  fn a_client_presents_a_scoped_credential_over_the_control_token() {
+    let scoped = control(&source(&[REQUIRED[1], ("JAKE_CONTROL_CREDENTIAL", "u4.ab")])).expect("loads");
+    assert_eq!((scoped.credential.as_str(), scoped.port), ("u4.ab", 8791));
+    assert_eq!(control(&source(&[REQUIRED[1]])).expect("loads").credential, "c0nsole");
+    assert!(
+      control(&source(&[]))
+        .err()
+        .expect("refused")
+        .starts_with("JAKE_CONTROL_TOKEN is not set")
     );
   }
 

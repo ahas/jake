@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
 
+use crate::credential::{self, Reach};
 use crate::departed::Departed;
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
@@ -33,24 +34,13 @@ const CLOSE_HUB_INITIATED: u16 = 4000;
 /// The close code of a socket whose hello named another name than its credential was made for.
 const CLOSE_OTHER_NAME: u16 = 4003;
 
-/// The credential of one agent name: the name, a dot, and the lowercase hex of HMAC-SHA256 over the name keyed
-/// by the agent key.
-pub fn agent_credential(key: &str, name: &str) -> String {
-  use hmac::{Hmac, Mac};
-
-  let mut mac =
-    Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes a key of any length");
-  mac.update(name.as_bytes());
-  let digest = mac.finalize().into_bytes();
-  let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-  format!("{name}.{hex}")
-}
-
 pub struct HubOptions {
   pub secret: String,
   /// The key a credential of one agent name is made with; none admits the shared secret alone.
   pub agent_key: Option<String>,
   pub control_token: String,
+  /// The key a control credential scoped to named agents is made with; none admits the control token alone.
+  pub control_key: Option<String>,
   pub max_payload_bytes: usize,
   pub ping_interval: Duration,
   pub missed_pong_limit: u32,
@@ -95,6 +85,8 @@ pub enum TargetRefusal {
   UnknownAgent,
   /// The request named none while several are attached.
   AgentRequired,
+  /// The request named an agent its caller's credential does not reach.
+  OutOfReach,
 }
 
 impl TargetRefusal {
@@ -103,16 +95,18 @@ impl TargetRefusal {
       Self::NoAgent => "no-agent",
       Self::UnknownAgent => "unknown-agent",
       Self::AgentRequired => "agent-required",
+      Self::OutOfReach => "agent-out-of-reach",
     }
   }
 
   /// The HTTP status the refusal answers with: a conflict with the hub's state, a name not found,
-  /// or a choice the caller must make.
+  /// a choice the caller must make, or a name the caller may not reach.
   pub fn status(self) -> u16 {
     match self {
       Self::NoAgent => 409,
       Self::UnknownAgent => 404,
       Self::AgentRequired => 400,
+      Self::OutOfReach => 403,
     }
   }
 }
@@ -121,6 +115,17 @@ impl TargetRefusal {
 pub struct Refusal {
   pub kind: TargetRefusal,
   pub reason: String,
+}
+
+impl Refusal {
+  /// A request naming an agent its caller's credential does not reach, refused alike whether or not
+  /// that agent is attached.
+  pub fn out_of_reach(name: &str) -> Self {
+    Self {
+      kind: TargetRefusal::OutOfReach,
+      reason: format!("this credential does not reach agent {name}"),
+    }
+  }
 }
 
 /// A shell command a control caller starts.
@@ -561,8 +566,21 @@ impl State {
     }
   }
 
-  fn find_target(&self, name: Option<&str>) -> Result<String, Refusal> {
-    if self.agents.is_empty() {
+  // The agent a request goes to among those its caller reaches: a named one must be reached and
+  // attached, and no name picks the only one attached.
+  fn find_target(&self, name: Option<&str>, reach: &Reach) -> Result<String, Refusal> {
+    if let Some(name) = name
+      && !reach.admits(name)
+    {
+      return Err(Refusal::out_of_reach(name));
+    }
+    let mut reachable: Vec<&str> = self
+      .agents
+      .keys()
+      .map(String::as_str)
+      .filter(|attached| reach.admits(attached))
+      .collect();
+    if reachable.is_empty() {
       return Err(Refusal {
         kind: TargetRefusal::NoAgent,
         reason: "no agent attached".into(),
@@ -578,16 +596,15 @@ impl State {
         })
       };
     }
-    if self.agents.len() > 1 {
-      let mut names: Vec<&str> = self.agents.keys().map(String::as_str).collect();
-      names.sort_unstable();
-      let reason = format!("{} agents are attached ({}); name one", names.len(), names.join(", "));
+    if reachable.len() > 1 {
+      reachable.sort_unstable();
+      let reason = format!("{} agents are attached ({}); name one", reachable.len(), reachable.join(", "));
       return Err(Refusal {
         kind: TargetRefusal::AgentRequired,
         reason,
       });
     }
-    Ok(self.agents.keys().next().cloned().unwrap_or_default())
+    Ok(reachable[0].to_owned())
   }
 }
 
@@ -636,14 +653,18 @@ impl Hub {
       return Some(None);
     }
     let key = self.options.agent_key.as_deref()?;
-    let (name, mac) = presented.rsplit_once('.')?;
-    (!name.is_empty() && agent_credential(key, name) == format!("{name}.{mac}"))
-      .then(|| Some(name.to_owned()))
+    credential::subject(key, presented).map(|name| Some(name.to_owned()))
   }
 
-  /// True when the header presents the control token.
-  pub fn authorize_control(&self, header: Option<&[u8]>) -> bool {
-    header == Some(format!("Bearer {}", self.options.control_token).as_bytes())
+  /// Whom a control request's header lets reach what: every agent for the control token; the named
+  /// agents for a credential made for them with the control key, `<names>.<hex mac>`; none otherwise.
+  pub fn authorize_control(&self, header: Option<&[u8]>) -> Option<Reach> {
+    let presented = std::str::from_utf8(header?).ok()?.strip_prefix("Bearer ")?;
+    if presented == self.options.control_token {
+      return Some(Reach::All);
+    }
+    let key = self.options.control_key.as_deref()?;
+    Reach::of_names(credential::subject(key, presented)?)
   }
 
   pub fn next_socket_id(&self) -> u64 {
@@ -779,16 +800,16 @@ impl Hub {
 
   // --- Control operations ----------------------------------------------------------------------
 
-  /// Decide which agent a request goes to: a named one must be attached, and no name picks the
-  /// only one attached.
-  pub fn resolve_target(&self, name: Option<&str>) -> Result<String, Refusal> {
-    self.lock().find_target(name)
+  /// Decide which agent a request goes to among those its caller reaches: a named one must be
+  /// reached and attached, and no name picks the only one attached.
+  pub fn resolve_target(&self, name: Option<&str>, reach: &Reach) -> Result<String, Refusal> {
+    self.lock().find_target(name, reach)
   }
 
   /// Start a shell command on the target agent; its life arrives on the returned events.
   pub fn start_exec(&self, params: ExecParams, target: Option<&str>) -> Result<Events, String> {
     let mut state = self.lock();
-    let name = state.find_target(target).map_err(|refusal| refusal.reason)?;
+    let name = state.find_target(target, &Reach::All).map_err(|refusal| refusal.reason)?;
     let id = state.next_id('c');
     let (listener, events) = Listener::open();
     listener.push("started", json!({ "id": id }));
@@ -816,8 +837,9 @@ impl Hub {
     Ok(events)
   }
 
-  /// Ask the agent running a command to stop it; a command id is unique across the hub.
-  pub fn cancel(&self, id: &str) -> Result<(), String> {
+  /// Ask the agent running a command to stop it; a command id is unique across the hub, and one on
+  /// an agent the caller does not reach is unknown to it.
+  pub fn cancel(&self, id: &str, reach: &Reach) -> Result<(), String> {
     let mut state = self.lock();
     if state.agents.is_empty() {
       return Err("no agent attached".into());
@@ -825,7 +847,7 @@ impl Hub {
     let Some(name) = state
       .agents
       .iter()
-      .find(|(_, agent)| agent.commands.contains_key(id))
+      .find(|(name, agent)| reach.admits(name) && agent.commands.contains_key(id))
       .map(|(name, _)| name.clone())
     else {
       return Err("unknown command".into());
@@ -845,7 +867,7 @@ impl Hub {
     B: Stream<Item = Result<Bytes, String>> + Send + Unpin + 'static,
   {
     let mut state = self.lock();
-    let name = state.find_target(target).map_err(|refusal| refusal.reason)?;
+    let name = state.find_target(target, &Reach::All).map_err(|refusal| refusal.reason)?;
     let id = state.next_id('u');
     let (listener, events) = Listener::open();
     listener.push("started", json!({ "id": id }));
@@ -1014,7 +1036,7 @@ impl Hub {
   /// declared total and checksum when the transfer closes.
   pub fn start_download(&self, path: String, target: Option<&str>) -> Result<Events, String> {
     let mut state = self.lock();
-    let name = state.find_target(target).map_err(|refusal| refusal.reason)?;
+    let name = state.find_target(target, &Reach::All).map_err(|refusal| refusal.reason)?;
     let id = state.next_id('d');
     let (listener, events) = Listener::open();
     listener.push("started", json!({ "id": id }));
@@ -1148,16 +1170,18 @@ impl Hub {
   /// queued ahead of the socket's close, so the agent reads it before the connection ends.
   pub fn leave(&self, target: Option<&str>) -> Result<String, String> {
     let mut state = self.lock();
-    let name = state.find_target(target).map_err(|refusal| refusal.reason)?;
+    let name = state.find_target(target, &Reach::All).map_err(|refusal| refusal.reason)?;
     state.send(&name, &Frame::Leave);
     state.depart(&name, "told to leave by the hub");
     Ok(name)
   }
 
-  /// Every attached agent, ordered by name, every departed one, and this process's run tag.
-  pub fn status(&self) -> Value {
+  /// Every attached agent the caller reaches, ordered by name, every departed one it reaches, and
+  /// this process's run tag.
+  pub fn status(&self, reach: &Reach) -> Value {
     let state = self.lock();
-    let mut agents: Vec<(&String, &Agent)> = state.agents.iter().collect();
+    let mut agents: Vec<(&String, &Agent)> =
+      state.agents.iter().filter(|(name, _)| reach.admits(name)).collect();
     agents.sort_by(|(a, _), (b, _)| by_name(a, b));
     let agents: Vec<Value> = agents
       .into_iter()
@@ -1173,7 +1197,13 @@ impl Hub {
         })
       })
       .collect();
-    json!({ "run": self.run, "attached": !agents.is_empty(), "agents": agents, "departed": state.departed.list() })
+    let departed: Vec<Value> = state
+      .departed
+      .list()
+      .into_iter()
+      .filter(|entry| entry["name"].as_str().is_some_and(|name| reach.admits(name)))
+      .collect();
+    json!({ "run": self.run, "attached": !agents.is_empty(), "agents": agents, "departed": departed })
   }
 
   /// The traffic recorded after `after_id`, and the live feed from the very next entry on.
@@ -1358,6 +1388,7 @@ mod tests {
       secret: "s".into(),
       agent_key: Some("k".into()),
       control_token: "c".into(),
+      control_key: Some("ck".into()),
       max_payload_bytes: CAP,
       ping_interval: Duration::from_secs(3600),
       missed_pong_limit: 3,
@@ -1416,7 +1447,7 @@ mod tests {
   }
 
   fn attached_names(hub: &Arc<Hub>) -> Vec<String> {
-    hub.status()["agents"]
+    hub.status(&Reach::All)["agents"]
       .as_array()
       .map(|agents| agents.iter().filter_map(|agent| agent["name"].as_str().map(str::to_owned)).collect())
       .unwrap_or_default()
@@ -1425,13 +1456,13 @@ mod tests {
   #[tokio::test]
   async fn a_credential_of_one_name_admits_that_name_alone() {
     let hub = hub(CAP);
-    let credential = agent_credential("k", "u7");
+    let credential = credential::credential("k", "u7");
     let bearer = format!("Bearer {credential}");
     assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), Some(Some("u7".to_owned())));
     assert_eq!(hub.authorize_agent(Some(b"Bearer s")), Some(None));
     assert_eq!(hub.authorize_agent(Some(b"Bearer u7.00")), None);
     assert_eq!(
-      hub.authorize_agent(Some(format!("Bearer {}", agent_credential("other", "u7")).as_bytes())),
+      hub.authorize_agent(Some(format!("Bearer {}", credential::credential("other", "u7")).as_bytes())),
       None
     );
     assert_eq!(hub.authorize_agent(None), None);
@@ -1451,12 +1482,68 @@ mod tests {
     assert!(!attached_names(&hub).contains(&"hass".to_owned()));
   }
 
+  #[tokio::test]
+  async fn a_scoped_control_credential_reaches_its_own_agents_alone() {
+    let hub = hub(CAP);
+    let bearer = |credential: String| format!("Bearer {credential}");
+    assert_eq!(hub.authorize_control(Some(b"Bearer c")), Some(Reach::All));
+    let scoped = hub.authorize_control(Some(bearer(credential::credential("ck", "u4")).as_bytes()));
+    assert_eq!(scoped, Reach::of_names("u4"));
+    // The credential an agent dials with is made with the agent key, and reaches nothing here.
+    assert_eq!(hub.authorize_control(Some(bearer(credential::credential("k", "u4")).as_bytes())), None);
+    let scoped = scoped.expect("a scoped reach");
+
+    let mut links = Vec::new();
+    for name in ["u4", "u7", "hass"] {
+      let (link, queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+      hub.on_message(
+        &link,
+        &format!(r#"{{"type":"hello","v":1,"agent":"{name}","agentVersion":"0.1.0","capabilities":[]}}"#),
+      );
+      links.push((link, queue));
+    }
+
+    // With three attached, a request naming none goes to the one the credential reaches.
+    assert_eq!(hub.resolve_target(None, &scoped).expect("its own agent"), "u4");
+    for other in ["u7", "ghost"] {
+      let refused = hub.resolve_target(Some(other), &scoped).expect_err("out of reach");
+      assert_eq!((refused.kind.status(), refused.kind.code()), (403, "agent-out-of-reach"));
+    }
+    let status = hub.status(&scoped);
+    let names: Vec<&str> = status["agents"]
+      .as_array()
+      .expect("agents")
+      .iter()
+      .filter_map(|a| a["name"].as_str())
+      .collect();
+    assert_eq!(names, ["u4"]);
+
+    // A command on another agent is unknown to the scoped caller, and still the administrator's to cancel.
+    let mut events = hub
+      .start_exec(
+        ExecParams {
+          shell: "linux".into(),
+          command: "sleep 60".into(),
+          cwd: None,
+          env: Map::new(),
+          distro: None,
+        },
+        Some("u7"),
+      )
+      .expect("started");
+    let started = received(&mut events);
+    let id = started[0].data["id"].as_str().expect("an id").to_owned();
+    assert_eq!(hub.cancel(&id, &scoped), Err("unknown command".to_owned()));
+    assert_eq!(hub.cancel(&id, &Reach::All), Ok(()));
+  }
+
   #[test]
   fn without_an_agent_key_only_the_shared_secret_admits() {
     let hub = Hub::new(HubOptions {
       secret: "s".into(),
       agent_key: None,
       control_token: "c".into(),
+      control_key: None,
       max_payload_bytes: CAP,
       ping_interval: Duration::from_secs(3600),
       missed_pong_limit: 3,
@@ -1464,7 +1551,7 @@ mod tests {
       departed_path: None,
       reverse_targets: Vec::new(),
     });
-    let bearer = format!("Bearer {}", agent_credential("k", "u7"));
+    let bearer = format!("Bearer {}", credential::credential("k", "u7"));
     assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), None);
     assert_eq!(hub.authorize_agent(Some(b"Bearer s")), Some(None));
   }
@@ -1479,6 +1566,7 @@ mod tests {
       secret: "s".into(),
       agent_key: None,
       control_token: "c".into(),
+      control_key: None,
       max_payload_bytes: CAP,
       ping_interval: Duration::from_secs(3600),
       missed_pong_limit: 3,

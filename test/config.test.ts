@@ -57,6 +57,12 @@ describe("hubFileEnv", () => {
     }
   });
 
+  test("a scoped credential in the environment is presented in the control token's place", () => {
+    const config = loadConsoleConfig({ JAKE_CONTROL_TOKEN: "ctl", JAKE_CONTROL_CREDENTIAL: "u4.ab" });
+    expect(config.controlToken).toBe("u4.ab");
+    expect(loadConsoleConfig({ JAKE_CONTROL_CREDENTIAL: "u4.ab" }).controlToken).toBe("u4.ab");
+  });
+
   test("a variable set in the environment overrides the file", () => {
     const dir = mkdtempSync(join(tmpdir(), "jake-hub-env-"));
     try {

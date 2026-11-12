@@ -30,7 +30,8 @@ against a checksum before reporting success; a download is written to <local> on
 Screenshots, requests from inside the agent's network, and Edge are shell commands sent with
 exec; docs/recipes.md has them, and the ProxyCommand line that carries ssh, and herdr, to a machine
 over the tunnel. The control token and port are read from the hub's configuration, never the
-command line.
+command line; JAKE_CONTROL_CREDENTIAL in the environment, a credential scoped to named agents, is
+presented in the token's place. jake-hub exec runs a command with the same flags and no bun.
 
 leave is irreversible: it deletes the executable, config, log, and autostart registrations and the
 agent does not come back. It refuses without --yes.

@@ -20,9 +20,11 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   loopback control API that the console and 비모 drive them through. It is reachable from 하스's
   network through a `*.ahas.io` name fronted by NPM. It holds no capability itself; it relays. The
   hub is the back end every agent shares, not a machine of its own: each attached agent is one
-  machine, and the hub is how all of them are reached. Run with the connect argument the same
-  executable is not the hub but a client of it: it joins its standard input and output to a byte
-  stream through the running hub, which is what makes it usable as an SSH `ProxyCommand`.
+  machine, and the hub is how all of them are reached. Run with one of its client verbs the same
+  executable is not the hub but a client of it: `connect` joins its standard input and output to a
+  byte stream through the running hub, which is what makes it usable as an SSH `ProxyCommand`;
+  `exec` runs one command on a machine (「The console」); `credential` prints a control credential
+  scoped to named agents (「Configuration and secrets」).
 - **agent** — a Rust program, the `agent` crate in this repository, that runs on one of 하스's
   machines from a single executable. It dials the hub,
   authenticates, and then serves what the hub asks of it: shell commands, with live-streamed output,
@@ -132,6 +134,21 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and recorded. Whoever holds the agent key mints such credentials — the account service, for a
   machine an invited person installs — so a person is given a credential for their own machine's name
   and never the shared secret. A hub with no agent key accepts the shared secret alone.
+- **A control caller may present a credential scoped to named agents** instead of the control token:
+  `<names>.<mac>`, where the names are agent names joined by commas and the mac is the lowercase hex
+  of HMAC-SHA256 over that list, keyed by the hub's control key (`JAKE_CONTROL_KEY`). The control
+  token is the administrator's and reaches every agent; a scoped credential reaches the agents it
+  names and no other. A request naming an agent outside its scope is refused with 403
+  `agent-out-of-reach` whether or not that agent is attached, so a holder learns nothing of the
+  other machines. A request naming none goes to the one attached agent of its scope. The status and
+  the traffic log show its agents alone, a cancel finds only the commands running on them, and a
+  listen is asked for or read for them alone.
+- The hub knows nothing of accounts. Which machines are one person's is decided by whoever mints the
+  credential, from its own record of whose machine each agent name is; `jake-hub credential
+  <agent>...` mints one from the hub's own file. A tool that acts for one person is handed a
+  credential for that person's machines and never the control token. A hub with no control key
+  accepts the control token alone, and a control key equal to the agent key is refused at startup,
+  so the credential an agent dials with never doubles as a control credential.
 - A refused credential and an unreachable hub are told apart. The hub answers an upgrade with a
   missing or wrong secret with 401 before any socket opens, and writes one line saying where the
   attempt came from and whether the credential was missing or wrong — never the value presented.
@@ -390,7 +407,9 @@ give very different footing for keeping a per-user process running.
   moving. A command-line tool against the hub's loopback control API is the primary surface — it is
   also the handle a headless session on main-host uses to drive the agent, so no change inside 비모
   is required. A thin read-only web page over the same API shows connection state and recent traffic.
-- Both surfaces read the control token from the hub's configuration, not from an argument. The CLI
+- Both surfaces read the control token from the hub's configuration, not from an argument. A CLI run
+  with `JAKE_CONTROL_CREDENTIAL` in its environment presents that scoped credential instead, so a
+  tool acting for one person reaches that person's machines alone. The CLI
   runs one command and returns the agent's own exit code for an `exec`, so a caller branches on it as
   it would on a local shell; the page only reads and offers no control the CLI does not. The CLI also
   moves a whole file across the tunnel in either direction — an upload of a local file onto the
@@ -400,11 +419,14 @@ give very different footing for keeping a per-user process running.
   unless the intent is stated outright, and the read-only page cannot trigger it at all. Every CLI
   command that reaches a machine takes the target agent's name, which may be left out only while a
   single agent is attached.
+- The CLI has two forms. The bun console carries every command. The hub executable carries `exec` as
+  well, with the same flags and the same exit codes, and passes a Ctrl-C on as a cancel, so running a
+  command on a machine needs only the Rust binary and no bun.
 - The page is the one route of the control API served without the token: a browser navigation cannot
   attach a bearer header, so the page comes back open and carries the token embedded in it, which its
   own read requests then present. This is safe because the control API binds to loopback alone —
   anyone able to load the page is already on the machine and could read the token from the config
-  file. Every other route still demands the token.
+  file. Every other route still demands the token or a scoped credential.
 
 ## The build and the install
 

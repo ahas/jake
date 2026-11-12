@@ -12,6 +12,8 @@ const BINARY = join(ROOT, "target", "debug", "jake-hub");
 export interface HubSeams {
   // The targets a stream back may reach, as JAKE_REVERSE_TARGETS names them.
   reverseTargets?: string;
+  // The key scoped control credentials are made with, as JAKE_CONTROL_KEY.
+  controlKey?: string;
   pingIntervalMs?: number;
   missedPongLimit?: number;
   socketBacklogBytes?: number;
@@ -65,17 +67,24 @@ async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string
   }
 }
 
-/** The hub executable in its connect mode, against a running hub: a byte stream on its standard input and output. */
-export function startConnect(hub: HubProcess, controlToken: string, args: string[]): Bun.Subprocess<"pipe", "pipe", "pipe"> {
+/**
+ * The hub executable run with a client verb against a running hub, configured by `credentials` alone:
+ * JAKE_CONTROL_TOKEN, JAKE_CONTROL_CREDENTIAL or JAKE_CONTROL_KEY, as the verb needs.
+ */
+export function startHubClient(
+  hub: HubProcess,
+  credentials: Record<string, string>,
+  args: string[],
+): Bun.Subprocess<"pipe", "pipe", "pipe"> {
   ensureHubBuilt();
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
-    JAKE_HUB_ENV: join(tmpdir(), "jake-connect-no-such-file.env"),
+    JAKE_HUB_ENV: join(tmpdir(), "jake-client-no-such-file.env"),
     JAKE_CONTROL_PORT: String(hub.controlPort),
-    JAKE_CONTROL_TOKEN: controlToken,
+    ...credentials,
   };
-  return Bun.spawn([BINARY, "connect", ...args], { cwd: ROOT, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  return Bun.spawn([BINARY, ...args], { cwd: ROOT, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 }
 
 /** Start a hub with the given secret and control token, returning once it says it is listening. */
@@ -98,6 +107,7 @@ export async function startHubProcess(secret: string, controlToken: string, seam
   if (seams.missedPongLimit !== undefined) env.JAKE_HUB_MISSED_PONG_LIMIT = String(seams.missedPongLimit);
   if (seams.socketBacklogBytes !== undefined) env.JAKE_HUB_SOCKET_BACKLOG_BYTES = String(seams.socketBacklogBytes);
   if (seams.reverseTargets !== undefined) env.JAKE_REVERSE_TARGETS = seams.reverseTargets;
+  if (seams.controlKey !== undefined) env.JAKE_CONTROL_KEY = seams.controlKey;
 
   const child = Bun.spawn([BINARY], { cwd: ROOT, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const stderr: string[] = [];

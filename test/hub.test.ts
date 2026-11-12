@@ -15,7 +15,7 @@ import {
   streamChecksum,
   type Frame,
 } from "../src/protocol";
-import { ensureHubBuilt, startConnect, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
+import { ensureHubBuilt, startHubClient, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
 import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
 import { ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
@@ -32,7 +32,7 @@ const readers: SseReader[] = [];
 const realAgents: AgentProcess[] = [];
 const dirs: string[] = [];
 const callers: StreamCaller[] = [];
-const connects: Bun.Subprocess[] = [];
+const clients: Bun.Subprocess[] = [];
 const ports: StandInPort[] = [];
 
 // A build after a change takes far longer than one case may, so both programs are built before any.
@@ -44,7 +44,7 @@ beforeAll(() => {
 afterEach(async () => {
   for (const reader of readers.splice(0)) reader.close();
   for (const caller of callers.splice(0)) caller.ws.close();
-  for (const connect of connects.splice(0)) connect.kill("SIGKILL");
+  for (const client of clients.splice(0)) client.kill("SIGKILL");
   for (const port of ports.splice(0)) port.stop();
   for (const agent of agents.splice(0)) agent.close();
   await Promise.all(realAgents.splice(0).map((agent) => agent.stop()));
@@ -950,8 +950,8 @@ describe("byte streams", () => {
     startRealAgent(`ws://127.0.0.1:${hub.agentPort}`, SECRET, { JAKE_STREAM_PORTS: String(port.port) });
     await until(async () => (await (await control(hub, "/status")).json()).agents.length === 1);
 
-    const connect = startConnect(hub, CONTROL, ["hass", String(port.port)]);
-    connects.push(connect);
+    const connect = startHubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["connect", "hass", String(port.port)]);
+    clients.push(connect);
     const echoed: Uint8Array[] = [];
     let echoedBytes = 0;
     void (async () => {
@@ -973,8 +973,8 @@ describe("byte streams", () => {
   test("the connect mode says why the hub refused the stream, and fails", async () => {
     const hub = await launch();
     await attach(hub.agentPort, ["exec:linux"]);
-    const connect = startConnect(hub, CONTROL, ["hass-desktop"]);
-    connects.push(connect);
+    const connect = startHubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["connect", "hass-desktop"]);
+    clients.push(connect);
     expect(await connect.exited).toBe(1);
     expect(await new Response(connect.stderr).text()).toContain("(HTTP 403): agent hass-desktop does not offer port 22");
   });
@@ -1061,6 +1061,94 @@ describe("leave", () => {
     const back = await (await control(second, "/status")).json();
     expect(back.departed).toEqual([]);
     expect(back.agents.map((agent: { name: string }) => agent.name)).toEqual(["jungsu-wsl"]);
+  });
+});
+
+// The hub executable run with a client verb, taken down after the case.
+function hubClient(hub: HubProcess, credentials: Record<string, string>, args: string[]): Bun.Subprocess<"pipe", "pipe", "pipe"> {
+  const client = startHubClient(hub, credentials, args);
+  clients.push(client);
+  return client;
+}
+
+// A control credential for the named agents, minted by the hub executable's credential verb.
+async function mint(hub: HubProcess, key: string, agents: string[]): Promise<string> {
+  const minted = hubClient(hub, { JAKE_CONTROL_KEY: key }, ["credential", ...agents]);
+  expect(await minted.exited).toBe(0);
+  return (await new Response(minted.stdout).text()).trim();
+}
+
+function chunkOf(text: string): { bytes: number; base64: string } {
+  return { bytes: Buffer.byteLength(text), base64: Buffer.from(text).toString("base64") };
+}
+
+describe("scoped control credentials", () => {
+  test("a credential scoped to one agent reaches that agent alone, and one made with another key reaches nothing", async () => {
+    const hub = await launch({ controlKey: "ck" });
+    const own = await attach(hub.agentPort, [], "u4");
+    await attach(hub.agentPort, [], "u7");
+    const scoped = { Authorization: `Bearer ${await mint(hub, "ck", ["u4"])}` };
+
+    const status = await (await control(hub, "/status", { headers: scoped })).json();
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["u4"]);
+
+    for (const other of ["u7", "ghost"]) {
+      const refused = await control(hub, `/exec?agent=${other}`, { ...execBody("hostname"), headers: { ...scoped, "content-type": "application/json" } });
+      expect(refused.status).toBe(403);
+      expect((await refused.json()).code).toBe("agent-out-of-reach");
+    }
+
+    // With two attached, a request naming none goes to the one agent the credential reaches.
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec`, { ...execBody("hostname"), headers: { ...scoped, "content-type": "application/json" } });
+    await reader.ready;
+    await own.waitFor((f) => f.type === "exec");
+
+    const forged = { Authorization: `Bearer ${await mint(hub, "not-the-key", ["u7"])}` };
+    expect((await control(hub, "/status", { headers: forged })).status).toBe(401);
+  });
+});
+
+describe("the hub executable's exec", () => {
+  test("streams a command's output through and exits with the agent's exit code", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, [], "u4");
+    const run = hubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["exec", "-a", "u4", "--shell", "linux", "--env", "A=1", "--", "ls", "-la"]);
+
+    const exec = (await agent.waitFor((f) => f.type === "exec", 10_000)) as { id: string; shell: string; command: string; env: Record<string, string> };
+    expect(exec).toMatchObject({ shell: "linux", command: "ls -la", env: { A: "1" } });
+    agent.send({ type: "stdout", v: V, id: exec.id, seq: 0, chunk: chunkOf("out\n") });
+    agent.send({ type: "stderr", v: V, id: exec.id, seq: 0, chunk: chunkOf("warn\n") });
+    agent.send({ type: "exit", v: V, id: exec.id, code: 3, signal: null, canceled: false });
+
+    expect(await run.exited).toBe(3);
+    expect(await new Response(run.stdout).text()).toBe("out\n");
+    expect(await new Response(run.stderr).text()).toBe("warn\n");
+  });
+
+  test("with a scoped credential it cannot reach another's machine, and a Ctrl-C cancels its own command", async () => {
+    const hub = await launch({ controlKey: "ck" });
+    const own = await attach(hub.agentPort, [], "u4");
+    const other = await attach(hub.agentPort, [], "u7");
+    const scoped = { JAKE_CONTROL_CREDENTIAL: await mint(hub, "ck", ["u4"]) };
+
+    const refused = hubClient(hub, scoped, ["exec", "-a", "u7", "hostname"]);
+    expect(await refused.exited).toBe(4);
+    expect(await new Response(refused.stderr).text()).toContain("does not reach agent u7");
+    expect(other.received.some((f) => f.type === "exec")).toBe(false);
+
+    const run = hubClient(hub, scoped, ["exec", "sleep", "60"]);
+    let printed = "";
+    void (async () => {
+      for await (const piece of run.stdout) printed += new TextDecoder().decode(piece);
+    })();
+    const exec = (await own.waitFor((f) => f.type === "exec", 10_000)) as { id: string };
+    own.send({ type: "stdout", v: V, id: exec.id, seq: 0, chunk: chunkOf("running\n") });
+    await until(() => printed === "running\n");
+
+    run.kill("SIGINT");
+    await own.waitFor((f) => f.type === "cancel" && (f as { id: string }).id === exec.id);
+    own.send({ type: "exit", v: V, id: exec.id, code: null, signal: null, canceled: true });
+    expect(await run.exited).toBe(130);
   });
 });
 

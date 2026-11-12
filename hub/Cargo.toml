@@ -11,12 +11,18 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 bytes = "1"
+# The client verbs' arguments.
+clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 form_urlencoded = "1"
 # A credential of one agent name: HMAC-SHA256 over the name, keyed by the hub's agent key.
 hmac = "0.12"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1"
+# The exec verb's request to the control API, and the event stream it is answered with.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+sse-stream = "0.2"
 indexmap = "2"
 jake-protocol = { path = "../protocol" }
 rand = "0.10"

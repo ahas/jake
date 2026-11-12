@@ -4,8 +4,11 @@ mod agent_server;
 mod config;
 mod connect;
 mod control;
+mod control_client;
 mod core;
+mod credential;
 mod departed;
+mod exec;
 mod link;
 
 use jake_protocol as protocol;
@@ -16,6 +19,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::serve::{Listener, ListenerExt, TapIo};
+use clap::{Parser, Subcommand, value_parser};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -43,6 +47,7 @@ async fn run() -> Result<(), String> {
     secret: config.secret,
     agent_key: config.agent_key,
     control_token: config.control_token.clone(),
+    control_key: config.control_key,
     max_payload_bytes: config.max_payload_bytes,
     ping_interval: config.ping_interval,
     missed_pong_limit: config.missed_pong_limit,
@@ -89,26 +94,74 @@ async fn run() -> Result<(), String> {
   Ok(())
 }
 
+/// The jake hub; given a verb, a client of the running hub instead.
+#[derive(Parser)]
+#[command(name = "jake-hub", version)]
+struct Cli {
+  #[command(subcommand)]
+  verb: Option<Verb>,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+  /// Join standard input and output to a byte stream to a port on an agent's machine
+  Connect {
+    /// The agent whose machine the stream reaches
+    agent: String,
+    /// The port on that machine
+    #[arg(default_value_t = connect::SSH_PORT, value_parser = value_parser!(u16).range(1..))]
+    port: u16,
+  },
+  /// Run a command on an agent's machine, stream its output, and exit with its exit code
+  Exec(exec::ExecArgs),
+  /// Print a control credential that reaches the named agents alone, made with JAKE_CONTROL_KEY
+  Credential {
+    /// The agents the credential reaches
+    #[arg(required = true)]
+    agents: Vec<String>,
+  },
+}
+
+// A control credential for the named agents, from the hub's own control key.
+fn scoped_credential(agents: &[String]) -> Result<String, String> {
+  if let Some(name) = agents.iter().find(|name| name.is_empty() || name.contains(',')) {
+    return Err(format!("{name:?} is not an agent name"));
+  }
+  Ok(credential::credential(&config::load_control_key()?, &agents.join(",")))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-  let args: Vec<String> = std::env::args().skip(1).collect();
-  if args.first().map(String::as_str) == Some(connect::MODE) {
-    let code = match connect::run(&args[1..]).await {
-      Ok(()) => 0,
-      Err(message) => {
-        eprintln!("jake-hub connect: {message}");
-        1
-      }
-    };
-    // A read of standard input cannot be cancelled, so the process ends here rather than waiting on
-    // one at the runtime's shutdown.
-    std::process::exit(code);
-  }
-  match run().await {
-    Ok(()) => ExitCode::SUCCESS,
-    Err(message) => {
-      eprintln!("{message}");
-      ExitCode::FAILURE
+  match Cli::parse().verb {
+    Some(Verb::Connect { agent, port }) => {
+      let code = match connect::run(&agent, port).await {
+        Ok(()) => 0,
+        Err(message) => {
+          eprintln!("jake-hub connect: {message}");
+          1
+        }
+      };
+      // A read of standard input cannot be cancelled, so the process ends here rather than waiting on
+      // one at the runtime's shutdown.
+      std::process::exit(code);
     }
+    Some(Verb::Exec(args)) => ExitCode::from(exec::run(args).await as u8),
+    Some(Verb::Credential { agents }) => match scoped_credential(&agents) {
+      Ok(credential) => {
+        println!("{credential}");
+        ExitCode::SUCCESS
+      }
+      Err(message) => {
+        eprintln!("jake-hub credential: {message}");
+        ExitCode::FAILURE
+      }
+    },
+    None => match run().await {
+      Ok(()) => ExitCode::SUCCESS,
+      Err(message) => {
+        eprintln!("{message}");
+        ExitCode::FAILURE
+      }
+    },
   }
 }

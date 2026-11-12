@@ -318,21 +318,28 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
     return response;
   }
   let hub = &control.hub;
-  if !hub.authorize_control(request.headers().get(AUTHORIZATION).map(|value| value.as_bytes())) {
+  let Some(reach) =
+    hub.authorize_control(request.headers().get(AUTHORIZATION).map(|value| value.as_bytes()))
+  else {
     return error(401, "unauthorized");
-  }
+  };
   let query = Query::of(&request);
   let (mut parts, body) = request.into_parts();
 
   match (method.clone(), path.as_str()) {
-    (Method::GET, "/status") => json(200, &hub.status()),
+    (Method::GET, "/status") => json(200, &hub.status(&reach)),
     (Method::GET, "/events") => {
       let after = query.get("after").and_then(leading_int).unwrap_or(0).max(0) as u64;
       let (replay, live) = hub.tail(after);
       let run = sse_frame("run", &json!({ "run": hub.run_tag() }), None);
-      let replay = replay.into_iter().map(|entry| sse_frame("traffic", &*entry, Some(entry.id)));
-      let live = BroadcastStream::new(live).filter_map(|entry| async move {
-        entry.ok().map(|entry| sse_frame("traffic", &*entry, Some(entry.id)))
+      let replay: Vec<Bytes> = replay
+        .into_iter()
+        .filter(|entry| reach.shows(entry.agent.as_deref()))
+        .map(|entry| sse_frame("traffic", &*entry, Some(entry.id)))
+        .collect();
+      let live = BroadcastStream::new(live).filter_map(move |entry| {
+        let shown = entry.ok().filter(|entry| reach.shows(entry.agent.as_deref()));
+        async move { shown.map(|entry| sse_frame("traffic", &*entry, Some(entry.id))) }
       });
       sse(stream::iter(std::iter::once(run).chain(replay)).chain(live).boxed())
     }
@@ -341,7 +348,7 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
         Ok(params) => params,
         Err(message) => return error(400, &message),
       };
-      match hub.resolve_target(query.agent()) {
+      match hub.resolve_target(query.agent(), &reach) {
         Ok(name) => started_stream(hub.start_exec(params, Some(&name))),
         Err(refused) => refusal(&refused),
       }
@@ -350,7 +357,7 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
       let Some(remote) = query.get("path").filter(|remote| !remote.is_empty()).map(str::to_owned) else {
         return error(400, "the path query parameter is required");
       };
-      let name = match hub.resolve_target(query.agent()) {
+      let name = match hub.resolve_target(query.agent(), &reach) {
         Ok(name) => name,
         Err(refused) => return refusal(&refused),
       };
@@ -366,12 +373,12 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
       let Some(id) = body_json(body).await.get("id").and_then(Value::as_str).map(str::to_owned) else {
         return error(400, "id must be a string");
       };
-      match hub.cancel(&id) {
+      match hub.cancel(&id, &reach) {
         Ok(()) => json(200, &json!({ "ok": true })),
         Err(reason) => json(409, &json!({ "ok": false, "reason": reason })),
       }
     }
-    (Method::POST, "/leave") => match hub.resolve_target(query.agent()) {
+    (Method::POST, "/leave") => match hub.resolve_target(query.agent(), &reach) {
       Err(refused) => json(
         refused.kind.status(),
         &json!({ "ok": false, "reason": refused.reason, "code": refused.kind.code() }),
@@ -385,6 +392,9 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
       let Some(name) = query.agent().filter(|name| !name.is_empty()).map(str::to_owned) else {
         return error(400, "the agent query parameter is required");
       };
+      if !reach.admits(&name) {
+        return refusal(&Refusal::out_of_reach(&name));
+      }
       let Some(port) = query.get("port").and_then(|port| port.parse::<u16>().ok()).filter(|port| *port > 0)
       else {
         return error(400, "the port query parameter must be a port number");
@@ -413,6 +423,9 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
       let Some(name) = query.agent().filter(|name| !name.is_empty()) else {
         return error(400, "the agent query parameter is required");
       };
+      if !reach.admits(name) {
+        return refusal(&Refusal::out_of_reach(name));
+      }
       json(200, &hub.listens(name))
     }
     (Method::GET, "/connect") => {
@@ -420,7 +433,7 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
       else {
         return error(400, "the port query parameter must be a port number");
       };
-      let name = match hub.resolve_target(query.agent()) {
+      let name = match hub.resolve_target(query.agent(), &reach) {
         Ok(name) => name,
         Err(refused) => return refusal(&refused),
       };

@@ -11,19 +11,8 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use crate::config;
 use crate::protocol::STREAM_CHUNK_BYTES;
 
-/// The argument that runs the executable as a stream's caller rather than as the hub.
-pub const MODE: &str = "connect";
 /// The port a stream reaches when none is named: SSH's.
-const SSH_PORT: u16 = 22;
-const USAGE: &str = "usage: jake-hub connect <agent> [port]";
-
-fn port_of(raw: &str) -> Result<u16, String> {
-  raw
-    .parse::<u16>()
-    .ok()
-    .filter(|port| *port > 0)
-    .ok_or_else(|| format!("{raw} is not a port number"))
-}
+pub const SSH_PORT: u16 = 22;
 
 // What the hub said when it refused the stream before opening it.
 fn refusal(response: &Response<Option<Vec<u8>>>) -> String {
@@ -36,14 +25,9 @@ fn refusal(response: &Response<Option<Vec<u8>>>) -> String {
   format!("the hub refused the stream (HTTP {}): {said}", response.status().as_u16())
 }
 
-/// Open the stream named by the arguments and carry it until either end closes; why it ended, when
-/// that was a failure.
-pub async fn run(args: &[String]) -> Result<(), String> {
-  let (agent, port) = match args {
-    [agent] => (agent, SSH_PORT),
-    [agent, port] => (agent, port_of(port)?),
-    _ => return Err(USAGE.into()),
-  };
+/// Open a stream to the port on the agent's machine and carry it until either end closes; why it
+/// ended, when that was a failure.
+pub async fn run(agent: &str, port: u16) -> Result<(), String> {
   let control = config::load_control()?;
   let query = form_urlencoded::Serializer::new(String::new())
     .append_pair("agent", agent)
@@ -52,8 +36,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
   let mut request = format!("ws://127.0.0.1:{}/connect?{query}", control.port)
     .into_client_request()
     .map_err(|error| error.to_string())?;
-  let credential = HeaderValue::from_str(&format!("Bearer {}", control.token))
-    .map_err(|_| "the control token cannot be sent as a header".to_owned())?;
+  let credential = HeaderValue::from_str(&format!("Bearer {}", control.credential))
+    .map_err(|_| "the control credential cannot be sent as a header".to_owned())?;
   request.headers_mut().insert(AUTHORIZATION, credential);
   let socket = match tokio_tungstenite::connect_async_with_config(request, None, true).await {
     Ok((socket, _)) => socket,
