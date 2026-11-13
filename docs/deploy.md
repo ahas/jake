@@ -49,7 +49,7 @@ builds the hub and links the unit. Deploy once from main-host, then enable the u
 lingering so it runs across a reboot without an interactive login.
 
 ```sh
-env -u CLAUDE_PID bmo-testbed deploy jake
+cd ~/repos/ahas/jake && bmo-testbed deploy
 systemctl --user enable --now jake-hub
 loginctl enable-linger "$USER"
 ```
