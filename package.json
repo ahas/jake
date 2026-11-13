@@ -11,10 +11,9 @@
     "check:types": "bunx tsc --noEmit",
     "typecheck": "bunx tsc --noEmit",
     "check:rust": "cargo clippy --offline --workspace --all-targets -- -D warnings && cargo fmt --all --check",
-    "check:cli": "bun scripts/check-hub-cli.ts --build",
     "test:rust": "cargo test --offline --workspace",
     "test": "bun test",
-    "check": "bun run check:types && bun run check:rust && bun run check:cli && bun run test:rust && bun run test",
+    "check": "bun run check:types && bun run check:rust && bun run test:rust && bun run test",
     "build": "bun scripts/build.ts"
   }
 }

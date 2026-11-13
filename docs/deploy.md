@@ -9,9 +9,8 @@ writing the NPM proxy host and reloading nginx, and enabling the service all cha
 infrastructure, so they belong to a deployment turn, not to a build. Run them from main-host unless a step says otherwise.
 
 The committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
-config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the hub CLI install
-script `scripts/install-hub-cli.sh`, the testbed's declaration `testbed.toml` with the check it runs
-before the flip, `scripts/check-checkout-at-commit.sh`, and this document.
+config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the testbed's declaration
+`testbed.toml`, and this document.
 
 ## 1. The config file
 
@@ -43,42 +42,29 @@ nginx template in step 5 too — the two must agree. Record the same `JAKE_SECRE
 
 ## 2. The systemd user service
 
-The hub is the Rust crate under `hub/`, and the unit builds and runs it with cargo offline, so the
-Rust toolchain must be installed under `~/.cargo` and the crates fetched once beforehand. Fetch them
-and build the release binary, so the first start does not wait on a compile:
+The hub is the Rust crate under `hub/`, and the unit runs its release binary from the deploy tree,
+`~/.local/share/jake-hub/deploy/bin/jake-hub`. Nothing runs from the checkout or its build directory:
+the binary is built by BMO's testbed when it deploys a commit (step 8), so the first deployment both
+builds the hub and links the unit. Deploy once from main-host, then enable the unit and turn on
+lingering so it runs across a reboot without an interactive login.
 
 ```sh
-cargo fetch --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
-cargo build --release --frozen --manifest-path ~/repos/ahas/jake/hub/Cargo.toml
-```
-
-The unit's `ExecStartPre` runs `scripts/install-hub-cli.sh` on every start. It builds
-`target/release/jake-hub` and copies it to `~/.local/bin/jake-hub`, so the CLI that ssh calls
-survives a sweep of the checkout's target directory. Run it by hand once after the build above:
-
-```sh
-bash ~/repos/ahas/jake/scripts/install-hub-cli.sh
-```
-
-Then link the unit into the user unit directory, enable it, and turn on lingering so it runs across
-a reboot without an interactive login.
-
-```sh
-mkdir -p ~/.config/systemd/user
-ln -sf ~/repos/ahas/jake/jake-hub.service ~/.config/systemd/user/jake-hub.service
-systemctl --user daemon-reload
+env -u CLAUDE_PID bmo-testbed deploy jake
 systemctl --user enable --now jake-hub
 loginctl enable-linger "$USER"
 ```
 
-The unit will not start until the config file from step 1 exists, which is what the
-`ConditionPathExists` guards. A restart runs whatever the checkout holds, rebuilding first if the
-crate changed. Putting a commit live is a deployment through BMO's testbed (step 8), which restarts the
-unit and records the commit; the first deployment moves the unit's link from the checkout onto the same
-file in the deploy tree. The ssh
-`ProxyCommand` runs `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`, so the
-checkout must keep that binary. The same start runs the install script, which rebuilds it and copies
-it to `~/.local/bin/jake-hub`; a restart therefore leaves both paths working.
+The deployment links `~/.config/systemd/user/jake-hub.service` to the unit file in the deploy tree,
+restarts the hub and waits until it answers. The unit will not start until the config file from step 1
+exists, which is what the `ConditionPathExists` guards. A restart runs the deployed commit again; only a
+deployment changes what the hub runs.
+
+The CLI the shell and other tools call, `jake-hub exec` among them, is the same binary. Link it onto the
+PATH once, so it follows every deployment rather than keeping a copy of its own:
+
+```sh
+ln -sf ~/.local/share/jake-hub/deploy/bin/jake-hub ~/.local/bin/jake-hub
+```
 
 After the unit file itself changes, run `systemctl --user daemon-reload` once so systemd reads the
 new start step; after that a restart is enough. Confirm it came up:
@@ -194,14 +180,12 @@ place.
 
 ## 7. ssh to a machine behind the tunnel
 
-The `ProxyCommand` that carries ssh to an agent's machine is the hub's own release binary, run in its
-connect mode: `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`. ssh is configured
-to call that checkout path, so a build must leave the binary there. The unit's `ExecStartPre` runs
-`scripts/install-hub-cli.sh`, which builds it, and the script keeps a second copy at
-`~/.local/bin/jake-hub` for use outside ssh, where `jake-hub exec` runs a command on a machine
-without bun. Both read the control port and token from the same `hub.env`. `bun run check` builds the CLI and fails when either path is missing, so a swept target
-directory is reported by the check rather than by the next ssh. A sweep while the hub is running
-still breaks ssh until the next restart, because the running hub holds the deleted file.
+The `ProxyCommand` that carries ssh to an agent's machine is the hub's deployed binary, run in its
+connect mode: `~/.local/share/jake-hub/deploy/bin/jake-hub connect <agent> [port]`. It is the deploy
+tree's path, so ssh always runs the live commit and no build or sweep of a checkout can take it away.
+The link at `~/.local/bin/jake-hub` from step 2 is the same file for use outside ssh, where `jake-hub
+exec` runs a command on a machine without bun. Both read the control port and token from the same
+`hub.env`.
 
 The machine side — an SSH server, the agent's `JAKE_STREAM_PORTS`, and main-host's key in the
 account's authorized keys — is in docs/install.md, and the `~/.ssh/config` block, with herdr's saved
@@ -230,12 +214,10 @@ The declaration says the rest:
   `[Install]` section, which systemd ignores). Each deployment links the unit to its file in the deploy
   tree, restarts the hub and waits until `bin/jake-hub up`, run from the release, answers 0, so the
   hub serves on both its ports before the deployment ends `live`.
-- The hub still runs from this checkout: the unit's start builds and runs whatever the checkout holds,
-  not the release. So before the flip the deployment checks that the checkout's `HEAD` is the commit
-  being deployed and that no tracked file stands changed, and fails with nothing restarted otherwise.
-  The commit the record names live is then exactly what the hub is built from, and a commit the
-  checkout has moved past is deployed by deploying the checkout's own `HEAD`.
-- A rollback flips the deploy tree back and restarts the hub, which runs the checkout as it stands, so it
-  moves no code. A commit that breaks the hub is mended by the next commit and its deployment.
+- The hub runs the release: the unit's binary is the deploy tree's `bin/jake-hub`, which the testbed
+  builds from the commit it deploys. The commit the record names live is exactly what the hub runs,
+  whatever the checkout holds meanwhile.
+- A rollback flips the deploy tree back to the previous release and restarts the hub, which then runs
+  that release's binary.
 - A jake job's close waits on this deployment: it reads the records under the deploy root and ends
   `live` once a deployment of its commit does.

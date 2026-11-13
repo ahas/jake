@@ -12,21 +12,16 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-# The checkout the hub runs from. cargo builds the Rust hub in place when its sources or its build
-# are newer than the binary, offline from the crates already fetched, and then replaces itself with
-# the hub, so the unit's main process is the hub and a restart runs whatever the checkout holds.
-WorkingDirectory=%h/repos/ahas/jake
-# The release build above leaves the CLI in the checkout's target directory, where a sweep of that
-# directory would take it from ssh. This installs the same binary outside the checkout and rebuilds
-# the checkout's copy on every start, so a restart leaves both paths working.
-ExecStartPre=%h/repos/ahas/jake/scripts/install-hub-cli.sh
-ExecStart=%h/.cargo/bin/cargo run --release --frozen --quiet --manifest-path hub/Cargo.toml
-# The journal names the hub, not the cargo that started it.
+# The hub's binary in the deploy tree: the release the testbed built from the commit it records live
+# (docs/deploy.md, step 8). A deployment flips the tree and restarts the unit, so the hub runs exactly
+# the deployed commit and nothing in a checkout or its build directory.
+WorkingDirectory=%h/.local/share/jake
+ExecStart=%h/.local/share/jake-hub/deploy/bin/jake-hub
 SyslogIdentifier=jake-hub
 Restart=always
 RestartSec=5
-# The same PATH BMO's units carry, so cargo, rustc and the tools a login shell reaches for are found
-# the same way whether the hub was started by systemd or from a shell.
+# The same PATH BMO's units carry, so a tool the hub reaches for is found the same way whether it was
+# started by systemd or from a shell.
 Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
