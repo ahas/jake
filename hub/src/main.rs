@@ -10,6 +10,7 @@ mod credential;
 mod departed;
 mod exec;
 mod link;
+mod up;
 
 use jake_protocol as protocol;
 
@@ -120,6 +121,8 @@ enum Verb {
     #[arg(required = true)]
     agents: Vec<String>,
   },
+  /// Ask the running hub once whether both its ports answer, and exit 0 only where they do
+  Up,
 }
 
 // A control credential for the named agents, from the hub's own control key.
@@ -156,6 +159,7 @@ async fn main() -> ExitCode {
         ExitCode::FAILURE
       }
     },
+    Some(Verb::Up) => ExitCode::from(up::run().await),
     None => match run().await {
       Ok(()) => ExitCode::SUCCESS,
       Err(message) => {

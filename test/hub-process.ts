@@ -72,8 +72,8 @@ async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string
 }
 
 /**
- * The hub executable run with a client verb against a running hub, configured by `credentials` alone:
- * JAKE_CONTROL_TOKEN, JAKE_CONTROL_CREDENTIAL or JAKE_CONTROL_KEY, as the verb needs.
+ * The hub executable run with a client verb against a running hub, configured by its two ports and by
+ * `credentials`: JAKE_CONTROL_TOKEN, JAKE_CONTROL_CREDENTIAL or JAKE_CONTROL_KEY, as the verb needs.
  */
 export function startHubClient(
   hub: HubProcess,
@@ -85,6 +85,8 @@ export function startHubClient(
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
     JAKE_HUB_ENV: join(tmpdir(), "jake-client-no-such-file.env"),
+    JAKE_HUB_HOST: "127.0.0.1",
+    JAKE_HUB_PORT: String(hub.agentPort),
     JAKE_CONTROL_PORT: String(hub.controlPort),
     ...credentials,
   };

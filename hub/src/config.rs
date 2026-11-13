@@ -126,10 +126,37 @@ pub fn load_control() -> Result<ControlConfig, String> {
   control(&Source(merged(std::env::vars().collect())?))
 }
 
+/// What `jake-hub up` asks the running hub through: where its agent server listens, and its control API.
+pub struct UpConfig {
+  pub host: String,
+  pub port: u16,
+  pub control: ControlConfig,
+}
+
+/// Read where the running hub answers, as the hub itself reads it, naming the key that is missing or
+/// malformed.
+pub fn load_up() -> Result<UpConfig, String> {
+  let env = Source(merged(std::env::vars().collect())?);
+  let (host, port) = agent_address(&env)?;
+  Ok(UpConfig {
+    host,
+    port,
+    control: control(&env)?,
+  })
+}
+
 /// Read the key scoped control credentials are made with, naming it when it is not set.
 pub fn load_control_key() -> Result<String, String> {
   let env = Source(merged(std::env::vars().collect())?);
   env.required("JAKE_CONTROL_KEY").map(|key| key.trim().to_owned())
+}
+
+// The address the agent server binds: its host and its port.
+fn agent_address(env: &Source) -> Result<(String, u16), String> {
+  Ok((
+    env.present("JAKE_HUB_HOST").unwrap_or(DEFAULT_HUB_HOST).to_owned(),
+    env.port("JAKE_HUB_PORT", DEFAULT_HUB_PORT)?,
+  ))
 }
 
 fn control(env: &Source) -> Result<ControlConfig, String> {
@@ -149,9 +176,10 @@ fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
   if control_key.is_some() && control_key == agent_key {
     return Err("JAKE_CONTROL_KEY must differ from JAKE_AGENT_KEY.".into());
   }
+  let (host, port) = agent_address(env)?;
   Ok(HubConfig {
-    host: env.present("JAKE_HUB_HOST").unwrap_or(DEFAULT_HUB_HOST).to_owned(),
-    port: env.port("JAKE_HUB_PORT", DEFAULT_HUB_PORT)?,
+    host,
+    port,
     secret: env.required("JAKE_SECRET")?,
     agent_key,
     control_port: env.port("JAKE_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,

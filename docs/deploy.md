@@ -8,9 +8,10 @@ Nothing here is run as part of building the hub. Opening the firewall port, crea
 writing the NPM proxy host and reloading nginx, and enabling the service all change live
 infrastructure, so they belong to a deployment turn, not to a build. Run them from main-host unless a step says otherwise.
 
-The five committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
+The committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
 config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the hub CLI install
-script `scripts/install-hub-cli.sh`, and this document.
+script `scripts/install-hub-cli.sh`, the testbed's declaration `testbed.toml` with the check it runs
+before the flip, `scripts/check-checkout-at-commit.sh`, and this document.
 
 ## 1. The config file
 
@@ -72,7 +73,9 @@ loginctl enable-linger "$USER"
 
 The unit will not start until the config file from step 1 exists, which is what the
 `ConditionPathExists` guards. A restart runs whatever the checkout holds, rebuilding first if the
-crate changed, so putting a new hub live is `systemctl --user restart jake-hub`. The ssh
+crate changed. Putting a commit live is a deployment through BMO's testbed (step 8), which restarts the
+unit and records the commit; the first deployment moves the unit's link from the checkout onto the same
+file in the deploy tree. The ssh
 `ProxyCommand` runs `~/repos/ahas/jake/target/release/jake-hub connect <agent> [port]`, so the
 checkout must keep that binary. The same start runs the install script, which rebuilds it and copies
 it to `~/.local/bin/jake-hub`; a restart therefore leaves both paths working.
@@ -166,11 +169,18 @@ covered by it.
 
 ```sh
 systemctl --user status jake-hub                 # active (running)
+jake-hub up                                      # both ports answer as the hub does
 curl -sI https://jake.example.org/                   # HTTP 401 — the hub answers, and wants the secret
 curl -sI -H "Authorization: Bearer $(grep '^JAKE_SECRET=' ~/.local/share/jake/hub.env | cut -d= -f2)" \
   https://jake.example.org/                          # HTTP 426 — authorized, expecting a WS upgrade
 bun ~/repos/ahas/jake/src/console/main.ts status   # every attached agent, one line each
 ```
+
+`jake-hub up` reads `hub.env` the way the hub does and asks the running hub once: the agent server, at
+`JAKE_HUB_HOST` (the loopback address where that is the unspecified address) and `JAKE_HUB_PORT`, with no
+credential, which answers 401; and the control API's `/status` on `JAKE_CONTROL_PORT` with the control
+credential, which answers 200. It exits 0 where both answer so and 1 otherwise, each time naming what each
+port answered, and waits at most ten seconds on either port.
 
 The agent server checks the secret before anything else, so a plain request reaching the hub returns
 401, and the same request carrying the secret returns 426 because the server accepts only a WebSocket
@@ -204,3 +214,28 @@ ssh jake_wsl true && echo reached                   # the login runs over the tu
 
 A hub restart drops every agent's connection, and every ssh session riding one ends with it; ssh
 connects again once the agents have redialled, a few seconds later.
+
+## 8. Putting a commit live
+
+A commit goes live through BMO's testbed. Its hosted deploy tool deploys the repository by the name
+`jake`, the one this repository's `testbed.toml` declares, from the checkout the machine's registry of
+checkouts lists for it: `checkouts.toml` under the testbed's data directory, which lists this checkout.
+The declaration says the rest:
+
+- The deploy root is `~/.local/share/jake-hub`. It holds the deploy tree `deploy`, the releases, the
+  deployment record `deployed.json` with its log, the progress record and the backups. The data root is
+  `~/.local/share/jake`, the hub's own data directory, which each deployment's backup carries, the
+  agent's log left out.
+- `jake-hub.service` marks itself as the deployment's one watched service (`X-BMO-Deploy=bot` in its
+  `[Install]` section, which systemd ignores). Each deployment links the unit to its file in the deploy
+  tree, restarts the hub and waits until `bin/jake-hub up`, run from the release, answers 0, so the
+  hub serves on both its ports before the deployment ends `live`.
+- The hub still runs from this checkout: the unit's start builds and runs whatever the checkout holds,
+  not the release. So before the flip the deployment checks that the checkout's `HEAD` is the commit
+  being deployed and that no tracked file stands changed, and fails with nothing restarted otherwise.
+  The commit the record names live is then exactly what the hub is built from, and a commit the
+  checkout has moved past is deployed by deploying the checkout's own `HEAD`.
+- A rollback flips the deploy tree back and restarts the hub, which runs the checkout as it stands, so it
+  moves no code. A commit that breaks the hub is mended by the next commit and its deployment.
+- A jake job's close waits on this deployment: it reads the records under the deploy root and ends
+  `live` once a deployment of its commit does.

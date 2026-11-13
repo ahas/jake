@@ -31,3 +31,6 @@ Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/sbin:/usr/lo
 
 [Install]
 WantedBy=default.target
+# The service a testbed deployment restarts and waits on until `jake-hub up` answers (docs/deploy.md,
+# step 8); systemd ignores the key.
+X-BMO-Deploy=bot

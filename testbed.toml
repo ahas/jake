@@ -1,0 +1,26 @@
+# How BMO's testbed deploys this repository, in the testbed's declaration format (docs/deploy.md, step 8).
+
+testbed = 0
+name = "jake"
+
+[build]
+# The release carries the hub's binary, which the deployment's health runs.
+binaries = ["jake-hub"]
+
+[deploy]
+root = "~/.local/share/jake-hub"
+# The hub's own data directory, holding its env file; every deployment's backup carries it.
+data_root = "~/.local/share/jake"
+units = ["jake-hub.service"]
+# Answers 0 once both the agent server and the control API answer as the hub does.
+health = "bin/jake-hub up"
+
+# The hub's unit builds and runs the checkout, not the release, so the commit goes live only where the
+# checkout stands at it.
+[[deploy.step]]
+id = "checkout-at-commit"
+phase = "before-flip"
+command = "bash scripts/check-checkout-at-commit.sh"
+
+[deploy.backup]
+exclude = ["agent.log"]

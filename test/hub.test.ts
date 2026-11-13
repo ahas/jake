@@ -1278,3 +1278,24 @@ describe("status page", () => {
     expect(status.status).toBe(401);
   });
 });
+
+describe("the hub executable's up", () => {
+  test("exits 0 naming both ports while the hub serves, and 1 naming the port that did not answer as the hub does", async () => {
+    const hub = await launch();
+    const up = hubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["up"]);
+    expect(await up.exited).toBe(0);
+    expect(await new Response(up.stdout).text()).toBe(
+      `jake-hub up: agent server on 127.0.0.1:${hub.agentPort} answered 401, control API on 127.0.0.1:${hub.controlPort} answered 200\n`,
+    );
+
+    // A token the hub did not load reads as a hub that is not the one configured.
+    const stranger = hubClient(hub, { JAKE_CONTROL_TOKEN: "not-the-token" }, ["up"]);
+    expect(await stranger.exited).toBe(1);
+    expect(await new Response(stranger.stderr).text()).toContain(`control API on 127.0.0.1:${hub.controlPort} answered 401`);
+
+    await hub.stop();
+    const down = hubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["up"]);
+    expect(await down.exited).toBe(1);
+    expect(await new Response(down.stderr).text()).toContain(`agent server on 127.0.0.1:${hub.agentPort} could not be reached`);
+  });
+});
