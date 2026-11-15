@@ -1,5 +1,7 @@
 [workspace]
 members = ["agent", "hub", "protocol"]
+# The desktop app is a workspace of its own (docs/desktop.md, 「The crate and its workspace」).
+exclude = ["desktop"]
 resolver = "3"
 
 # The contract tests run the debug builds through transfers of hundreds of megabytes; the hashing,

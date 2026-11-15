@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# The agent as a library, which the executable and the desktop app's built-in agent both run.
+[lib]
+name = "jake_agent"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jake"
 path = "src/main.rs"
@@ -22,6 +27,10 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 # The machine's own trust store comes first, since a network that inspects TLS re-signs the hub's
 # certificate with a root only that store holds; the bundled roots stand in where the store is empty.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# The library's tests run it the way the desktop app does, on a runtime of many threads.
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

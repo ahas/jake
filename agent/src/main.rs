@@ -1,32 +1,13 @@
 // The jake executable: the agent, the Windows guard, or the uninstaller's leave notice, by its argument.
 
-mod command;
-mod config;
-mod connection;
-mod departure;
-mod exec;
-mod log;
-mod pair;
-mod platform;
-mod stream;
-mod transfer;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
+use jake_agent::platform::{self, Platform, Role};
+use jake_agent::{Agent, Ended, Log, VERSION, config, departure};
 use serde_json::json;
-
-use crate::connection::Agent;
-use crate::log::Log;
-use crate::pair::{GUARD_MODE_FLAG, Watchdog};
-use crate::platform::{Platform, Role};
-
-/// This build's version, announced in the hello; the build stamps it in through `JAKE_VERSION`.
-const VERSION: &str = match option_env!("JAKE_VERSION") {
-  Some(version) => version,
-  None => env!("CARGO_PKG_VERSION"),
-};
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
 const LEAVE_FLAG: &str = "--leave";
@@ -135,16 +116,9 @@ async fn run_agent(start: Start) -> ExitCode {
     "agent-starting",
     json!({ "hubUrl": start.config.hub_url, "agent": start.config.agent_name, "version": VERSION }),
   );
-  let agent = Agent {
-    config: start.config.clone(),
-    version: VERSION.to_owned(),
-    log: log.clone(),
-  };
+  let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone());
   // The tunnel ends only on a hub's leave; by then every run and transfer it carried has ended.
-  let leave = tokio::select! {
-    () = agent.run() => true,
-    () = stop_requested() => false,
-  };
+  let leave = jake_agent::run(&agent, stop_requested()).await == Ended::Left;
   // The watchdog stops before anything is torn down, so it neither rewrites an anchor nor revives the guard.
   if let Some(pair) = pair {
     pair.stop();
@@ -170,11 +144,7 @@ async fn run_guard(start: Start) -> ExitCode {
 }
 
 async fn run_leave(start: Start) -> ExitCode {
-  let agent = Agent {
-    config: start.config,
-    version: VERSION.to_owned(),
-    log: start.log,
-  };
+  let agent = Agent::new(start.config, VERSION.to_owned(), start.log);
   match agent.announce_leave().await {
     Ok(()) => {
       println!("the hub was told {} has left", agent.config.agent_name);

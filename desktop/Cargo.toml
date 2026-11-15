@@ -1,0 +1,40 @@
+[package]
+name = "jake-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A workspace of its own (docs/desktop.md, 「The crate and its workspace」): the root workspace's
+# release build and lints must need no webview libraries, and this crate is built with unwinding.
+[workspace]
+
+[[bin]]
+name = "jake-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+jake-agent = { path = "../agent" }
+# Windows Credential Manager, the Secret Service over D-Bus and the macOS Keychain, and no file store.
+keyring = "4.2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.7"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-updater = "2.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+url = "2.5"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local",
+  "description": "The bundled status page in the main window may read the state, try the console again and retry; no remote origin is listed, so the console's own pages call nothing.",
+  "windows": ["main"],
+  "permissions": ["allow-status", "allow-console", "allow-retry"]
+}

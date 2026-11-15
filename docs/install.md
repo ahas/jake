@@ -6,6 +6,11 @@
 - It installs on either kind of host — a Windows box, where it runs PowerShell and WSL commands, or a
   Linux/WSL box, where it runs a Linux shell.
 - This guide is how 하스 installs, updates, and removes it on his own machine.
+- The desktop app is the other way: BMO's web console as an app of its own that carries the agent
+  inside it and is joined by approving it in the console, with no secret typed. It is described in
+  docs/desktop.md; this guide is the one-line install, which works as it always has beside it. Give
+  the two different machines, or one of them alone: on a machine where an installed agent of the same
+  name runs, the app keeps its own agent off.
 - No administrator rights are needed. Everything runs in his own user account.
 
 ## One-line install

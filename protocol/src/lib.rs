@@ -13,6 +13,10 @@ pub use stream::{ReceiveWindow, STREAM_ACK_BYTES, STREAM_CHUNK_BYTES, STREAM_WIN
 /// The version every frame carries; a frame at another version is refused, not guessed at.
 pub const PROTOCOL_VERSION: i64 = 1;
 
+/// The reason the hub closes an agent's socket with once a newer hello took the same name; an agent
+/// that gives its name up rather than redial reads its connection's end by it.
+pub const SUPERSEDED_REASON: &str = "superseded by a new connection";
+
 /// The decoded size of one file-transfer chunk, held far below either side's payload cap.
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 

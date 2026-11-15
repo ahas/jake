@@ -33,16 +33,23 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and only keeps the agent alive; the command line chooses which of the two a process is. Run with
   the leave-notice flag it is neither: it tells the hub the agent was uninstalled, and exits. On a Linux
   host the agent needs no guard, because the platform's own service manager keeps it running. The
-  staying-alive scheme below covers both.
+  staying-alive scheme below covers both. The same crate is also a library, whose entry runs the
+  agent on a caller's own runtime from a configuration held in memory.
+- **desktop** — the desktop app, the `desktop` crate in this repository: BMO's web console in a window
+  of its own, carrying a built-in agent that runs the agent crate's library for as long as the app
+  runs. It is the second way a machine is joined to the hub, beside the one-line install, and obtains
+  the person's own machine credential through the console's device pairing. docs/desktop.md is its
+  canonical statement.
 
 ## Many agents, one hub
 
 - An agent is known to the hub by the name its hello carries, and the name is the whole of its
   identity. The hub holds one connection per name, as many names at once as there are machines. A
   hello under a name already held replaces that name's connection — the older socket is closed with
-  the stated reason `superseded by a new connection` — because a redial after a half-dead TCP
-  connection must not leave two peers streaming as the same machine. A hello under a new name
-  displaces nobody.
+  code 4000 and the stated reason `superseded by a new connection` — because a redial after a
+  half-dead TCP connection must not leave two peers streaming as the same machine. A hello under a
+  new name displaces nobody. The reason is part of the contract: the desktop app's built-in agent
+  reads it to give its name up rather than redial.
 - Everything that belongs to a connection lives and dies with it: its liveness probe, its commands,
   its transfers and its streams. An agent that drops, is declared dead, or is superseded ends only what was
   running on it; the other agents' work carries on.
@@ -120,7 +127,9 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 - Each side reads a single environment file at startup, and nothing is compiled into a binary. The
   agent's file sits beside its executable; the hub's sits under its data directory, outside the git
-  tree. The repository carries only the example files.
+  tree. The repository carries only the example files. The desktop app's built-in agent reads no
+  file: the app hands it the hub URL, its name and its credential, which it keeps in the operating
+  system's credential store (docs/desktop.md, 「The credential's storage」).
 - The connection secret and the control token are entered at install time and live only in those
   files. A loader that cannot find a required key reports the key by name and stops — it never runs
   a process against a guessed credential.
@@ -132,8 +141,9 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   hub accepts it only where it holds an agent key and the mac is the name's, and the connection may
   then take that one name: a hello under any other is answered by closing the socket with code 4003,
   and recorded. Whoever holds the agent key mints such credentials — the account service, for a
-  machine an invited person installs — so a person is given a credential for their own machine's name
-  and never the shared secret. A hub with no agent key accepts the shared secret alone.
+  machine an invited person installs, and for the machine a person pairs the desktop app with — so a
+  person is given a credential for their own machine's name and never the shared secret. A hub with no
+  agent key accepts the shared secret alone.
 - **A control caller may present a credential scoped to named agents** instead of the control token:
   `<names>.<mac>`, where the names are agent names joined by commas and the mac is the lowercase hex
   of HMAC-SHA256 over that list, keyed by the hub's control key (`JAKE_CONTROL_KEY`). The control
@@ -164,7 +174,10 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 The agent must come back on its own from a crash and a reboot, so that BMO's link to 하스's machine
 survives without anyone tending it. How it comes back depends on the host, because the two platforms
-give very different footing for keeping a per-user process running.
+give very different footing for keeping a per-user process running. What follows is the installed
+agent's scheme; the desktop app's built-in agent runs while the app runs, is restarted by the app
+after a fault, and returns at sign-in only where the person turned that on (docs/desktop.md,
+「Keeping the agent running」).
 
 ### On a Linux host
 
@@ -454,6 +467,10 @@ give very different footing for keeping a per-user process running.
   `systemd --user` unit with lingering enabled, started at once, failing loudly where systemd is not
   available. It verifies by reading the agent's own local log for a record that it reached the hub,
   because the installer runs on 하스's machine and cannot reach the hub's loopback control API.
+- The desktop app is the other way a machine is joined, and is built and distributed apart: an
+  installer for the current user alone, with updates through Tauri's updater (docs/desktop.md,
+  「Distribution and updates」). The one-line install stays as it is beside it, and the two never run
+  under one name together (docs/desktop.md, 「One agent per name」).
 - The install is re-runnable over an existing one without duplicating its registrations: on Windows
   each anchor is overwritten in place and a running pair is stopped before its executable is replaced
   and started again after; on Linux the unit is refreshed and restarted. Hand-edited tuning keys in

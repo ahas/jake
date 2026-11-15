@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
-use jake_protocol::{Frame, decode_frame};
+use jake_protocol::{Frame, SUPERSEDED_REASON, decode_frame};
 use serde_json::{Number, json};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -44,6 +44,41 @@ pub struct Agent {
   pub config: AgentConfig,
   pub version: String,
   pub log: Log,
+  when_superseded: WhenSuperseded,
+  link: watch::Sender<Link>,
+}
+
+/// Where the agent's link to the hub stands, as a caller watching it reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+  /// Dialing the hub, or about to dial it again after a connection ended.
+  Connecting,
+  /// Welcomed by the hub.
+  Attached,
+  /// The hub turned the credential or the name away, for the reason given.
+  Refused(String),
+  /// The hub could not be reached, for the reason given.
+  Unreachable(String),
+}
+
+/// What the agent does once the hub hands its name to a newer connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhenSuperseded {
+  /// Dial again, as an installed agent does after a half-dead connection was replaced.
+  Redial,
+  /// Stop, leaving the name to the connection that took it.
+  GiveUp,
+}
+
+/// Why the agent stopped serving the hub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+  /// The caller asked it to stop.
+  Stopped,
+  /// The hub sent a leave.
+  Left,
+  /// The hub handed its name to a newer connection, and it was told to give the name up.
+  Superseded,
 }
 
 enum DialError {
@@ -53,6 +88,30 @@ enum DialError {
 }
 
 impl Agent {
+  /// An agent that redials when superseded, its link starting as connecting.
+  pub fn new(config: AgentConfig, version: String, log: Log) -> Self {
+    Self {
+      config,
+      version,
+      log,
+      when_superseded: WhenSuperseded::Redial,
+      link: watch::Sender::new(Link::Connecting),
+    }
+  }
+
+  /// The same agent, doing this once the hub hands its name to a newer connection.
+  pub fn when_superseded(self, when: WhenSuperseded) -> Self {
+    Self {
+      when_superseded: when,
+      ..self
+    }
+  }
+
+  /// A watch on the agent's link, current from the moment it is taken.
+  pub fn link(&self) -> watch::Receiver<Link> {
+    self.link.subscribe()
+  }
+
   fn capabilities(&self) -> Vec<String> {
     let shells = Platform::HOST.shells().iter().map(|shell| format!("exec:{shell}"));
     let ports = self.config.stream_ports.iter().map(|port| format!("stream:{port}"));
@@ -92,8 +151,9 @@ impl Agent {
     }
   }
 
-  /// Dial and redial for ever, one connection at a time; it returns only when the hub sends a leave.
-  pub async fn run(&self) {
+  /// Dial and redial for ever, one connection at a time; it returns only when the hub sends a leave,
+  /// or supersedes an agent told to give its name up.
+  pub(crate) async fn run(&self) -> Ended {
     let stable = self.config.heartbeat * 2;
     let mut attempt: u32 = 0;
     loop {
@@ -102,18 +162,25 @@ impl Agent {
           let started = Instant::now();
           let session = Session::new(self, socket).run().await;
           if session.leave {
-            return;
+            return Ended::Left;
+          }
+          if session.superseded && self.when_superseded == WhenSuperseded::GiveUp {
+            self.log.warn("name-given-up", json!({ "agent": self.config.agent_name }));
+            return Ended::Superseded;
           }
           if session.welcomed && started.elapsed() >= stable {
             attempt = 0;
           }
         }
         Err(DialError::Refused(status)) => {
-          self
-            .log
-            .warn("rejected", json!({ "status": status, "reason": "the hub refused the shared secret" }));
+          let reason = "the hub refused the shared secret";
+          self.log.warn("rejected", json!({ "status": status, "reason": reason }));
+          self.link.send_replace(Link::Refused(format!("{reason} (HTTP {status})")));
         }
-        Err(DialError::Failed(error)) => self.log.warn("dial-failed", json!({ "error": error })),
+        Err(DialError::Failed(error)) => {
+          self.log.warn("dial-failed", json!({ "error": error }));
+          self.link.send_replace(Link::Unreachable(error));
+        }
       }
       let delay = self.backoff(attempt);
       attempt = (attempt + 1).min(MAX_ATTEMPT);
@@ -185,6 +252,7 @@ fn writer(
 struct Outcome {
   welcomed: bool,
   leave: bool,
+  superseded: bool,
 }
 
 struct Session<'a> {
@@ -200,6 +268,7 @@ struct Session<'a> {
   accepted: mpsc::UnboundedReceiver<Accepted>,
   welcomed: bool,
   leave: bool,
+  superseded: bool,
   last_inbound: Instant,
 }
 
@@ -228,6 +297,7 @@ impl<'a> Session<'a> {
       runs: HashMap::new(),
       welcomed: false,
       leave: false,
+      superseded: false,
       last_inbound: Instant::now(),
     }
   }
@@ -251,6 +321,7 @@ impl<'a> Session<'a> {
           None => break "socket closed".to_owned(),
           Some(Err(error)) => break format!("socket error: {error}"),
           Some(Ok(Message::Close(frame))) => {
+            self.superseded = frame.as_ref().is_some_and(|frame| frame.reason == SUPERSEDED_REASON);
             break match frame {
               Some(frame) => format!("socket closed (code {}: {})", u16::from(frame.code), frame.reason),
               None => "socket closed".to_owned(),
@@ -275,9 +346,14 @@ impl<'a> Session<'a> {
     };
     self.end().await;
     log.info("connection-ended", json!({ "reason": reason, "welcomed": self.welcomed }));
+    // A link that was up is down now, and the agent dials again; a refusal stands until it does.
+    if self.welcomed {
+      self.agent.link.send_replace(Link::Connecting);
+    }
     Outcome {
       welcomed: self.welcomed,
       leave: self.leave,
+      superseded: self.superseded,
     }
   }
 
@@ -315,9 +391,11 @@ impl<'a> Session<'a> {
       Frame::Welcome { hub_version } => {
         self.welcomed = true;
         log.info("welcomed", json!({ "hubVersion": hub_version }));
+        self.agent.link.send_replace(Link::Attached);
       }
       Frame::Reject { reason } => {
         log.warn("rejected", json!({ "reason": reason }));
+        self.agent.link.send_replace(Link::Refused(reason.clone()));
         return Some(format!("hub rejected the connection: {reason}"));
       }
       Frame::Ping { ts } => self.send(Frame::Pong { ts }).await,
@@ -424,9 +502,9 @@ impl Drop for Session<'_> {
   }
 }
 
-// Full jitter over an exponential window clamped to the cap, so retries neither fall into lockstep
-// nor drift toward hours apart; `draw` is the jitter, from zero up to one.
-fn backoff(base: Duration, cap: Duration, attempt: u32, draw: f64) -> Duration {
+/// Full jitter over an exponential window clamped to the cap, so retries neither fall into lockstep
+/// nor drift toward hours apart; `draw` is the jitter, from zero up to one.
+pub fn backoff(base: Duration, cap: Duration, attempt: u32, draw: f64) -> Duration {
   base.saturating_mul(2u32.saturating_pow(attempt)).min(cap).mul_f64(draw)
 }
 

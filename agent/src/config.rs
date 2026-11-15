@@ -40,6 +40,15 @@ pub struct AgentConfig {
   pub listen_ports: Vec<u16>,
 }
 
+impl AgentConfig {
+  /// A configuration held in memory: the three values a hub needs, every other setting at the
+  /// default an `agent.env` holding only those three would give.
+  pub fn new(hub_url: String, secret: String, agent_name: String) -> Self {
+    settings(&Source(&HashMap::new()), hub_url, secret, agent_name)
+      .expect("every default setting is well-formed")
+  }
+}
+
 /// The environment the agent runs against: agent.env beside the executable, under the process's own.
 pub fn merged(
   install_dir: &Path,
@@ -121,10 +130,23 @@ impl Source<'_> {
 /// Read the agent's configuration, naming the first key that is missing or malformed.
 pub fn read(env: &HashMap<String, String>) -> Result<AgentConfig, String> {
   let env = Source(env);
+  let hub_url = env.required("JAKE_HUB_URL")?;
+  let secret = env.required("JAKE_SECRET")?;
+  let agent_name = env.required("JAKE_AGENT_NAME")?;
+  settings(&env, hub_url, secret, agent_name)
+}
+
+// Every setting past the three required ones, each read from the source or left at its default.
+fn settings(
+  env: &Source,
+  hub_url: String,
+  secret: String,
+  agent_name: String,
+) -> Result<AgentConfig, String> {
   Ok(AgentConfig {
-    hub_url: env.required("JAKE_HUB_URL")?,
-    secret: env.required("JAKE_SECRET")?,
-    agent_name: env.required("JAKE_AGENT_NAME")?,
+    hub_url,
+    secret,
+    agent_name,
     heartbeat: env.millis("JAKE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS)?,
     tick: env.millis("JAKE_TICK_MS", DEFAULT_TICK_MS)?,
     watchdog_stale: env.millis("JAKE_WATCHDOG_STALE_MS", DEFAULT_WATCHDOG_STALE_MS)?,
@@ -159,6 +181,13 @@ mod tests {
     assert_eq!(config.exec_max_output_bytes, 8 * 1024 * 1024);
     assert_eq!(config.redial_cap, Duration::from_secs(60));
     assert_eq!(config.stream_ports, [22]);
+  }
+
+  #[test]
+  fn a_configuration_held_in_memory_is_the_one_the_three_required_keys_alone_give() {
+    let read = read(&env(&REQUIRED)).unwrap();
+    let held = AgentConfig::new("ws://hub".into(), "s".into(), "box".into());
+    assert_eq!(format!("{held:?}"), format!("{read:?}"));
   }
 
   #[test]

@@ -19,8 +19,8 @@ use crate::credential::{self, Reach};
 use crate::departed::Departed;
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
-  Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SendWindow,
-  TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
+  Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SUPERSEDED_REASON,
+  SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
 };
 
 /// The version the hub names in its welcome.
@@ -344,7 +344,7 @@ impl State {
 
     // One connection per name: whatever held this name on another socket is displaced and closed.
     if let Some(held) = self.agents.get(&name).map(|agent| agent.link.socket_id) {
-      self.detach(&name, "superseded by a new connection", held != link.socket_id);
+      self.detach(&name, SUPERSEDED_REASON, held != link.socket_id);
     }
 
     let now = now_ms();
