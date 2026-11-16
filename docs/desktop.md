@@ -164,9 +164,72 @@ end, so the built-in agent gives way, twice over.
   update. The app checks the feed and installs an update in Windows's passive mode, showing its progress
   and asking nothing. An app built from a configuration with no updater entry checks for none.
 - **The feed is served beside the agent's builds,** at `https://ai.example.org/bmo/jake/desktop/latest.json`,
-  with the installers and their signatures it names; serving that path is host infrastructure BMO owns.
+  with the installers and their signatures it names (「Releases」).
 - **A build** runs `cargo tauri build` inside the `desktop` folder. The NSIS installer is built on
   main-host as well as on a Windows machine: cross-compiled for `x86_64-pc-windows-gnu` with
   `cargo-zigbuild` as the CLI's runner and `--bundles nsis`, which needs `nsis` and the mingw-w64
   binutils and C compiler for the app's Windows resources. The AppImage and the deb are built on a
   Linux machine with WebKitGTK.
+
+## Releases
+
+A release is one version of the app, built for every platform at once, signed for the updater and
+published where both the updater and the console read it.
+
+### Where releases are kept
+
+- **The release folder is the `desktop` folder of the agent's served layout:** on main-host the
+  directory `/var/www/ahas-ai/bmo/jake/desktop/`, which the `ai.example.org` site serves statically as
+  `https://ai.example.org/bmo/jake/desktop/`. The folder belongs to the user that runs releases, so a
+  release writes it without root; serving the path is host infrastructure BMO owns.
+- **Each version has a folder of its own,** named by the bare version (`0.1.0`), holding the Windows
+  installer, the AppImage and the deb, each beside its updater signature, and that version's release
+  read. A published version is never written again: the updater installs only a version higher than
+  the running one, so a fix ships as a new version.
+- **Two files at the folder's top name the current version:** `latest.json`, the updater's feed in
+  the form Tauri's updater reads, and `release.json`, the read the console uses. Both are replaced
+  whole, each by a rename, and only once the version's folder is complete, so neither ever names a
+  file that is not yet there.
+- **The feed names every installer the updater may take,** each with its signature and its address:
+  the NSIS installer under `windows-x86_64-nsis` and `windows-x86_64`, the AppImage under
+  `linux-x86_64-appimage` and `linux-x86_64`, and the deb under `linux-x86_64-deb`. An app installed
+  from the deb looks for the deb's key first, so it is never handed an AppImage.
+
+### The read the console uses
+
+The console builds its download page against this contract alone.
+
+- **It reads `https://ai.example.org/bmo/jake/desktop/release.json`,** a JSON object that always describes
+  the current version. The same object is kept in that version's own folder, at
+  `https://ai.example.org/bmo/jake/desktop/<version>/release.json`, and never changes there.
+- **The object holds:** `version`, the bare semantic version; `date`, when it was published, as an
+  RFC 3339 UTC timestamp; and `files`, one entry per installer.
+- **Each entry of `files` holds:** `platform`, `windows` or `linux`; `arch`, `x86_64`; `format`,
+  `nsis`, `appimage` or `deb`; `file`, the file's name; `size`, its length in bytes; `sha256`, its
+  SHA-256 digest in lowercase hex; and `url`, the absolute address it downloads from.
+- **The download route is each entry's `url`,** a file in the version's folder served as it is, so
+  a link to it downloads the installer and a version's link never changes once published.
+- **No release yet reads as not found:** until the first release is published the address answers
+  404, and the console shows that the app is not yet available.
+- **A field may be added and none is removed or renamed,** so a console built against this contract
+  reads every later release.
+
+### Making a release
+
+- **A release is one command run on main-host from the repository's root, `bun run release:desktop`.**
+  It runs `scripts/desktop-release.ts` under a memory cap of its own, and that builds the app for
+  Windows and then for Linux, one after the other, finds the installers and their signatures, and
+  publishes them.
+- **The version is the one in the app's Tauri configuration,** and the address it is published under
+  is the folder holding the updater's endpoint, so neither is stated twice. A version not higher than
+  the one already published is refused before anything is built.
+- **The update key is read from the deployment's secret store by its path:** the env folder holds
+  `jake-desktop-updater.key` and `jake-desktop-updater.password`, and the release hands the key to the
+  build as its path and the password through its variable, printing neither. Where either file is
+  missing the release stops before building.
+- **Every installer and every signature must come from this run:** a file the build did not write
+  afresh stops the release, so a stale build is never published under a new version.
+- **The release ends by printing** the version and, for each installer, its name, its size, its
+  SHA-256 and its address.
+- **The Authenticode signature is not part of it:** the installer stays unsigned for Windows until
+  the owner provides a certificate (「Distribution and updates」).
