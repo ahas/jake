@@ -358,8 +358,9 @@ after a fault, and returns at sign-in only where the person turned that on (docs
 
 - A byte stream joins a caller on main-host to a TCP port on the agent's machine. The caller opens it
   through the control API, naming the agent and the port; the hub sends the agent a stream-open, the
-  agent connects to that port on its own `localhost`, and from then on the bytes cross the tunnel in
-  both directions as stream pieces until either end closes. The frames and the window that paces
+  agent connects to that port on its own `localhost`, the IPv4 loopback first and the IPv6 one where that
+  refuses, since a port WSL mirrors onto a Windows host answers on IPv4 alone; from then on the bytes cross
+  the tunnel in both directions as stream pieces until either end closes. The frames and the window that paces
   them are stated in docs/protocol.md.
 - The machine decides what it exposes. The agent's configuration holds the list of local ports a
   stream may reach, `JAKE_STREAM_PORTS`, which is the SSH port alone unless the install or a hand edit

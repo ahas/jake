@@ -1,6 +1,7 @@
 // Byte streams to and from the machine's own ports, each one local TCP connection paced by its window.
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -275,6 +276,16 @@ impl Streams {
   }
 }
 
+// A local port dialed at the IPv4 loopback first and the IPv6 one after. The name `localhost` gives the IPv6
+// address first on Windows, where a port mirrored from WSL answers on IPv4 alone and an IPv6 dial of it never
+// ends, so dialing by the name would spend the whole wait on an address nothing answers.
+async fn dial(port: u16) -> std::io::Result<TcpStream> {
+  match TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
+    Ok(socket) => Ok(socket),
+    Err(refused) => TcpStream::connect((Ipv6Addr::LOCALHOST, port)).await.map_err(|_| refused),
+  }
+}
+
 // The task that owns one stream's TCP connection and carries its bytes both ways.
 struct Carrier {
   id: String,
@@ -286,7 +297,7 @@ struct Carrier {
 
 impl Carrier {
   async fn serve(self, port: u16, inbound: mpsc::UnboundedReceiver<Vec<u8>>) {
-    let socket = match timeout(CONNECT_TIMEOUT, TcpStream::connect(("localhost", port))).await {
+    let socket = match timeout(CONNECT_TIMEOUT, dial(port)).await {
       Ok(Ok(socket)) => socket,
       Ok(Err(error)) => return self.refuse(format!("localhost:{port}: {error}")).await,
       Err(_) => {
