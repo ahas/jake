@@ -15,6 +15,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis", "appimage", "deb"],
     "publisher": "ahas",
     "shortDescription": "BMO console with a built-in jake agent",
@@ -22,6 +23,15 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJFN0UwN0RFMzkwMjM2OTIKUldTU05nSTUzZ2QrTHJ0VmQyZlhpQzR5UWc5R0c4TGxxMUc5eE9JWTVjUko5WmZqbzdXQXpWVnAK",
+      "endpoints": ["https://ai.example.org/bmo/jake/desktop/latest.json"],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

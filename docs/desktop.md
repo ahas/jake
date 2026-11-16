@@ -155,13 +155,14 @@ end, so the built-in agent gives way, twice over.
   public key built into the app.
 - **The update key is the owner's.** It is made once with `cargo tauri signer generate`, which writes a
   private key and asks for its password; the private key and its password are kept outside every
-  repository, in the owner's password store, and are handed to a release build through the
-  `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` environment variables alone.
-  Neither is ever committed. The public key is written into the updater's `pubkey` in the app's Tauri
-  configuration.
-- **Until the public key is written in, the app does not check for updates.** A release without it is
-  installed by hand with the next installer. Writing the key in goes with turning on the bundle's
-  updater artifacts, which a release build then signs with the private key.
+  repository, in the deployment's secret store (the data root's env folder), a file each, readable by
+  their user alone, and are handed to a release build through the `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` environment variables alone. Neither is ever committed. The
+  public key is written into the updater's `pubkey` in the app's Tauri configuration.
+- **The public key is written in, and the bundle makes updater artifacts,** which a release build signs
+  with the private key; a release build without the two variables fails rather than ship an unsigned
+  update. The app checks the feed and installs an update in Windows's passive mode, showing its progress
+  and asking nothing. An app built from a configuration with no updater entry checks for none.
 - **The feed is served beside the agent's builds,** at `https://ai.example.org/bmo/jake/desktop/latest.json`,
   with the installers and their signatures it names; serving that path is host infrastructure BMO owns.
 - **A build** runs `cargo tauri build` inside the `desktop` folder. The NSIS installer is built on
