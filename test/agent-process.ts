@@ -23,6 +23,24 @@ export function ensureAgentBuilt(): void {
   built = true;
 }
 
+const LAUNCH_COMMAND = join(ROOT, "target", "debug", "examples", "exec-invocation");
+let launchBuilt = false;
+
+/** What the agent would start for an exec frame on the platform named, without starting it. */
+export function agentLaunchOf(frame: object, platform: "windows" | "linux"): unknown {
+  if (!launchBuilt) {
+    const build = Bun.spawnSync(
+      ["cargo", "build", "--offline", "--quiet", "--manifest-path", MANIFEST, "--example", "exec-invocation"],
+      { stdin: "ignore", stdout: "inherit", stderr: "inherit" },
+    );
+    if (build.exitCode !== 0) throw new Error("cargo build of the agent's launch example failed");
+    launchBuilt = true;
+  }
+  const result = Bun.spawnSync([LAUNCH_COMMAND, platform], { stdin: new Blob([JSON.stringify(frame)]), stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) throw new Error(`the agent's launch example refused the frame: ${result.stderr.toString()}`);
+  return JSON.parse(result.stdout.toString());
+}
+
 /** One frame as the wire carries it, read loosely: the tests check fields by name. */
 export type WireFrame = { type: string; v: number } & Record<string, unknown>;
 

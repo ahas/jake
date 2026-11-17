@@ -25,7 +25,7 @@ import {
 } from "./hub-process";
 import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
-import { ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
+import { agentLaunchOf, ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -585,6 +585,30 @@ describe("exec streaming", () => {
 
     const exit = await reader.waitFor((e) => e.event === "exit");
     expect(exit.data).toMatchObject({ canceled: true, signal: "SIGTERM" });
+  });
+
+  test("a wsl command reaches the agent's WSL launcher as one argument, exactly as the caller wrote it", async () => {
+    const hub = await launch();
+    const agent = await attach(hub.agentPort, ["exec:powershell", "exec:wsl"]);
+    const command = 'X=raw; echo "x=$X sub=$(echo inner) tick=`echo back`"';
+
+    const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ shell: "wsl", command, distro: "Ubuntu" }),
+    });
+    await reader.ready;
+    const exec = await agent.waitFor((f) => f.type === "exec");
+    if (exec.type !== "exec") throw new Error("not an exec");
+
+    expect(agentLaunchOf(exec, "windows")).toEqual({
+      file: "wsl.exe",
+      args: ["--distribution", "Ubuntu", "--exec", "bash", "-lc", command],
+      cwd: null,
+      env: [],
+    });
+    agent.send({ type: "exit", v: V, id: exec.id, code: 0, signal: null, canceled: false });
+    await reader.waitFor((e) => e.event === "exit");
   });
 
   test("an agent disconnect ends every in-flight command explicitly", async () => {

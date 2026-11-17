@@ -399,28 +399,10 @@ impl<'a> Session<'a> {
         return Some(format!("hub rejected the connection: {reason}"));
       }
       Frame::Ping { ts } => self.send(Frame::Pong { ts }).await,
-      Frame::Exec {
-        id,
-        shell,
-        command,
-        cwd,
-        env,
-        distro,
-      } => {
-        let env = env
-          .into_iter()
-          .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
-          .collect();
-        self
-          .exec(ExecRequest {
-            id,
-            shell,
-            command,
-            cwd,
-            env,
-            distro,
-          })
-          .await;
+      exec @ Frame::Exec { .. } => {
+        if let Some(request) = ExecRequest::from_frame(exec) {
+          self.exec(request).await;
+        }
       }
       // A cancel for a run that already ended reaches nothing.
       Frame::Cancel { id } => {

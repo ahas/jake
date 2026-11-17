@@ -36,6 +36,36 @@ pub struct ExecRequest {
   pub distro: Option<String>,
 }
 
+impl ExecRequest {
+  /// The command an exec frame carries; none for any other frame. An overlay value that is not a
+  /// string is dropped.
+  pub fn from_frame(frame: Frame) -> Option<Self> {
+    let Frame::Exec {
+      id,
+      shell,
+      command,
+      cwd,
+      env,
+      distro,
+    } = frame
+    else {
+      return None;
+    };
+    let env = env
+      .into_iter()
+      .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
+      .collect();
+    Some(Self {
+      id,
+      shell,
+      command,
+      cwd,
+      env,
+      distro,
+    })
+  }
+}
+
 /// A ready-to-spawn command: the overlay is laid over the agent's own environment, never in place of it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Invocation {

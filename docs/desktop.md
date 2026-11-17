@@ -46,6 +46,10 @@ to it.
   connection. Its answer says which of the three ended it.
 - **It reports its link as it goes:** connecting, attached, refused by the hub, or unable to reach it,
   through a watch the caller reads.
+- **It says what it would launch for a command without launching it:** for an exec frame and a
+  platform, the program, its arguments, the directory and the environment overlay. The crate's
+  `exec-invocation` example prints that for a frame on standard input, which is how the hub's
+  contract tests hold a Windows launch, WSL's among them, on a Linux machine.
 - **A leave asks nothing of the machine.** The library does not uninstall anything; the executable
   runs its departure after the entry answers that the hub sent a leave, and the app forgets its
   credential instead (「Keeping the agent running」).

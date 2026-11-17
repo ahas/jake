@@ -14,6 +14,7 @@ mod transfer;
 
 pub use config::AgentConfig;
 pub use connection::{Agent, Ended, Link, WhenSuperseded, backoff};
+pub use exec::{ExecRequest, Invocation, invocation};
 pub use log::Log;
 
 /// This build's version, announced in the hello; the build stamps it in through `JAKE_VERSION`.
