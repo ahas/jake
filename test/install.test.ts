@@ -1,7 +1,7 @@
-// The Linux installer's answers to its three questions, driven through a pseudo-terminal.
+// The Linux installer: its answers to its three questions, and its unattended update.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -59,5 +59,72 @@ describe("install.sh prompts", () => {
     const refused = await run([...given, "ssh"], "");
     expect(refused.code).not.toBe(0);
     expect(refused.output).toContain("--stream-ports takes port numbers separated by commas, or none (got ssh)");
+  });
+});
+
+// An installed agent's machine in a temporary home: the previous binary and its config in place, a
+// build folder holding the new binary beside a copy of the installer, and a stand-in service manager
+// that, on each start, logs the agent reaching the hub where the binary in place says it does.
+function machine(previous: string, next: string): { home: string; folder: string; bin: string; stubs: string } {
+  const home = mkdtempSync(join(tmpdir(), "jake-update-"));
+  homes.push(home);
+  const data = join(home, ".local", "share", "jake");
+  mkdirSync(data, { recursive: true });
+  writeFileSync(join(data, "jake"), previous);
+  writeFileSync(join(data, "agent.env"), "JAKE_HUB_URL=wss://example.test\nJAKE_SECRET=s\nJAKE_AGENT_NAME=n2\n");
+  const folder = join(home, "build");
+  mkdirSync(folder);
+  copyFileSync(SCRIPT, join(folder, "install.sh"));
+  writeFileSync(join(folder, "jake"), next);
+  writeFileSync(join(folder, "jake-agent.service"), "[Unit]\n");
+  writeFileSync(join(folder, "uninstall.sh"), "#!/bin/sh\n");
+  const stubs = join(home, "stubs");
+  mkdirSync(stubs);
+  const systemctl = [
+    "#!/bin/sh",
+    'case " $* " in',
+    '  *" enable --now "*|*" start "*)',
+    `    grep -q reaches "${join(data, "jake")}" && echo '{"event":"welcomed"}' >> "${join(data, "agent.log")}" ;;`,
+    "esac",
+    "exit 0",
+  ].join("\n");
+  writeFileSync(join(stubs, "systemctl"), systemctl, { mode: 0o755 });
+  writeFileSync(join(stubs, "loginctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return { home, folder, bin: join(data, "jake"), stubs };
+}
+
+async function update(at: ReturnType<typeof machine>): Promise<{ code: number; output: string }> {
+  const proc = Bun.spawn(["bash", join(at.folder, "install.sh"), "--update"], {
+    env: {
+      PATH: `${at.stubs}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      HOME: at.home,
+      XDG_CONFIG_HOME: join(at.home, ".config"),
+      JAKE_INSTALL_WAIT_SECONDS: "0",
+    },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [output, errors] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code: await proc.exited, output: output + errors };
+}
+
+describe("install.sh --update", () => {
+  test("a new build that reaches the hub stays, and the previous one is dropped", async () => {
+    const at = machine("old reaches", "new reaches");
+    const { code, output } = await update(at);
+    expect(output).toContain("The agent is connected to the hub.");
+    expect(code).toBe(0);
+    expect(readFileSync(at.bin, "utf8")).toBe("new reaches");
+    expect(existsSync(`${at.bin}.previous`)).toBe(false);
+  });
+
+  test("a new build that does not reach the hub gives way to the previous one, and the update fails", async () => {
+    const at = machine("old reaches", "new is silent");
+    const { code, output } = await update(at);
+    expect(code).not.toBe(0);
+    expect(output).toContain("the update did not take; the previous build is back and connected to the hub.");
+    expect(readFileSync(at.bin, "utf8")).toBe("old reaches");
+    expect(existsSync(`${at.bin}.previous`)).toBe(false);
   });
 });

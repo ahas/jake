@@ -43,6 +43,10 @@
 .PARAMETER NonInteractive
   Never prompt. Requires Secret and AgentName to be passed as arguments or already in agent.env;
   HubUrl falls back to the default.
+
+.PARAMETER Update
+  An unattended update: never prompt, and put the previous executable back where the new one does not
+  reach the hub, ending with an error.
 #>
 [CmdletBinding()]
 param(
@@ -52,10 +56,12 @@ param(
   [string]$StreamPorts,
   [string]$SshKey,
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\jake",
-  [switch]$NonInteractive
+  [switch]$NonInteractive,
+  [switch]$Update
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Update) { $NonInteractive = $true }
 
 $Base = 'https://ai.example.org/bmo/jake'
 $DefaultHubUrl = 'wss://jake.example.org'
@@ -66,6 +72,10 @@ $GuardFlag = '--guard'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $StartupDir = [Environment]::GetFolderPath('Startup')
 $LogPath = Join-Path $env:LOCALAPPDATA 'jake\agent.log'
+$PreviousBinary = 'jake.previous.exe'
+# How long the agent is given to report reaching the hub: longer for an update, which puts the previous
+# executable back where the new one does not.
+$WaitSeconds = if ($Update) { 30 } else { 15 }
 
 function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  $msg" -ForegroundColor Green }
@@ -160,6 +170,10 @@ Start-Sleep -Milliseconds 500
 
 Write-Step "installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+$Previous = Join-Path $InstallDir $PreviousBinary
+if ($Update -and (Test-Path (Join-Path $InstallDir $Binary))) {
+  Copy-Item -LiteralPath (Join-Path $InstallDir $Binary) -Destination $Previous -Force
+}
 foreach ($name in @($Binary, 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
   $src = Join-Path $Payload $name
   if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
@@ -276,28 +290,68 @@ Register-Anchor $GuardAnchor $Exe $GuardFlag $InstallDir
 Write-Ok "anchors registered for the agent and the guard"
 
 # --- start the pair and verify it reached the hub -----------------------------------------------
+# The pair is started through its own logon tasks, as the watchdog relaunches a peer, so Task Scheduler
+# owns both and they outlive whatever ran this install, a scheduled update among them.
+
+function Start-Pair {
+  Start-ScheduledTask -TaskName $AgentAnchor
+  Start-ScheduledTask -TaskName $GuardAnchor
+}
+
+function Get-LogSize {
+  if (Test-Path $LogPath) { return (Get-Item $LogPath).Length }
+  return 0
+}
+
+# Read what the log gained since the mark for up to $WaitSeconds: whether the agent reached the hub, or why not.
+function Wait-ForHub($logMark) {
+  $failure = $null
+  for ($i = 0; $i -le $WaitSeconds; $i++) {
+    if ($i -gt 0) { Start-Sleep -Seconds 1 }
+    if (-not (Test-Path $LogPath)) { continue }
+    $fs = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
+    try {
+      if ($fs.Length -gt $logMark) { $fs.Position = $logMark }
+      $reader = New-Object System.IO.StreamReader($fs)
+      $tail = $reader.ReadToEnd()
+    } finally { $fs.Close() }
+    if ($tail -match '"event":"welcomed"') { return @{ Reached = $true; Failure = $null } }
+    elseif ($tail -match '"event":"rejected"') { return @{ Reached = $false; Failure = "the hub rejected the agent (the shared secret or the agent name is wrong)" } }
+    elseif ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
+  }
+  return @{ Reached = $false; Failure = $failure }
+}
 
 Write-Step "starting the agent and guard"
-$logMark = 0
-if (Test-Path $LogPath) { $logMark = (Get-Item $LogPath).Length }
-Start-Process -FilePath $Exe -WorkingDirectory $InstallDir -WindowStyle Hidden
-Start-Process -FilePath $Exe -ArgumentList $GuardFlag -WorkingDirectory $InstallDir -WindowStyle Hidden
+$logMark = Get-LogSize
+Start-Pair
 
 Write-Step "waiting for the agent to reach the hub"
-$reached = $false
-$failure = $null
-for ($i = 0; $i -lt 15; $i++) {
-  Start-Sleep -Seconds 1
-  if (-not (Test-Path $LogPath)) { continue }
-  $fs = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-  try {
-    if ($fs.Length -gt $logMark) { $fs.Position = $logMark }
-    $reader = New-Object System.IO.StreamReader($fs)
-    $tail = $reader.ReadToEnd()
-  } finally { $fs.Close() }
-  if ($tail -match '"event":"welcomed"') { $reached = $true; break }
-  elseif ($tail -match '"event":"rejected"') { $failure = "the hub rejected the agent (the shared secret or the agent name is wrong)"; break }
-  elseif ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
+$outcome = Wait-ForHub $logMark
+$reached = $outcome.Reached
+$failure = $outcome.Failure
+
+# An update must leave the machine attached: a new executable that does not reach the hub gives way to
+# the previous one, and the update fails.
+if ($Update -and (Test-Path $Previous)) {
+  if ($reached) {
+    Remove-Item -LiteralPath $Previous -Force -ErrorAction SilentlyContinue
+  } else {
+    Write-Warn2 "the new build did not reach the hub: $failure"
+    Write-Step "putting the previous build back"
+    Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
+      try { $_ | Stop-Process -Force } catch { }
+    }
+    Start-Sleep -Milliseconds 500
+    Move-Item -LiteralPath $Previous -Destination $Exe -Force
+    $logMark = Get-LogSize
+    Start-Pair
+    $outcome = Wait-ForHub $logMark
+    if ($outcome.Reached) {
+      throw "the update did not take; the previous build is back and connected to the hub."
+    }
+    throw "the update did not take; the previous build is back but has not connected yet: $($outcome.Failure)"
+  }
 }
 
 Write-Host ""

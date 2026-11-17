@@ -21,7 +21,12 @@ export interface HubSeams {
   socketBacklogBytes?: number;
   /** The data directory the hub keeps its record in; a fresh one, removed at the stop, when omitted. */
   dataDir?: string;
+  /** The agent build the hub orders agents onto, as JAKE_AGENT_BUILD_DIR names it; the orders are off when omitted. */
+  agentBuildDir?: string;
 }
+
+/** The address a hub started here tells its agents to download a build from. */
+export const AGENT_DOWNLOAD_URL = "https://downloads.test/jake";
 
 /** A running hub process: its two ports, the lines it wrote to stderr, and its teardown. */
 export interface HubProcess {
@@ -114,6 +119,9 @@ export async function startHubProcess(secret: string, controlToken: string, seam
   if (seams.socketBacklogBytes !== undefined) env.JAKE_HUB_SOCKET_BACKLOG_BYTES = String(seams.socketBacklogBytes);
   if (seams.reverseTargets !== undefined) env.JAKE_REVERSE_TARGETS = seams.reverseTargets;
   if (seams.controlKey !== undefined) env.JAKE_CONTROL_KEY = seams.controlKey;
+  if (seams.agentBuildDir === undefined) env.JAKE_AGENT_UPDATE = "off";
+  else env.JAKE_AGENT_BUILD_DIR = seams.agentBuildDir;
+  env.JAKE_AGENT_DOWNLOAD_URL = AGENT_DOWNLOAD_URL;
 
   const child = Bun.spawn([BINARY], { cwd: ROOT, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const stderr: string[] = [];

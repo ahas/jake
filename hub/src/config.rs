@@ -11,6 +11,7 @@ const DEFAULT_MAX_PAYLOAD_BYTES: i64 = 16 * 1024 * 1024;
 const DEFAULT_PING_INTERVAL_MS: i64 = 15_000;
 const DEFAULT_MISSED_PONG_LIMIT: i64 = 3;
 const DEFAULT_SOCKET_BACKLOG_BYTES: i64 = 4 * 1024 * 1024;
+const DEFAULT_AGENT_DOWNLOAD_URL: &str = "https://ai.example.org/bmo/jake";
 
 pub struct HubConfig {
   pub host: String,
@@ -29,6 +30,14 @@ pub struct HubConfig {
   pub departed_path: PathBuf,
   /// The `host:port` targets a stream back from an agent may reach; none unless set.
   pub reverse_targets: Vec<String>,
+  /// The agent build attached agents are ordered onto; none where the orders are turned off.
+  pub agent_update: Option<AgentUpdate>,
+}
+
+/// Where the agent build the hub orders agents onto stands, and the address the agents download it from.
+pub struct AgentUpdate {
+  pub build_dir: PathBuf,
+  pub download_url: String,
 }
 
 /// What a client of the running hub needs to reach its control API, from the hub's own file.
@@ -51,6 +60,14 @@ fn env_path(process: &HashMap<String, String>) -> PathBuf {
 /// The record of departed agents, beside the hub's file in the data directory.
 fn departed_path(process: &HashMap<String, String>) -> PathBuf {
   env_path(process).with_file_name("departed.json")
+}
+
+/// The release's own agent build: the `agents` folder beside the `bin` folder of the hub's executable.
+fn release_agent_build() -> PathBuf {
+  std::env::current_exe()
+    .ok()
+    .and_then(|exe| Some(exe.parent()?.parent()?.join("agents")))
+    .unwrap_or_default()
 }
 
 /// The environment the hub runs against: its file's values, under the process's own.
@@ -117,7 +134,7 @@ impl Source {
 pub fn load() -> Result<HubConfig, String> {
   let process: HashMap<String, String> = std::env::vars().collect();
   let departed = departed_path(&process);
-  read(&Source(merged(process)?), departed)
+  read(&Source(merged(process)?), departed, release_agent_build())
 }
 
 /// Read the control API's port and what a client presents to it, naming the key that is missing or
@@ -170,7 +187,20 @@ fn control(env: &Source) -> Result<ControlConfig, String> {
   })
 }
 
-fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
+// Whether and from where the hub orders agents onto an agent build.
+fn agent_update(env: &Source, release_build: PathBuf) -> Result<Option<AgentUpdate>, String> {
+  match env.present("JAKE_AGENT_UPDATE").unwrap_or("on") {
+    "on" => {}
+    "off" => return Ok(None),
+    _ => return Err("JAKE_AGENT_UPDATE must be on or off.".into()),
+  }
+  Ok(Some(AgentUpdate {
+    build_dir: env.present("JAKE_AGENT_BUILD_DIR").map_or(release_build, PathBuf::from),
+    download_url: env.present("JAKE_AGENT_DOWNLOAD_URL").unwrap_or(DEFAULT_AGENT_DOWNLOAD_URL).to_owned(),
+  }))
+}
+
+fn read(env: &Source, departed_path: PathBuf, release_build: PathBuf) -> Result<HubConfig, String> {
   let agent_key = env.present("JAKE_AGENT_KEY").map(|key| key.trim().to_owned());
   let control_key = env.present("JAKE_CONTROL_KEY").map(|key| key.trim().to_owned());
   if control_key.is_some() && control_key == agent_key {
@@ -205,6 +235,7 @@ fn read(env: &Source, departed_path: PathBuf) -> Result<HubConfig, String> {
           .collect()
       })
       .unwrap_or_default(),
+    agent_update: agent_update(env, release_build)?,
     departed_path,
   })
 }
@@ -220,16 +251,49 @@ mod tests {
   const REQUIRED: [(&str, &str); 2] = [("JAKE_SECRET", "s3cr3t"), ("JAKE_CONTROL_TOKEN", "c0nsole")];
 
   fn error_of(pairs: &[(&str, &str)]) -> String {
-    read(&source(pairs), PathBuf::new()).err().expect("refused")
+    read(&source(pairs), PathBuf::new(), PathBuf::new()).err().expect("refused")
   }
 
   #[test]
   fn reads_the_required_keys_and_applies_defaults() {
-    let config = read(&source(&REQUIRED), PathBuf::new()).expect("loads");
+    let config = read(&source(&REQUIRED), PathBuf::new(), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("0.0.0.0", 8790, 8791));
     assert_eq!((config.secret.as_str(), config.control_token.as_str()), ("s3cr3t", "c0nsole"));
     assert_eq!(config.max_payload_bytes, 16 * 1024 * 1024);
     assert_eq!((config.ping_interval, config.missed_pong_limit), (Duration::from_secs(15), 3));
+  }
+
+  #[test]
+  fn agent_orders_take_the_release_build_and_the_published_address_unless_told_otherwise() {
+    let release = PathBuf::from("/release/agents");
+    let config = read(&source(&REQUIRED), PathBuf::new(), release.clone()).expect("loads");
+    let update = config.agent_update.expect("on by default");
+    assert_eq!(
+      (update.build_dir, update.download_url.as_str()),
+      (release.clone(), "https://ai.example.org/bmo/jake")
+    );
+
+    let pairs = [
+      REQUIRED[0],
+      REQUIRED[1],
+      ("JAKE_AGENT_BUILD_DIR", "/elsewhere"),
+      ("JAKE_AGENT_DOWNLOAD_URL", "https://x.test/j"),
+    ];
+    let update = read(&source(&pairs), PathBuf::new(), release.clone())
+      .expect("loads")
+      .agent_update
+      .expect("on");
+    assert_eq!(
+      (update.build_dir, update.download_url.as_str()),
+      (PathBuf::from("/elsewhere"), "https://x.test/j")
+    );
+
+    let off = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_UPDATE", "off")];
+    assert!(read(&source(&off), PathBuf::new(), release).expect("loads").agent_update.is_none());
+    assert_eq!(
+      error_of(&[REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_UPDATE", "yes")]),
+      "JAKE_AGENT_UPDATE must be on or off."
+    );
   }
 
   #[test]
@@ -241,7 +305,7 @@ mod tests {
       ("JAKE_HUB_PORT", "9000"),
       ("JAKE_CONTROL_PORT", "9001"),
     ];
-    let config = read(&source(&pairs), PathBuf::new()).expect("loads");
+    let config = read(&source(&pairs), PathBuf::new(), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("127.0.0.1", 9000, 9001));
   }
 
@@ -277,7 +341,7 @@ mod tests {
       ("JAKE_HUB_ENV".to_owned(), path.display().to_string()),
       ("JAKE_SECRET".to_owned(), "from-env".to_owned()),
     ]);
-    let config = read(&Source(merged(process).expect("reads")), PathBuf::new());
+    let config = read(&Source(merged(process).expect("reads")), PathBuf::new(), PathBuf::new());
     std::fs::remove_file(&path).expect("removes");
     let config = config.expect("loads");
     assert_eq!(
@@ -291,7 +355,7 @@ mod tests {
     let shared = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "k")];
     assert_eq!(error_of(&shared), "JAKE_CONTROL_KEY must differ from JAKE_AGENT_KEY.");
     let distinct = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "ck")];
-    let config = read(&source(&distinct), PathBuf::new()).expect("loads");
+    let config = read(&source(&distinct), PathBuf::new(), PathBuf::new()).expect("loads");
     assert_eq!(config.control_key.as_deref(), Some("ck"));
   }
 

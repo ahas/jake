@@ -59,7 +59,8 @@ repository nor the executable.
 
 The one-liner is the download-and-run form of the same scripts. Given a build folder produced by the
 build, run the script inside it instead. The folder holds the binaries for both platforms, the
-example config, the install and uninstall scripts, and this guide.
+example config, the install and uninstall scripts, this guide, and `version.txt`, the version stamped
+into both binaries.
 
 - **Linux/WSL** — `./install.sh` from inside the folder.
 - **Windows** — `.\install.ps1` from a PowerShell window inside the folder. If script execution is
@@ -190,9 +191,36 @@ commands are moving.
 
 ## Update
 
-Run the one-liner again, or run the install script again from a new build folder. It stops the
-running agent, replaces the binary, refreshes its registration, and starts it again. The config is
-left as it is.
+An installed agent is brought to the live build without anyone at the machine. Every deployment of
+the hub publishes the agent build of the same commit to `ai.example.org/bmo/jake/`, and the hub orders
+each attached agent that runs another build onto it:
+
+- When an agent says hello, or at a later ping while it is still behind, the hub compares the version
+  it announced with the one its release carries. An installed build that differs, on a machine the
+  build has a binary for, is ordered to update once nothing a caller started is running on it: no
+  command and no transfer. An open ssh stream does not hold it back and drops with the restart, as it
+  does when the hub restarts.
+- The order is one short command that hands the update to a runner of its own and ends at once, so
+  the call never hangs on the agent it replaces. On Windows the runner is the one-shot scheduled task
+  `JakeUpdate`, on Linux the transient user unit `jake-update`. Task Scheduler and the user's service
+  manager own it, so it outlives the agent it stops.
+- The runner waits until `ai.example.org/bmo/jake/version.txt` names the build it was ordered onto, which
+  the deployment publishes right after the hub comes up, and gives up after ten minutes. It then
+  downloads the install script and runs it in its update mode (`--update` on Linux, `-Update` on
+  Windows), the same install as by hand without a question asked: it stops
+  the agent, replaces the binary, refreshes the registrations, starts it again and keeps the config.
+  It does nothing on a machine where no installed agent runs, as with the desktop app's built-in one.
+- In update mode the install keeps the previous binary until the new one reaches the hub. Where the
+  new build reports no connection within thirty seconds, it puts the previous binary back, starts it
+  again and ends with an error, so the machine stays attached.
+- What the runner did is written to `update.log` beside the agent's own log. The hub writes a line to
+  its log for each order and how the command ended, and does not order the same agent again for an
+  hour.
+- The hub's `JAKE_AGENT_UPDATE=off` turns the orders off (hub.env.example).
+
+To update by hand, run the one-liner again, or run the install script again from a new build folder.
+It stops the running agent, replaces the binary, refreshes its registration, and starts it again. The
+config is left as it is.
 
 ## Uninstall
 

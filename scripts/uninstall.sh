@@ -52,7 +52,7 @@ if [ "$REMOVE_CONFIG" -eq 1 ]; then
   rm -rf "$DATA_DIR"
 else
   # Keep agent.env and the log; drop only the binary and the uninstaller copy.
-  rm -f "$BIN" "$DATA_DIR/jake.new" "$DATA_DIR/uninstall.sh"
+  rm -f "$BIN" "$DATA_DIR/jake.new" "$DATA_DIR/jake.previous" "$DATA_DIR/uninstall.sh"
 fi
 
 echo ""

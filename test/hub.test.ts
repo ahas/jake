@@ -15,7 +15,14 @@ import {
   streamChecksum,
   type Frame,
 } from "../src/protocol";
-import { ensureHubBuilt, startHubClient, startHubProcess, type HubProcess, type HubSeams } from "./hub-process";
+import {
+  AGENT_DOWNLOAD_URL,
+  ensureHubBuilt,
+  startHubClient,
+  startHubProcess,
+  type HubProcess,
+  type HubSeams,
+} from "./hub-process";
 import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
 import { ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
@@ -1061,6 +1068,89 @@ describe("leave", () => {
     const back = await (await control(second, "/status")).json();
     expect(back.departed).toEqual([]);
     expect(back.agents.map((agent: { name: string }) => agent.name)).toEqual(["jungsu-wsl"]);
+  });
+});
+
+describe("agent updates", () => {
+  const BUILD = "0.1.0+gnew1234";
+
+  // A hub whose release carries the agent build BUILD.
+  async function launchWithBuild(): Promise<HubProcess> {
+    const agentBuildDir = mkdtempSync(join(tmpdir(), "jake-agent-build-"));
+    dirs.push(agentBuildDir);
+    await Bun.write(join(agentBuildDir, "version.txt"), `${BUILD}\n`);
+    return launch({ agentBuildDir });
+  }
+
+  // An agent dialing in with the given capabilities and version, once the hub has welcomed it.
+  async function dial(hub: HubProcess, capabilities: string[], version: string): Promise<FakeAgent> {
+    const agent = new FakeAgent(hub.agentPort, SECRET);
+    agents.push(agent);
+    expect(await agent.outcome()).toBe("open");
+    agent.hello(capabilities, "n2", version);
+    await agent.waitFor((f) => f.type === "welcome");
+    return agent;
+  }
+
+  // Whether pwsh parses a script without an error, as Windows PowerShell would be handed it.
+  async function parsesAsPowerShell(script: string): Promise<string> {
+    const parse =
+      "$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$errors); $errors | ForEach-Object { $_.ToString() }";
+    const proc = Bun.spawn(["pwsh", "-NoProfile", "-NonInteractive", "-Command", parse], {
+      stdin: new Blob([script]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    await proc.exited;
+    return (out + err).trim();
+  }
+
+  test("a Linux agent on another installed build is ordered to update through a unit of its own", async () => {
+    const hub = await launchWithBuild();
+    const agent = await dial(hub, ["exec:linux", "transfer"], "0.1.0+gold1234");
+    const order = await agent.waitFor((f) => f.type === "exec");
+    if (order.type !== "exec") throw new Error("not an exec");
+    expect(order.shell).toBe("linux");
+    expect(order.command).toStartWith("systemd-run --user --collect --unit jake-update ");
+    expect(order.command).toContain(AGENT_DOWNLOAD_URL);
+    expect(order.command).toContain(BUILD);
+
+    agent.send({ type: "exit", v: V, id: order.id, code: 0, signal: null, canceled: false });
+    await until(async () => hub.stderr.some((line) => line.includes("agent n2 update order exit")));
+    expect(hub.stderr.some((line) => line.includes("agent n2 runs 0.1.0+gold1234; ordering it onto 0.1.0+gnew1234"))).toBe(true);
+  });
+
+  test("a Windows agent is ordered through PowerShell with a script Windows PowerShell can parse", async () => {
+    const hub = await launchWithBuild();
+    const agent = await dial(hub, ["exec:powershell", "exec:wsl", "transfer"], "0.1.0+gold1234");
+    const order = await agent.waitFor((f) => f.type === "exec");
+    if (order.type !== "exec") throw new Error("not an exec");
+    expect(order.shell).toBe("powershell");
+    expect(order.command).toContain("Start-ScheduledTask -TaskName 'JakeUpdate'");
+    expect(await parsesAsPowerShell(order.command)).toBe("");
+    const runner = order.command.split("@'\n")[1]?.split("\n'@")[0] ?? "";
+    expect(runner).toContain(`$want = '${BUILD}'`);
+    expect(await parsesAsPowerShell(runner)).toBe("");
+  });
+
+  test("an agent on the build, the desktop app's agent, or a hub with the orders off is not ordered", async () => {
+    const withBuild = await launchWithBuild();
+    const off = await launch();
+    const cases: [HubProcess, string][] = [
+      [withBuild, BUILD],
+      [withBuild, "desktop-0.1.0"],
+      [off, "0.1.0+gold1234"],
+    ];
+    for (const [hub, version] of cases) {
+      const agent = await dial(hub, ["exec:linux"], version);
+      // The hub answers frames in order, so an order sent at the hello arrives before this pong.
+      agent.send({ type: "ping", v: V, ts: 1 });
+      await agent.waitFor((f) => f.type === "pong");
+      expect(agent.received.filter((f) => f.type === "exec")).toEqual([]);
+      agent.close();
+      await agent.waitClose();
+    }
   });
 });
 

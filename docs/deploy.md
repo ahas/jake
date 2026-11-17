@@ -217,7 +217,45 @@ The declaration says the rest:
 - The hub runs the release: the unit's binary is the deploy tree's `bin/jake-hub`, which the testbed
   builds from the commit it deploys. The commit the record names live is exactly what the hub runs,
   whatever the checkout holds meanwhile.
+- The release also carries the agent builds of its commit. The `agents` build step runs the agent
+  build in the build tree with the release's `agents/` folder as its output, so every release holds the layout the
+  one-line install downloads: the Windows `jake.exe`, the Linux `jake`, the install and uninstall
+  scripts, the example config, the agent's unit, the install guide, and `version.txt`, the version
+  stamped into both binaries.
+- Once the hub answers its health, the deployment publishes that layout (section 9), so the download
+  is the build of the commit the hub runs. A publish that fails fails the deployment, which rolls back.
 - A rollback flips the deploy tree back to the previous release and restarts the hub, which then runs
   that release's binary.
 - A jake job's close waits on this deployment: it reads the records under the deploy root and ends
   `live` once a deployment of its commit does.
+
+## 9. The agent downloads
+
+The one-line install reads `https://ai.example.org/bmo/jake/`, which main-host's own nginx serves from
+`/var/www/ahas-ai/bmo/jake/`. A deployment writes there itself, so the folder belongs to the account
+the testbed runs as, with the web server's group, the same as the desktop releases folder inside it.
+Hand it over once, before the first deployment that publishes:
+
+```sh
+sudo chown -R ahas:www-data /var/www/ahas-ai/bmo/jake
+sudo chmod 2775 /var/www/ahas-ai/bmo/jake
+```
+
+The deployment's `publish-agents` step runs `bun scripts/publish-agents.ts` from the release, after
+the health. It copies each file of the release's `agents/` into the folder under a temporary name and
+renames it over the old one, so a download in progress reads one whole file or the other, and it
+writes `version.txt` last. Whoever reads `version.txt` and finds the version he wants can then fetch
+every other file of that build. The `desktop/` folder beside them is left alone.
+
+Publishing goes with deploying and nothing else. A rollback the testbed takes during a deployment
+happens before the publish, so the download stays the build of the hub that stays live. A rollback
+ordered later, after a deployment ended `live`, leaves the download one build ahead of the hub until
+the next deployment publishes again. To match it at once, run the step from the live release by hand:
+
+```sh
+cd ~/.local/share/jake-hub/deploy && bun scripts/publish-agents.ts
+```
+
+The agents follow the download on their own (docs/install.md, 「Update」): the hub orders every
+attached agent that runs another build onto the one its release carries, and the agent fetches it from
+this folder once `version.txt` names it.

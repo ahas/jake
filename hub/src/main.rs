@@ -11,6 +11,7 @@ mod departed;
 mod exec;
 mod link;
 mod up;
+mod update;
 
 use jake_protocol as protocol;
 
@@ -25,6 +26,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::core::{Hub, HubOptions};
+use crate::update::AgentBuild;
 
 /// How long a shutdown waits for the agents' sockets to carry their closing frames.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -55,6 +57,18 @@ async fn run() -> Result<(), String> {
     socket_backlog_bytes: config.socket_backlog_bytes,
     departed_path: Some(config.departed_path),
     reverse_targets: config.reverse_targets,
+    agent_build: config.agent_update.and_then(|update| {
+      match AgentBuild::read(&update.build_dir, &update.download_url) {
+        Ok(build) => {
+          eprintln!("jake hub: agents are ordered onto build {}", build.version);
+          Some(build)
+        }
+        Err(error) => {
+          eprintln!("jake hub: no agent build to order agents onto: {error}");
+          None
+        }
+      }
+    }),
   });
 
   let agent_listener = bind(&config.host, config.port).await?;

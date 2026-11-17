@@ -7,6 +7,12 @@ name = "jake"
 # The release carries the hub's binary, which the unit runs and the deployment's health asks.
 binaries = ["jake-hub"]
 
+# The agent builds of the same commit, cross-compiled into the release's `agents/`, which the hub reads
+# its agents' build from and the publish step below serves (docs/deploy.md, steps 8 and 9).
+[[build.step]]
+id = "agents"
+command = "export PATH=\"$HOME/.bun/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH\" && bun scripts/build.ts --out \"$(git rev-parse --show-toplevel)/../deploy-releases/$(git rev-parse HEAD | cut -c1-12)/agents\""
+
 [deploy]
 root = "~/.local/share/jake-hub"
 # The hub's own data directory, holding its env file; every deployment's backup carries it.
@@ -14,6 +20,12 @@ data_root = "~/.local/share/jake"
 units = ["jake-hub.service"]
 # Answers 0 once both the agent server and the control API answer as the hub does.
 health = "bin/jake-hub up"
+
+# Once the hub answers, the release's agent builds become what the one-line install downloads.
+[[deploy.step]]
+id = "publish-agents"
+phase = "after-health"
+command = "export PATH=\"$HOME/.bun/bin:$PATH\" && bun scripts/publish-agents.ts"
 
 [deploy.backup]
 exclude = ["agent.log"]

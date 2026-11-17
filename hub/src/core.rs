@@ -22,6 +22,7 @@ use crate::protocol::{
   Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SUPERSEDED_REASON,
   SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
 };
+use crate::update::{self, AgentBuild};
 
 /// The version the hub names in its welcome.
 const HUB_VERSION: &str = "0.1.0";
@@ -33,6 +34,8 @@ const TAIL_BACKLOG: usize = 1024;
 const CLOSE_HUB_INITIATED: u16 = 4000;
 /// The close code of a socket whose hello named another name than its credential was made for.
 const CLOSE_OTHER_NAME: u16 = 4003;
+/// How much of an update order's output the hub's log keeps.
+const UPDATE_REPORT_BYTES: usize = 4096;
 
 pub struct HubOptions {
   pub secret: String,
@@ -49,6 +52,8 @@ pub struct HubOptions {
   pub departed_path: Option<PathBuf>,
   /// The `host:port` targets a stream back from an agent may reach.
   pub reverse_targets: Vec<String>,
+  /// The agent build attached agents are ordered onto; none orders no agent.
+  pub agent_build: Option<AgentBuild>,
 }
 
 /// One event in a command's or a transfer's life, as its control caller receives it.
@@ -232,6 +237,8 @@ struct State {
   // What each agent is to listen on for streams back, by name and port, with the target each joins:
   // asked again on every connection the agent makes.
   listens: HashMap<String, std::collections::BTreeMap<u16, String>>,
+  // When each agent was last ordered onto the release's agent build.
+  updates_ordered: HashMap<String, i64>,
 }
 
 pub struct Hub {
@@ -566,6 +573,51 @@ impl State {
     }
   }
 
+  // Start a shell command on an attached agent; its life arrives on the returned events.
+  fn start_exec(&mut self, name: &str, params: ExecParams) -> Events {
+    let id = self.next_id('c');
+    let (listener, events) = Listener::open();
+    listener.push("started", json!({ "id": id }));
+    if let Some(agent) = self.agents.get_mut(name) {
+      agent.commands.insert(id.clone(), listener);
+    }
+    let ExecParams {
+      shell,
+      command,
+      cwd,
+      env,
+      distro,
+    } = params;
+    self.send(
+      name,
+      &Frame::Exec {
+        id,
+        shell,
+        command,
+        cwd,
+        env,
+        distro,
+      },
+    );
+    events
+  }
+
+  // Order an agent onto the agent build where it runs another, nothing a caller started is running on
+  // it, and it was not ordered within the retry window; the answer is what it ran, and the order.
+  fn offer_update(&mut self, name: &str, build: &AgentBuild, now: i64) -> Option<(String, Events)> {
+    let agent = self.agents.get(name)?;
+    if !agent.commands.is_empty() || !agent.transfers.is_empty() {
+      return None;
+    }
+    if self.updates_ordered.get(name).is_some_and(|at| now - at < update::RETRY_AFTER_MS) {
+      return None;
+    }
+    let order = build.order(&agent.agent_version, &agent.capabilities)?;
+    let running = agent.agent_version.clone();
+    self.updates_ordered.insert(name.to_owned(), now);
+    Some((running, self.start_exec(name, order)))
+  }
+
   // The agent a request goes to among those its caller reaches: a named one must be reached and
   // attached, and no name picks the only one attached.
   fn find_target(&self, name: Option<&str>, reach: &Reach) -> Result<String, Refusal> {
@@ -620,6 +672,7 @@ impl Hub {
       id_seq: 0,
       departed: Departed::load(options.departed_path.clone()),
       listens: HashMap::new(),
+      updates_ordered: HashMap::new(),
     };
     Arc::new(Self {
       options,
@@ -714,6 +767,7 @@ impl Hub {
       if let Some(attached) = state.agents.get_mut(agent) {
         attached.probe = Some(probe);
       }
+      self.update_if_behind(&mut state, agent);
       return;
     }
 
@@ -795,6 +849,7 @@ impl Hub {
       return false;
     }
     state.send(name, &Frame::Ping { ts: now.into() });
+    self.update_if_behind(&mut state, name);
     true
   }
 
@@ -810,31 +865,19 @@ impl Hub {
   pub fn start_exec(&self, params: ExecParams, target: Option<&str>) -> Result<Events, String> {
     let mut state = self.lock();
     let name = state.find_target(target, &Reach::All).map_err(|refusal| refusal.reason)?;
-    let id = state.next_id('c');
-    let (listener, events) = Listener::open();
-    listener.push("started", json!({ "id": id }));
-    if let Some(agent) = state.agents.get_mut(&name) {
-      agent.commands.insert(id.clone(), listener);
-    }
-    let ExecParams {
-      shell,
-      command,
-      cwd,
-      env,
-      distro,
-    } = params;
-    state.send(
-      &name,
-      &Frame::Exec {
-        id,
-        shell,
-        command,
-        cwd,
-        env,
-        distro,
-      },
-    );
-    Ok(events)
+    Ok(state.start_exec(&name, params))
+  }
+
+  // Order the agent onto the release's agent build where it is due, and log how the order ends.
+  fn update_if_behind(&self, state: &mut State, name: &str) {
+    let Some(build) = &self.options.agent_build else {
+      return;
+    };
+    let Some((running, events)) = state.offer_update(name, build, now_ms()) else {
+      return;
+    };
+    eprintln!("jake hub: agent {name} runs {running}; ordering it onto {}", build.version);
+    tokio::spawn(report_update(name.to_owned(), events));
   }
 
   /// Ask the agent running a command to stop it; a command id is unique across the hub, and one on
@@ -1254,6 +1297,32 @@ fn port_of_listen(id: &str) -> Option<u16> {
   id.strip_prefix('l').and_then(|port| port.parse().ok())
 }
 
+// Log how an order onto the agent build ended: what its command printed, and its exit.
+async fn report_update(name: String, mut events: Events) {
+  let mut printed = Vec::new();
+  while let Some(event) = events.recv().await {
+    match event.kind {
+      "stdout" | "stderr" => {
+        let chunk = &event.data["chunk"];
+        if let (Some(bytes), Some(base64)) = (chunk["bytes"].as_u64(), chunk["base64"].as_str()) {
+          let encoded = EncodedBytes {
+            bytes,
+            base64: base64.to_owned(),
+          };
+          printed.extend(decode_bytes(&encoded, UPDATE_REPORT_BYTES).unwrap_or_default());
+        }
+      }
+      "started" => {}
+      _ => {
+        printed.truncate(UPDATE_REPORT_BYTES);
+        let printed = String::from_utf8_lossy(&printed);
+        eprintln!("jake hub: agent {name} update order {}: {} {}", event.kind, event.data, printed.trim());
+        return;
+      }
+    }
+  }
+}
+
 // One stream back: the agent's accepted connection joined to a fresh connection to its target here, each
 // direction on its own until either ends.
 async fn carry_back(end: StreamEnd, mut events: mpsc::UnboundedReceiver<StreamEvent>, target: String) {
@@ -1395,6 +1464,7 @@ mod tests {
       socket_backlog_bytes,
       departed_path: None,
       reverse_targets: Vec::new(),
+      agent_build: None,
     })
   }
 
@@ -1537,6 +1607,39 @@ mod tests {
     assert_eq!(hub.cancel(&id, &Reach::All), Ok(()));
   }
 
+  #[tokio::test]
+  async fn an_agent_is_ordered_onto_the_build_only_while_idle_and_once_within_the_retry_window() {
+    let hub = hub(CAP);
+    let build = AgentBuild {
+      version: "0.1.0+gnew0000".into(),
+      download_url: "https://example.test/jake".into(),
+    };
+    let (link, mut queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(
+      &link,
+      r#"{"type":"hello","v":1,"agent":"n2","agentVersion":"0.1.0+gold0000","capabilities":["exec:linux"]}"#,
+    );
+    let params = ExecParams {
+      shell: "linux".into(),
+      command: "sleep 1".into(),
+      cwd: None,
+      env: Map::new(),
+      distro: None,
+    };
+    let _running = hub.start_exec(params, Some("n2")).expect("started");
+    assert!(hub.lock().offer_update("n2", &build, 0).is_none(), "a caller's command holds it back");
+
+    hub.on_message(&link, r#"{"type":"exit","v":1,"id":"c1","code":0,"signal":null,"canceled":false}"#);
+    let (running, _order) = hub.lock().offer_update("n2", &build, 0).expect("ordered once idle");
+    assert_eq!(running, "0.1.0+gold0000");
+    let sent = queued(&mut queue);
+    assert_eq!(kinds(&sent).last(), Some(&"exec"));
+
+    hub.on_message(&link, r#"{"type":"exit","v":1,"id":"c2","code":0,"signal":null,"canceled":false}"#);
+    assert!(hub.lock().offer_update("n2", &build, update::RETRY_AFTER_MS - 1).is_none());
+    assert!(hub.lock().offer_update("n2", &build, update::RETRY_AFTER_MS).is_some());
+  }
+
   #[test]
   fn without_an_agent_key_only_the_shared_secret_admits() {
     let hub = Hub::new(HubOptions {
@@ -1550,6 +1653,7 @@ mod tests {
       socket_backlog_bytes: CAP,
       departed_path: None,
       reverse_targets: Vec::new(),
+      agent_build: None,
     });
     let bearer = format!("Bearer {}", credential::credential("k", "u7"));
     assert_eq!(hub.authorize_agent(Some(bearer.as_bytes())), None);
@@ -1573,6 +1677,7 @@ mod tests {
       socket_backlog_bytes: CAP,
       departed_path: None,
       reverse_targets: vec![address.clone(), "127.0.0.1:4555".into()],
+      agent_build: None,
     });
 
     // A target the hub does not allow is refused; so is a port an attached agent does not offer.

@@ -460,8 +460,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   https://ai.example.org/bmo/jake/install.sh | bash`; on Windows it is `powershell -c "irm
   https://ai.example.org/bmo/jake/install.ps1 | iex"`. Each install script fetches the binary for its own
   platform — the Linux binary from `ai.example.org/bmo/jake/jake`, the Windows executable from
-  `ai.example.org/bmo/jake/jake.exe` — along with the example config it needs. Serving that layout at that
-  path is host infrastructure BMO owns, not something jake's own checkout can arrange.
+  `ai.example.org/bmo/jake/jake.exe` — along with the example config it needs. Each deployment of the hub
+  builds that layout from the commit it deploys, carries it in the release, and publishes it there
+  once the hub answers (docs/deploy.md, sections 8 and 9), so the download is always the agent build
+  of the commit the hub runs. The layout names its own version in `version.txt`, written last when it
+  is published, so a reader that finds the version it wants there finds the rest of that build too.
 - The installer runs in 하스's own user session without elevation. It places the binary in a per-user
   location and writes the hub URL, the shared secret, and the agent name into the config file beside
   it — the credential is entered at install time and exists only in that file, never in the repository
@@ -481,6 +484,36 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   the config are preserved either way. The uninstaller reverses it — stopping the agent, removing its
   registrations, and deleting the layout — and leaves removing the config an explicit choice, so a
   reinstall keeps the hub URL and secret unless they are asked to be dropped.
+
+## Keeping the agents current
+
+- An installed agent follows the hub's release without a hand at its machine. A hub reads, at start,
+  the version of the agent build its release carries, and orders onto that build every attached agent
+  that announces another installed build, one whose version carries the commit the install's build
+  stamps in. The desktop app's built-in agent announces a version of its own kind and is updated by the
+  app's own updater, so it is never ordered; neither is a development build that carries no commit.
+- The order is an ordinary command, not a frame of its own, because the agents that need the update
+  are exactly the ones that may not know a new frame; every agent runs a command. The hub picks the
+  command by the shells the agent offers: PowerShell means a Windows host, the Linux shell a Linux
+  host, and an agent offering neither is left alone.
+- The command cannot do the replacing itself: the agent running it is the process to be stopped, and a
+  call left waiting on its own agent would hang until the socket dropped. So the command only hands
+  the work to a runner the platform owns, the same way leaving hands its file deletion to one, and ends
+  at once with the exit the hub reads. On Windows that runner is a one-shot scheduled task, which
+  deletes itself when it is done; on Linux a transient unit of the user's service manager, outside the
+  agent's own unit, so stopping the agent's unit does not stop it.
+- The runner installs exactly as a person re-running the install would, in the install's update mode:
+  it stops the agent, replaces the binary, refreshes every registration, starts it again, and keeps
+  the config. The new build must come back attached, so that mode keeps the previous binary until the
+  new one reports a connection and puts it back where none comes, ending with an error.
+- A deployment restarts the hub before it publishes the agent build, so an agent can be ordered onto a
+  build the download does not offer yet. The runner therefore waits, bounded, until the published
+  version is the one it was ordered onto, and changes nothing when it never is.
+- An update stops whatever the agent carries, so the hub orders it only while no command and no
+  transfer a caller started is running there, and otherwise asks again at each ping. Byte streams do
+  not hold it back: an ssh session may stay open indefinitely, and it is dropped and redialled the same
+  way a hub restart drops it. Once ordered, an agent is not ordered again for an hour, so a build that
+  cannot reach a machine is retried rather than looping. The hub logs each order and its command's end.
 
 ## The hub on main-host
 

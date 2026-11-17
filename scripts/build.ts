@@ -1,14 +1,21 @@
 // Cross-compiles the agent for Windows and Linux and assembles the install layout.
 
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { cpSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..");
-const distDir = join(repoRoot, "dist");
-const layoutDir = join(distDir, "jake");
+
+/** The layout's folder: `--out <dir>`, as a deployment gives its release's, else `dist/jake`. */
+const layoutDir = resolve(
+  parseArgs({ options: { out: { type: "string" } } }).values.out ?? join(repoRoot, "dist", "jake"),
+);
+
+/** The file of the layout that names the version stamped into its binaries, read by the hub and the updater. */
+const VERSION_FILE = "version.txt";
 
 /**
  * The per-platform executables the layout ships: a Rust target and the name it lands under. The Linux
@@ -42,8 +49,21 @@ function git(args: string[]): string | null {
   return result.stdout.trim();
 }
 
+/** Cargo's target directory for the workspace, as Cargo itself resolves it. */
+function cargoTargetDir(): string {
+  const result = spawnSync("cargo", ["metadata", "--format-version", "1", "--no-deps", "--offline"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    throw new Error(`cargo metadata failed: ${result.stderr}`);
+  }
+  return (JSON.parse(result.stdout) as { target_directory: string }).target_directory;
+}
+
 /** Cross-compile the agent for one target into the layout, stamping the version in. */
-function compile(target: string, outName: string, version: string): void {
+function compile(target: string, outName: string, version: string, targetDir: string): void {
   const result = spawnSync(
     "cargo",
     ["zigbuild", "--release", "--offline", "--package", "jake-agent", "--target", target],
@@ -52,7 +72,7 @@ function compile(target: string, outName: string, version: string): void {
   if (result.status !== 0) {
     throw new Error(`compile failed for ${target} (exit ${result.status ?? "signal"})`);
   }
-  const built = join(repoRoot, "target", target, "release", outName);
+  const built = join(targetDir, target, "release", outName);
   if (!existsSync(built)) {
     throw new Error(`compile reported success but ${built} is missing`);
   }
@@ -78,9 +98,10 @@ async function main(): Promise<void> {
   rmSync(layoutDir, { recursive: true, force: true });
   mkdirSync(layoutDir, { recursive: true });
 
+  const targetDir = cargoTargetDir();
   for (const { target, outName } of BINARIES) {
     console.log(`· compiling ${outName} (${target})`);
-    compile(target, outName, version);
+    compile(target, outName, version, targetDir);
   }
 
   console.log("· placing the example config, the install scripts, and the systemd unit");
@@ -91,12 +112,13 @@ async function main(): Promise<void> {
   place("scripts/uninstall.sh", "uninstall.sh");
   place("jake-agent.service", "jake-agent.service");
   place("docs/install.md", "INSTALL.md");
+  writeFileSync(join(layoutDir, VERSION_FILE), `${version}\n`);
 
   console.log("\nlayout:");
   for (const { outName } of BINARIES) {
     console.log(`  ${outName}  ${sizeOf(join(layoutDir, outName))}`);
   }
-  console.log(`  agent.env.example, install.ps1, uninstall.ps1, install.sh, uninstall.sh, jake-agent.service, INSTALL.md`);
+  console.log(`  agent.env.example, install.ps1, uninstall.ps1, install.sh, uninstall.sh, jake-agent.service, INSTALL.md, ${VERSION_FILE}`);
   console.log(`\ndone. version ${version} stamped into each executable.`);
 }
 

@@ -6,6 +6,7 @@ set -euo pipefail
 BASE="https://ai.example.org/bmo/jake"
 DATA_DIR="$HOME/.local/share/jake"
 BIN="$DATA_DIR/jake"
+PREVIOUS_BIN="$DATA_DIR/jake.previous"
 ENV_FILE="$DATA_DIR/agent.env"
 UNIT_NAME="jake-agent.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -33,6 +34,8 @@ Options:
                         none (default: 22, this machine's sshd)
   --ssh-key <key>       a public key to add to ~/.ssh/authorized_keys, so ssh over the hub logs in
   --non-interactive     never prompt; the secret and name must be passed or already in agent.env
+  --update              an unattended update: never prompt, and put the previous binary back where the
+                        new one does not reach the hub
   --print-config        resolve the values, print the hub URL and agent name, and install nothing
   -h, --help            show this help
 EOF
@@ -46,6 +49,7 @@ AGENT_NAME=""
 STREAM_PORTS=""
 SSH_KEY=""
 NON_INTERACTIVE=0
+UPDATE=0
 PRINT_CONFIG=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,6 +64,7 @@ while [ $# -gt 0 ]; do
     --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
     --ssh-key=*) SSH_KEY="${1#*=}"; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --update) UPDATE=1; NON_INTERACTIVE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -69,6 +74,11 @@ done
 if [ -n "$STREAM_PORTS" ] && ! [[ "$STREAM_PORTS" =~ ^(none|[0-9]{1,5}(,[0-9]{1,5})*)$ ]]; then
   die "--stream-ports takes port numbers separated by commas, or none (got $STREAM_PORTS)"
 fi
+
+# How long the agent is given to report reaching the hub: longer for an update, which puts the previous
+# build back where the new one does not. JAKE_INSTALL_WAIT_SECONDS sets it outright.
+if [ "$UPDATE" -eq 1 ]; then WAIT_SECONDS=30; else WAIT_SECONDS=15; fi
+WAIT_SECONDS="${JAKE_INSTALL_WAIT_SECONDS:-$WAIT_SECONDS}"
 
 # --- host checks ---------------------------------------------------------------------------------
 
@@ -185,6 +195,9 @@ systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
 
 step "installing to $DATA_DIR"
 mkdir -p "$DATA_DIR"
+if [ "$UPDATE" -eq 1 ] && [ -f "$BIN" ]; then
+  cp -f "$BIN" "$PREVIOUS_BIN"
+fi
 new_bin="$DATA_DIR/jake.new"
 if [ -n "$src_dir" ]; then cp "$src_dir/jake" "$new_bin"; else fetch "$BASE/jake" "$new_bin"; fi
 chmod +x "$new_bin"
@@ -264,27 +277,59 @@ if ! loginctl enable-linger "$(id -un)" 2>/dev/null; then
   warn "could not enable linger; the agent starts at login but may not at boot. Run: loginctl enable-linger $(id -un)"
 fi
 log_file="$DATA_DIR/agent.log"
-log_mark=0
-[ -f "$log_file" ] && log_mark="$(wc -c < "$log_file")"
+
+# The size of the agent's log now, so a wait reads only what the log gains after it.
+log_size() { if [ -f "$log_file" ]; then wc -c < "$log_file"; else echo 0; fi; }
+
+# Read what the log gained since the mark for up to WAIT_SECONDS: sets reached, or failure with why not.
+wait_for_hub() { # mark
+  local mark="$1" log_tail elapsed=0
+  reached=0
+  failure=""
+  while :; do
+    if [ -f "$log_file" ]; then
+      [ "$(wc -c < "$log_file")" -ge "$mark" ] || mark=0
+      log_tail="$(tail -c +"$((mark + 1))" "$log_file" 2>/dev/null || true)"
+      case "$log_tail" in
+        *'"event":"welcomed"'*) reached=1; return 0 ;;
+        *'"event":"rejected"'*) failure="the hub rejected the agent (the shared secret or the agent name is wrong)"; return 0 ;;
+        *'"event":"dial-failed"'*) failure="the agent could not reach the hub (check the hub URL and that the hub is running)" ;;
+      esac
+    fi
+    [ "$elapsed" -lt "$WAIT_SECONDS" ] || return 0
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+}
+
+log_mark="$(log_size)"
 systemctl --user enable --now "$UNIT_NAME"
 ok "service enabled and started"
 
-# --- wait briefly for the agent to reach the hub, reading only what its log gained since the start --
+# --- wait briefly for the agent to reach the hub ---------------------------------------------------
 
 step "waiting for the agent to reach the hub"
-reached=0
-failure=""
-for _ in $(seq 1 15); do
-  sleep 1
-  [ -f "$log_file" ] || continue
-  [ "$(wc -c < "$log_file")" -ge "$log_mark" ] || log_mark=0
-  log_tail="$(tail -c +"$((log_mark + 1))" "$log_file" 2>/dev/null || true)"
-  case "$log_tail" in
-    *'"event":"welcomed"'*) reached=1; break ;;
-    *'"event":"rejected"'*) failure="the hub rejected the agent (the shared secret or the agent name is wrong)"; break ;;
-    *'"event":"dial-failed"'*) failure="the agent could not reach the hub (check the hub URL and that the hub is running)" ;;
-  esac
-done
+wait_for_hub "$log_mark"
+
+# An update must leave the machine attached: a new build that does not reach the hub gives way to the
+# previous one, and the update fails.
+if [ "$UPDATE" -eq 1 ] && [ -f "$PREVIOUS_BIN" ]; then
+  if [ "$reached" -eq 1 ]; then
+    rm -f "$PREVIOUS_BIN"
+  else
+    warn "the new build did not reach the hub${failure:+: $failure}"
+    step "putting the previous build back"
+    systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
+    mv -f "$PREVIOUS_BIN" "$BIN"
+    log_mark="$(log_size)"
+    systemctl --user start "$UNIT_NAME"
+    wait_for_hub "$log_mark"
+    if [ "$reached" -eq 1 ]; then
+      die "the update did not take; the previous build is back and connected to the hub."
+    fi
+    die "the update did not take; the previous build is back but has not connected yet${failure:+: $failure}."
+  fi
+fi
 
 echo ""
 if [ "$reached" -eq 1 ]; then
