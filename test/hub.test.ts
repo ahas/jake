@@ -1121,6 +1121,7 @@ describe("agent updates", () => {
     expect(hub.stderr.some((line) => line.includes("agent n2 runs 0.1.0+gold1234; ordering it onto 0.1.0+gnew1234"))).toBe(true);
   });
 
+  // It starts PowerShell twice, which takes seconds each on a loaded machine.
   test("a Windows agent is ordered through PowerShell with a script Windows PowerShell can parse", async () => {
     const hub = await launchWithBuild();
     const agent = await dial(hub, ["exec:powershell", "exec:wsl", "transfer"], "0.1.0+gold1234");
@@ -1132,7 +1133,7 @@ describe("agent updates", () => {
     const runner = order.command.split("@'\n")[1]?.split("\n'@")[0] ?? "";
     expect(runner).toContain(`$want = '${BUILD}'`);
     expect(await parsesAsPowerShell(runner)).toBe("");
-  });
+  }, 30_000);
 
   test("an agent on the build, the desktop app's agent, or a hub with the orders off is not ordered", async () => {
     const withBuild = await launchWithBuild();

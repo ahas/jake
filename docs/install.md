@@ -203,7 +203,9 @@ each attached agent that runs another build onto it:
 - The order is one short command that hands the update to a runner of its own and ends at once, so
   the call never hangs on the agent it replaces. On Windows the runner is the one-shot scheduled task
   `JakeUpdate`, on Linux the transient user unit `jake-update`. Task Scheduler and the user's service
-  manager own it, so it outlives the agent it stops.
+  manager own it, so it outlives the agent it stops. On Windows the runner and the install script it
+  runs are handed to PowerShell as inline text, never as a `.ps1` file, so a PC whose policy blocks
+  script files is updated all the same.
 - The runner waits until `ai.example.org/bmo/jake/version.txt` names the build it was ordered onto, which
   the deployment publishes right after the hub comes up, and gives up after ten minutes. It then
   downloads the install script and runs it in its update mode (`--update` on Linux, `-Update` on

@@ -502,6 +502,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   at once with the exit the hub reads. On Windows that runner is a one-shot scheduled task, which
   deletes itself when it is done; on Linux a transient unit of the user's service manager, outside the
   agent's own unit, so stopping the agent's unit does not stop it.
+- On Windows nothing of the update runs from a script file. A managed PC's software restriction policy
+  can block every `.ps1` file PowerShell is asked to load, whatever execution policy the command line
+  names, while script text passed inline still runs, as every command the agent runs is passed. So
+  the task starts PowerShell with the runner encoded on its command line, and the runner hands the
+  downloaded install script to a second PowerShell as text, never by its path.
 - The runner installs exactly as a person re-running the install would, in the install's update mode:
   it stops the agent, replaces the binary, refreshes every registration, starts it again, and keeps
   the config. The new build must come back attached, so that mode keeps the previous binary until the

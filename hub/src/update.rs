@@ -171,6 +171,7 @@ fn windows_runner(build: &AgentBuild) -> String {
 $base = {base}
 $want = {want}
 $log = Join-Path $env:LOCALAPPDATA 'jake\update.log'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
 function Say($message) {{ Add-Content -LiteralPath $log -Value ((Get-Date -Format o) + ' ' + $message) -Encoding UTF8 }}
 try {{
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -192,7 +193,8 @@ try {{
   $web.DownloadFile("$base/install.ps1", $installer)
   Say "updating $installDir to $want"
   $ErrorActionPreference = 'Continue'
-  & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -Update -InstallDir $installDir 2>&1 | Out-File -LiteralPath $log -Append -Encoding UTF8
+  $install = "& ([scriptblock]::Create([System.IO.File]::ReadAllText('" + $installer.Replace("'", "''") + "'))) -Update -InstallDir '" + $installDir.Replace("'", "''") + "'"
+  & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ([Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($install))) 2>&1 | Out-File -LiteralPath $log -Append -Encoding UTF8
   Say "the install ended with exit $LASTEXITCODE"
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }} catch {{
@@ -205,19 +207,19 @@ try {{
   )
 }
 
-/// The Windows order: the runner written beside the agent's log and handed to a one-shot task,
-/// registered like the agent's own anchors, per-user and non-elevated, and started at once.
+/// The Windows order: the runner encoded onto the command line of a one-shot task, registered like
+/// the agent's own anchors, per-user and non-elevated, and started at once. Neither the runner nor the
+/// install script it runs is ever loaded from a `.ps1` file, since a software restriction policy may
+/// block script files whatever execution policy the command line names, while inline script runs.
 fn windows_command(build: &AgentBuild) -> String {
   format!(
     r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$dir = Join-Path $env:LOCALAPPDATA 'jake'
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$runner = Join-Path $dir 'update.ps1'
-[System.IO.File]::WriteAllText($runner, @'
+$runner = @'
 {runner}
-'@)
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $runner + '"')
+'@
+$encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runner))
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ' + $encoded)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 Register-ScheduledTask -TaskName '{WINDOWS_TASK}' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
@@ -286,7 +288,7 @@ mod tests {
     assert!(order.command.contains("Register-ScheduledTask -TaskName 'JakeUpdate'"));
     assert!(order.command.contains("Start-ScheduledTask -TaskName 'JakeUpdate'"));
     assert!(order.command.contains("$want = '0.1.0+gabc1234'"));
-    assert!(order.command.contains("-Update -InstallDir $installDir"));
+    assert!(order.command.contains(") -Update -InstallDir '"));
     assert!(order.command.contains("Unregister-ScheduledTask -TaskName 'JakeUpdate'"));
   }
 
@@ -294,7 +296,15 @@ mod tests {
   fn a_windows_order_answers_with_its_one_line_and_no_progress_records() {
     let order = build().order("0.1.0+g0000000", &offers(&["exec:powershell"])).expect("ordered");
     let quiet = order.command.find("$ProgressPreference = 'SilentlyContinue'").expect("quiet");
-    let first_cmdlet = order.command.find("New-Item").expect("cmdlet");
+    let first_cmdlet = order.command.find("New-ScheduledTaskAction").expect("cmdlet");
     assert!(quiet < first_cmdlet);
+  }
+
+  #[test]
+  fn a_windows_order_loads_no_script_file_so_a_policy_on_script_files_cannot_stop_it() {
+    let order = build().order("0.1.0+g0000000", &offers(&["exec:powershell"])).expect("ordered");
+    assert!(!order.command.contains(" -File "));
+    assert_eq!(order.command.matches("-EncodedCommand").count(), 2);
+    assert!(order.command.contains("[scriptblock]::Create([System.IO.File]::ReadAllText("));
   }
 }
