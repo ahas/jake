@@ -210,6 +210,7 @@ try {{
 fn windows_command(build: &AgentBuild) -> String {
   format!(
     r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $dir = Join-Path $env:LOCALAPPDATA 'jake'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $runner = Join-Path $dir 'update.ps1'
@@ -287,5 +288,13 @@ mod tests {
     assert!(order.command.contains("$want = '0.1.0+gabc1234'"));
     assert!(order.command.contains("-Update -InstallDir $installDir"));
     assert!(order.command.contains("Unregister-ScheduledTask -TaskName 'JakeUpdate'"));
+  }
+
+  #[test]
+  fn a_windows_order_answers_with_its_one_line_and_no_progress_records() {
+    let order = build().order("0.1.0+g0000000", &offers(&["exec:powershell"])).expect("ordered");
+    let quiet = order.command.find("$ProgressPreference = 'SilentlyContinue'").expect("quiet");
+    let first_cmdlet = order.command.find("New-Item").expect("cmdlet");
+    assert!(quiet < first_cmdlet);
   }
 }
