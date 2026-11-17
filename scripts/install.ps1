@@ -74,8 +74,9 @@ $StartupDir = [Environment]::GetFolderPath('Startup')
 $LogPath = Join-Path $env:LOCALAPPDATA 'jake\agent.log'
 $PreviousBinary = 'jake.previous.exe'
 # How long the agent is given to report reaching the hub: longer for an update, which puts the previous
-# executable back where the new one does not.
+# executable back where the new one does not. JAKE_INSTALL_WAIT_SECONDS sets it outright.
 $WaitSeconds = if ($Update) { 30 } else { 15 }
+if ($env:JAKE_INSTALL_WAIT_SECONDS) { $WaitSeconds = [int]$env:JAKE_INSTALL_WAIT_SECONDS }
 
 function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  $msg" -ForegroundColor Green }
@@ -311,7 +312,8 @@ function Wait-ForHub($logMark) {
     if (-not (Test-Path $LogPath)) { continue }
     $fs = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
     try {
-      if ($fs.Length -gt $logMark) { $fs.Position = $logMark }
+      # A log shorter than the mark was rotated, and is read whole; one that has not grown holds nothing new.
+      if ($fs.Length -ge $logMark) { $fs.Position = $logMark }
       $reader = New-Object System.IO.StreamReader($fs)
       $tail = $reader.ReadToEnd()
     } finally { $fs.Close() }
@@ -337,7 +339,7 @@ if ($Update -and (Test-Path $Previous)) {
   if ($reached) {
     Remove-Item -LiteralPath $Previous -Force -ErrorAction SilentlyContinue
   } else {
-    Write-Warn2 "the new build did not reach the hub: $failure"
+    Write-Warn2 ("the new build did not reach the hub" + $(if ($failure) { ": $failure" } else { "" }))
     Write-Step "putting the previous build back"
     Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
       try { $_ | Stop-Process -Force } catch { }
