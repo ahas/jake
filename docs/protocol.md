@@ -44,8 +44,10 @@ Command execution (streaming):
   emits will echo, the shell to run it through, the command text, an optional working directory, an
   environment overlay, and, for WSL, an optional distribution. The named shell is meant to be one of
   those the hello list advertised; on a Windows host these are PowerShell and WSL, on a Linux or WSL
-  host a Linux shell. A name the host has no shell for is run in the host's own shell, not refused. The command text is bounded by the same size cap as a byte payload, so an
-  embedded-content command cannot slip past the cap that guards every chunk.
+  host a Linux shell. A name the host has no shell for is run in the host's own shell, not refused.
+  The command text reaches the shell as written, with no other shell expanding it first, so a caller
+  writes it as it would at that shell's own prompt. The command text is bounded by the same size cap
+  as a byte payload, so an embedded-content command cannot slip past the cap that guards every chunk.
 - **stdout** / **stderr** — agent to hub: one chunk of a run's output, carrying the run's id, a
   sequence number that orders the chunks, and the chunk bytes. Chunks are emitted as output arrives,
   not held until the run ends.

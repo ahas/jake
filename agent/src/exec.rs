@@ -75,6 +75,8 @@ pub fn powershell_invocation(request: &ExecRequest) -> Invocation {
 }
 
 /// WSL entered through its launcher, the command in a login shell; the overlay crosses by `WSLENV`.
+/// The launcher starts bash itself, since the distribution's default shell would expand the command
+/// once before bash read it.
 pub fn wsl_invocation(request: &ExecRequest) -> Invocation {
   let mut args = Vec::new();
   if let Some(distro) = request.distro.as_deref().filter(|distro| !distro.is_empty()) {
@@ -83,7 +85,7 @@ pub fn wsl_invocation(request: &ExecRequest) -> Invocation {
   if let Some(cwd) = request.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
     args.extend(["--cd".to_owned(), cwd.to_owned()]);
   }
-  args.extend(["--", "bash", "-lc"].map(str::to_owned));
+  args.extend(["--exec", "bash", "-lc"].map(str::to_owned));
   args.push(request.command.clone());
 
   let mut env = request.env.clone();
@@ -478,7 +480,10 @@ mod tests {
   fn wsl_enters_through_its_launcher_into_a_login_shell_and_shares_the_overlay() {
     let mut asked = request("wsl", "echo $A");
     let bare = invocation(Platform::Windows, &asked);
-    assert_eq!((bare.file.as_str(), bare.args.join(" ")), ("wsl.exe", "-- bash -lc echo $A".to_owned()));
+    assert_eq!(
+      (bare.file.as_str(), bare.args.join(" ")),
+      ("wsl.exe", "--exec bash -lc echo $A".to_owned())
+    );
     assert!(bare.env.is_empty());
 
     asked.distro = Some("Ubuntu".into());
@@ -491,6 +496,22 @@ mod tests {
       built.env,
       [("A".to_owned(), "1".to_owned()), ("WSLENV".to_owned(), "A/u:PATH/l".to_owned())]
     );
+  }
+
+  #[test]
+  fn a_wsl_command_reaches_bash_as_written_with_no_default_shell_before_it() {
+    let commands = [
+      "X=1; echo \"$X\" $(echo $X) `echo $X` 'lit $X' \"q\\\"q\" end\\",
+      "echo e30K | base64 -d | bash",
+      "first\nsecond",
+    ];
+    for command in commands {
+      let mut asked = request("wsl", command);
+      asked.distro = Some("Ubuntu".into());
+      asked.cwd = Some("~".into());
+      let built = invocation(Platform::Windows, &asked);
+      assert_eq!(built.args[4..], ["--exec", "bash", "-lc", command], "{command}");
+    }
   }
 
   #[test]

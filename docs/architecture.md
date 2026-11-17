@@ -288,8 +288,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   forced to UTF-8, so a non-ASCII character crosses the tunnel as itself rather than as mojibake in
   the machine's OEM code page. WSL is entered through its launcher with an optional distribution and
   working directory, and the command runs in a login shell so its environment matches what a person
-  gets at an interactive prompt. The Linux shell runs the command in a login shell in the same way,
-  so its environment likewise matches an interactive prompt.
+  gets at an interactive prompt. The launcher is told to start that bash itself rather than hand the
+  line to the distribution's default shell, because the default shell would expand the command's `$`,
+  quotes and backticks once before bash read it; the command text reaches bash as written, and bash
+  alone expands it, the same as on a Linux host. The Linux shell runs the command in a login shell in
+  the same way, so its environment likewise matches an interactive prompt.
 - Stopping a command ends its whole process tree, not only the shell that was launched: a shell that
   started something else must not leave that behind. How the tree is ended is platform-aware — on
   Windows the Task Scheduler's own tree-terminating kill, on Linux a signal to the command's process
