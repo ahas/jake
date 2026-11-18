@@ -63,10 +63,18 @@ describe("install.sh prompts", () => {
   });
 });
 
+// The real mv, which a stand-in falls through to.
+const MV = Bun.which("mv") ?? "/bin/mv";
+
 // An installed agent's machine in a temporary home: the previous binary and its config in place, a
 // build folder holding the new binary beside a copy of the installer, and a stand-in service manager
-// that, on each start, logs the agent reaching the hub where the binary in place says it does.
-function machine(previous: string, next: string): { home: string; folder: string; bin: string; stubs: string } {
+// that records every call and, on each start, logs the agent reaching the hub where the binary in place
+// says it does. Where `failMove` names a file, moving that file fails, as a swap or a rollback may.
+function machine(
+  previous: string,
+  next: string,
+  failMove?: string,
+): { home: string; folder: string; bin: string; stubs: string } {
   const home = mkdtempSync(join(tmpdir(), "jake-update-"));
   homes.push(home);
   const data = join(home, ".local", "share", "jake");
@@ -83,6 +91,7 @@ function machine(previous: string, next: string): { home: string; folder: string
   mkdirSync(stubs);
   const systemctl = [
     "#!/bin/sh",
+    `echo "$*" >> "${join(home, "systemctl.calls")}"`,
     'case " $* " in',
     '  *" enable --now "*|*" start "*)',
     `    grep -q reaches "${join(data, "jake")}" && echo '{"event":"welcomed"}' >> "${join(data, "agent.log")}" ;;`,
@@ -91,7 +100,18 @@ function machine(previous: string, next: string): { home: string; folder: string
   ].join("\n");
   writeFileSync(join(stubs, "systemctl"), systemctl, { mode: 0o755 });
   writeFileSync(join(stubs, "loginctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  if (failMove) {
+    const mv = ["#!/bin/sh", `case " $* " in *"/${failMove} "*) exit 1 ;; esac`, `exec ${MV} "$@"`].join("\n");
+    writeFileSync(join(stubs, "mv"), mv, { mode: 0o755 });
+  }
   return { home, folder, bin: join(data, "jake"), stubs };
+}
+
+// Whether the agent's unit runs once the install has ended: started after the last time it was stopped.
+function unitRunning(at: ReturnType<typeof machine>): boolean {
+  const calls = readFileSync(join(at.home, "systemctl.calls"), "utf8").split("\n");
+  const last = calls.filter((call) => / (stop|start|enable --now) /.test(` ${call} `)).at(-1) ?? "";
+  return !last.includes("stop");
 }
 
 async function update(at: ReturnType<typeof machine>): Promise<{ code: number; output: string }> {
@@ -127,14 +147,52 @@ describe("install.sh --update", () => {
     expect(output).toContain("the update did not take; the previous build is back and connected to the hub.");
     expect(readFileSync(at.bin, "utf8")).toBe("old reaches");
     expect(existsSync(`${at.bin}.previous`)).toBe(false);
+    expect(unitRunning(at)).toBe(true);
+  });
+
+  test("a swap that fails leaves the previous binary in place and the agent started again", async () => {
+    const at = machine("old reaches", "new reaches", "jake.new");
+    const { code, output } = await update(at);
+    expect(code).not.toBe(0);
+    expect(output).toContain("the install ended before it started the agent again, so it starts the agent now");
+    expect(readFileSync(at.bin, "utf8")).toBe("old reaches");
+    expect(unitRunning(at)).toBe(true);
+  });
+
+  test("a rollback that fails leaves the new binary in place and the agent started again", async () => {
+    const at = machine("old reaches", "new is silent", "jake.previous");
+    const { code, output } = await update(at);
+    expect(code).not.toBe(0);
+    expect(output).toContain("the update did not take, and the previous build could not be put back");
+    expect(readFileSync(at.bin, "utf8")).toBe("new is silent");
+    expect(unitRunning(at)).toBe(true);
   });
 });
 
-// The Windows commands install.ps1 calls, stood in for under pwsh: the registry value, the Startup
-// shortcut and the guard are accepted and dropped, no jake process runs, and starting the agent's
-// logon task logs it reaching the hub where the executable in place says it does.
+// The Windows commands install.ps1 calls, stood in for under pwsh: the registry value and the Startup
+// shortcut are accepted and dropped, a registered task is recorded with its run-time limit, the jake
+// processes are the tasks started and not since stopped, and starting the agent's task logs it starting
+// and, where the executable in place says it does, reaching the hub. Moving the file JAKE_TEST_FAIL_MOVE
+// names fails, as a swap or a rollback may while the file is held.
 const WINDOWS_STAND_INS = `
-function Get-Process { }
+$global:JakeRunning = @{ JakeAgent = $true; JakeGuard = $true }
+$global:JakeRegistered = @()
+function Get-Process {
+  foreach ($task in @($global:JakeRunning.Keys)) {
+    $process = [pscustomobject]@{ Task = $task }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) $true }
+    $process
+  }
+}
+function Stop-Process {
+  param([Parameter(ValueFromPipeline)]$InputObject, [switch]$Force)
+  process { $global:JakeRunning.Remove($InputObject.Task) }
+}
+function Move-Item {
+  param($LiteralPath, $Destination)
+  if ($env:JAKE_TEST_FAIL_MOVE -and (Split-Path -Leaf $LiteralPath) -eq $env:JAKE_TEST_FAIL_MOVE) { throw "$LiteralPath is in use" }
+  Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+}
 function New-ItemProperty { }
 function New-Item { if ("$args" -match 'HKCU:') { return }; Microsoft.PowerShell.Management\\New-Item @args }
 function New-Object {
@@ -149,14 +207,23 @@ function New-Object {
 }
 function New-ScheduledTaskAction { param($Execute, $Argument) @{ Argument = $Argument } }
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn) }
-function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable) }
+function New-ScheduledTaskSettingsSet {
+  param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $ExecutionTimeLimit)
+  @{ ExecutionTimeLimit = $ExecutionTimeLimit }
+}
 function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) }
-function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force) }
+function Register-ScheduledTask {
+  param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force)
+  $global:JakeRegistered += "$TaskName limit $($Settings.ExecutionTimeLimit)"
+}
 function Start-ScheduledTask {
   param($TaskName)
+  $global:JakeRunning[$TaskName] = $true
   if ($TaskName -ne 'JakeAgent') { return }
+  $log = Join-Path $env:LOCALAPPDATA 'jake/agent.log'
+  Add-Content -LiteralPath $log -Value '{"event":"agent-starting"}'
   if ((Get-Content -Raw -LiteralPath (Join-Path $env:JAKE_TEST_INSTALL 'jake.exe')) -match 'reaches') {
-    Add-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'jake/agent.log') -Value '{"event":"welcomed"}'
+    Add-Content -LiteralPath $log -Value '{"event":"welcomed"}'
   }
 }
 `;
@@ -184,10 +251,15 @@ function windowsMachine(previous: string, next: string): { install: string; buil
   return { install, build, localAppData };
 }
 
-async function windowsUpdate(at: ReturnType<typeof windowsMachine>): Promise<{ outcome: string; output: string }> {
+type WindowsRun = { outcome: string; output: string; running: string; registered: string };
+
+// Run install.ps1 -Update on the machine; `running` names the tasks whose process runs once it has ended.
+async function windowsUpdate(at: ReturnType<typeof windowsMachine>, failMove = ""): Promise<WindowsRun> {
   const run = `${WINDOWS_STAND_INS}
 try { & (Join-Path $env:JAKE_TEST_BUILD 'install.ps1') -Update -InstallDir $env:JAKE_TEST_INSTALL; 'OUTCOME: installed' }
-catch { "OUTCOME: $_" }`;
+catch { "OUTCOME: $_" }
+'RUNNING: ' + (($global:JakeRunning.Keys | Sort-Object) -join ' ')
+'REGISTERED: ' + ($global:JakeRegistered -join ', ')`;
   const runner = join(at.localAppData, "..", "run.ps1");
   writeFileSync(runner, run);
   const proc = Bun.spawn(["pwsh", "-NoProfile", "-NonInteractive", "-File", runner], {
@@ -197,6 +269,7 @@ catch { "OUTCOME: $_" }`;
       LOCALAPPDATA: at.localAppData,
       JAKE_TEST_BUILD: at.build,
       JAKE_TEST_INSTALL: at.install,
+      JAKE_TEST_FAIL_MOVE: failMove,
       JAKE_INSTALL_WAIT_SECONDS: "0",
     },
     stdin: "ignore",
@@ -205,27 +278,47 @@ catch { "OUTCOME: $_" }`;
   });
   const [output, errors] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   await proc.exited;
-  const outcome = /OUTCOME: (.*)/.exec(output)?.[1] ?? "";
-  return { outcome, output: output + errors };
+  const line = (label: string) => new RegExp(`${label}: (.*)`).exec(output)?.[1] ?? "";
+  return { outcome: line("OUTCOME"), output: output + errors, running: line("RUNNING"), registered: line("REGISTERED") };
 }
 
 // Each case starts PowerShell, which takes seconds on a loaded machine.
 describe("install.ps1 -Update", () => {
-  test("a new executable that reaches the hub stays, and the previous one is dropped", async () => {
+  test("a new executable that reaches the hub stays, the previous one is dropped, and the tasks have no run-time limit", async () => {
     const at = windowsMachine("old reaches", "new reaches");
-    const { outcome, output } = await windowsUpdate(at);
+    const { outcome, output, running, registered } = await windowsUpdate(at);
     expect(outcome).toBe("installed");
     expect(output).toContain("Installed. The agent is connected to the hub.");
     expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("new reaches");
     expect(existsSync(join(at.install, "jake.previous.exe"))).toBe(false);
+    expect(running).toBe("JakeAgent JakeGuard");
+    expect(registered).toBe("JakeAgent limit 00:00:00, JakeGuard limit 00:00:00");
   }, 30_000);
 
   test("a new executable that never reaches the hub gives way to the previous one, though the log held an earlier welcome", async () => {
     const at = windowsMachine("old reaches", "new is silent");
-    const { outcome, output } = await windowsUpdate(at);
+    const { outcome, output, running } = await windowsUpdate(at);
     expect(output).toContain("! the new build did not reach the hub\n");
     expect(outcome).toBe("the update did not take; the previous build is back and connected to the hub.");
     expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("old reaches");
     expect(existsSync(join(at.install, "jake.previous.exe"))).toBe(false);
+    expect(running).toBe("JakeAgent JakeGuard");
+  }, 30_000);
+
+  test("a swap that fails leaves the previous executable in place and the agent and guard started again", async () => {
+    const at = windowsMachine("old reaches", "new reaches");
+    const { outcome, output, running } = await windowsUpdate(at, "jake.new.exe");
+    expect(outcome).toStartWith("the new build could not be put in place:");
+    expect(output).toContain("the install ended before it started the agent again, so it starts the agent and guard now");
+    expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("old reaches");
+    expect(running).toBe("JakeAgent JakeGuard");
+  }, 30_000);
+
+  test("a rollback that fails leaves the new executable in place and the agent and guard started again", async () => {
+    const at = windowsMachine("old reaches", "new is silent");
+    const { outcome, running } = await windowsUpdate(at, "jake.previous.exe");
+    expect(outcome).toStartWith("the update did not take, and the previous build could not be put back:");
+    expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("new is silent");
+    expect(running).toBe("JakeAgent JakeGuard");
   }, 30_000);
 });

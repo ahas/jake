@@ -115,22 +115,98 @@ pub fn run_key_remove_command(target: &AnchorTarget) -> Vec<String> {
   owned(&["reg", "delete", RUN_KEY, "/v", target.name, "/f"])
 }
 
-/// Create, or overwrite in place, the logon-triggered task for this run mode. It stores no credential
-/// and runs non-elevated; a boot trigger or a task that runs logged off would need an administrator.
+/// Create, or overwrite in place, the logon-triggered task for this run mode, with the settings the
+/// installer registers it with. It stores no credential and runs non-elevated; a boot trigger or a
+/// task that runs logged off would need an administrator. It starts and keeps running on battery and
+/// has no run-time limit, since Task Scheduler's default of three days would end both run modes
+/// together; `schtasks /create` cannot set either, so the task is registered through PowerShell.
 pub fn task_create_command(target: &AnchorTarget) -> Vec<String> {
-  owned(&[
-    "schtasks",
-    "/create",
-    "/tn",
-    target.name,
-    "/tr",
-    &invocation(target),
-    "/sc",
-    "onlogon",
-    "/rl",
-    "limited",
-    "/f",
-  ])
+  let mut action = format!("New-ScheduledTaskAction -Execute {}", ps_single_quote(&target.binary_path));
+  if !target.args.is_empty() {
+    action.push_str(&format!(" -Argument {}", ps_single_quote(&target.args.join(" "))));
+  }
+  let lines = [
+    format!("$action = {action}"),
+    "$trigger = New-ScheduledTaskTrigger -AtLogOn".to_owned(),
+    "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)"
+      .to_owned(),
+    "$principal = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -LogonType Interactive \
+     -RunLevel Limited"
+      .to_owned(),
+    format!(
+      "Register-ScheduledTask -TaskName {} -Action $action -Trigger $trigger -Settings $settings \
+       -Principal $principal -Force | Out-Null",
+      ps_single_quote(target.name)
+    ),
+  ];
+  powershell_command(&lines.join("\n"))
+}
+
+/// Print the definition Task Scheduler holds for this run mode's task, as XML; it fails where the task
+/// is absent. A plain query, so a tick that finds the task as it must be starts no PowerShell.
+pub fn task_query_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&["schtasks", "/query", "/tn", target.name, "/xml"])
+}
+
+/// The text `schtasks` printed. Into a pipe it prints single-byte text whatever encoding its XML
+/// declaration names; it is read as UTF-8, a byte that is not replaced, so a path outside ASCII reads
+/// as another and the task is merely registered again. UTF-16, told by a byte order mark or by the zero
+/// high byte of the first character, is read as such.
+pub fn query_text(bytes: &[u8]) -> String {
+  let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.get(1) == Some(&0);
+  let text = if utf16 {
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+    String::from_utf16_lossy(&units)
+  } else {
+    String::from_utf8_lossy(bytes).into_owned()
+  };
+  text.trim_start_matches('\u{FEFF}').to_owned()
+}
+
+/// Whether a task definition, as `schtasks /query /xml` prints it, is the one `task_create_command`
+/// registers for this run mode: a logon trigger, the action that runs this run mode, no run-time
+/// limit, and starting, and running on, battery. An element left out holds Task Scheduler's default,
+/// and a definition that cannot be read is not the one.
+pub fn task_definition_holds(xml: &str, target: &AnchorTarget) -> bool {
+  let Ok(document) = roxmltree::Document::parse(xml) else {
+    return false;
+  };
+  let task = document.root_element();
+  let Some(settings) = child(task, "Settings") else {
+    return false;
+  };
+  let logon_trigger = child(task, "Triggers").and_then(|triggers| child(triggers, "LogonTrigger"));
+  let exec = child(task, "Actions").and_then(|actions| child(actions, "Exec"));
+  let command = text(exec.and_then(|exec| child(exec, "Command")), "");
+  let arguments = text(exec.and_then(|exec| child(exec, "Arguments")), "");
+  logon_trigger.is_some()
+    && command.trim_matches('"').eq_ignore_ascii_case(&target.binary_path)
+    && arguments == target.args.join(" ")
+    && text(child(settings, "ExecutionTimeLimit"), "PT72H") == "PT0S"
+    && text(child(settings, "DisallowStartIfOnBatteries"), "true") == "false"
+    && text(child(settings, "StopIfGoingOnBatteries"), "true") == "false"
+    && text(child(settings, "StartWhenAvailable"), "false") == "true"
+}
+
+/// The child element of a task definition's element with the given name, whatever its namespace.
+fn child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
+  node.children().find(|child| child.is_element() && child.tag_name().name() == name)
+}
+
+/// An element's text, or the default an absent element stands for.
+fn text(node: Option<roxmltree::Node<'_, '_>>, default: &str) -> String {
+  node.map_or(default.to_owned(), |node| node.text().unwrap_or_default().trim().to_owned())
+}
+
+/// The command that registers this run mode's task, where the definition Task Scheduler holds for it
+/// (none where the task is absent) is not the one it must hold; none where it is.
+pub fn task_refresh_command(target: &AnchorTarget, held: Option<&str>) -> Option<Vec<String>> {
+  if held.is_some_and(|xml| task_definition_holds(xml, target)) {
+    None
+  } else {
+    Some(task_create_command(target))
+  }
 }
 
 pub fn task_remove_command(target: &AnchorTarget) -> Vec<String> {
@@ -177,15 +253,6 @@ pub fn startup_shortcut_remove_command(
 ) -> Vec<String> {
   let lnk = ps_single_quote(&startup_shortcut_path(target, env));
   powershell_command(&format!("Remove-Item -LiteralPath {lnk} -Force -ErrorAction SilentlyContinue"))
-}
-
-/// Every command that registers all three anchors of one run mode, in the order a rewrite runs them.
-pub fn anchor_register_commands(target: &AnchorTarget, env: &HashMap<String, String>) -> [Vec<String>; 3] {
-  [
-    run_key_add_command(target),
-    task_create_command(target),
-    startup_shortcut_create_command(target, env),
-  ]
 }
 
 /// Every command that removes all three anchors of one run mode.
@@ -275,6 +342,21 @@ fn launch(argv: &[String]) {
   }
 }
 
+/// How long a tick waits on Task Scheduler to print a task's definition.
+const QUERY_WITHIN: Duration = Duration::from_secs(10);
+
+/// Read the run mode's task back and register it again only where it is absent or not as it must be,
+/// so a tick that finds it in order starts nothing but the query.
+async fn refresh_task(target: AnchorTarget) {
+  let held = crate::command::output(&task_query_command(&target), QUERY_WITHIN)
+    .await
+    .ok()
+    .map(|bytes| query_text(&bytes));
+  if let Some(command) = task_refresh_command(&target, held.as_deref()) {
+    launch(&command);
+  }
+}
+
 fn epoch_ms() -> u64 {
   SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
 }
@@ -297,8 +379,9 @@ pub struct Watchdog {
 
 impl Watchdog {
   /// Tick at once — so the first heartbeat and the anchors are in place immediately — then on every
-  /// tick: refresh this process's heartbeat, rewrite every anchor, and relaunch the peer's task when
-  /// its heartbeat is missing or stale. A redundant relaunch is harmless, as the peer's lock drops it.
+  /// tick: refresh this process's heartbeat, put back every anchor that is missing or, for the task,
+  /// not as it must be, and relaunch the peer's task when its heartbeat is missing or stale. A
+  /// redundant relaunch is harmless, as the peer's lock drops it.
   pub fn start(self) -> JoinHandle<()> {
     tokio::spawn(async move {
       let mut ticks = interval_at(Instant::now(), self.tick);
@@ -318,9 +401,11 @@ impl Watchdog {
     }
     let _ = fs::write(&own, now.to_string());
     for target in install_targets(&self.install_dir) {
-      for command in anchor_register_commands(&target, &self.env) {
-        launch(&command);
+      launch(&run_key_add_command(&target));
+      if !Path::new(&startup_shortcut_path(&target, &self.env)).exists() {
+        launch(&startup_shortcut_create_command(&target, &self.env));
       }
+      tokio::spawn(refresh_task(target));
     }
 
     let peer = self.role.peer();
@@ -376,25 +461,131 @@ mod tests {
         "/f"
       ]
     );
-    assert_eq!(
-      task_create_command(&agent),
-      [
-        "schtasks",
-        "/create",
-        "/tn",
-        "JakeAgent",
-        "/tr",
-        "\"C:\\Program Files\\jake\\jake.exe\"",
-        "/sc",
-        "onlogon",
-        "/rl",
-        "limited",
-        "/f"
-      ]
+    let agent_task = decode(&task_create_command(&agent)[6]);
+    assert!(
+      agent_task
+        .contains("$action = New-ScheduledTaskAction -Execute 'C:\\Program Files\\jake\\jake.exe'\n")
     );
+    assert!(agent_task.contains("Register-ScheduledTask -TaskName 'JakeAgent' "));
+    let guard_task = decode(&task_create_command(&guard)[6]);
+    assert!(guard_task.contains("-Execute 'C:\\Program Files\\jake\\jake.exe' -Argument '--guard'\n"));
     assert_eq!(task_run_command("JakeGuard"), ["schtasks", "/run", "/tn", "JakeGuard"]);
     assert_eq!(run_key_remove_command(&agent)[..2], ["reg", "delete"]);
     assert_eq!(task_remove_command(&guard), ["schtasks", "/delete", "/tn", "JakeGuard", "/f"]);
+  }
+
+  #[test]
+  fn every_rewrite_registers_the_task_with_no_run_time_limit_and_running_on_battery() {
+    for target in install_targets("C:\\jake") {
+      let task = decode(&task_create_command(&target)[6]);
+      assert!(task.contains(
+        "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+         -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)\n"
+      ));
+      assert!(task.contains("-Settings $settings"));
+    }
+  }
+
+  const INSTALL_DIR: &str = "C:\\Users\\tester\\AppData\\Local\\Programs\\jake";
+
+  /// The guard's task as `schtasks /query /xml` printed it into a pipe on a Windows PC, once
+  /// registered the way the installer and `task_create_command` register it: single-byte text under a
+  /// declaration that names UTF-16. The user's SID and folder are replaced.
+  const REGISTERED_AS_IT_MUST_BE: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\JakeGuard</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-0-0-0-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <LogonTrigger />
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\tester\AppData\Local\Programs\jake\jake.exe</Command>
+      <Arguments>--guard</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#;
+
+  /// The agent's task as the same PC printed it once `schtasks /create` had registered it: no
+  /// run-time limit element, so the default of three days, the battery defaults, and a quoted command.
+  const REGISTERED_BY_SCHTASKS: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-11-18T10:07:34</Date>
+    <URI>\JakeAgent</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-0-0-0-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <StartBoundary>2026-11-18T10:07:00</StartBoundary>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"C:\Users\tester\AppData\Local\Programs\jake\jake.exe"</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#;
+
+  #[test]
+  fn a_task_as_it_must_be_is_not_registered_again() {
+    let [_, guard] = install_targets(INSTALL_DIR);
+    let printed = REGISTERED_AS_IT_MUST_BE.as_bytes();
+    assert_eq!(task_refresh_command(&guard, Some(&query_text(printed))), None);
+    let printed_as_utf16: Vec<u8> = [0xFF, 0xFE]
+      .into_iter()
+      .chain(REGISTERED_AS_IT_MUST_BE.encode_utf16().flat_map(u16::to_le_bytes))
+      .collect();
+    assert_eq!(task_refresh_command(&guard, Some(&query_text(&printed_as_utf16))), None);
+  }
+
+  #[test]
+  fn a_task_with_the_three_day_limit_or_none_at_all_is_registered_again() {
+    let [agent, guard] = install_targets(INSTALL_DIR);
+    let limited = REGISTERED_AS_IT_MUST_BE.replace("PT0S", "PT72H");
+    assert_eq!(task_refresh_command(&guard, Some(&limited)), Some(task_create_command(&guard)));
+    let by_schtasks = query_text(REGISTERED_BY_SCHTASKS.as_bytes());
+    assert_eq!(task_refresh_command(&agent, Some(&by_schtasks)), Some(task_create_command(&agent)));
+    assert_eq!(task_refresh_command(&guard, None), Some(task_create_command(&guard)));
   }
 
   #[test]

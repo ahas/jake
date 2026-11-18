@@ -184,23 +184,47 @@ if [ "$PRINT_CONFIG" -eq 1 ]; then
   exit 0
 fi
 
-# --- stop any running unit so its binary can be replaced -----------------------------------------
-
-step "stopping any running agent"
-systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
-
-# --- place the binary ----------------------------------------------------------------------------
-# The new binary is written beside the target and moved into place, so a still-open old inode never
+# --- stage the payload while the agent still runs --------------------------------------------------
+# Everything is fetched before the unit is stopped, so a failed download changes nothing. The new
+# binary is written beside the target and later moved into place, so a still-open old inode never
 # blocks the write. curl and cp do not carry an exec bit reliably, so it is set explicitly.
 
 step "installing to $DATA_DIR"
 mkdir -p "$DATA_DIR"
+stage="$(mktemp -d)"
+new_bin="$DATA_DIR/jake.new"
+unit_stopped=0
+
+# Once the unit is stopped, an install that ends early still leaves a binary in place and the unit
+# started again: the previous binary is put back where none is left.
+finish() {
+  local code=$?
+  [ -z "$stage" ] || rm -rf "$stage"
+  if [ "$unit_stopped" -eq 1 ]; then
+    warn "the install ended before it started the agent again, so it starts the agent now"
+    if [ ! -f "$BIN" ] && [ -f "$PREVIOUS_BIN" ]; then
+      cp -f "$PREVIOUS_BIN" "$BIN" && chmod +x "$BIN" || warn "no binary could be put in place"
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user start "$UNIT_NAME" || warn "the agent could not be started"
+  fi
+  exit "$code"
+}
+trap finish EXIT
+
+if [ -n "$src_dir" ]; then cp "$src_dir/jake" "$new_bin"; else fetch "$BASE/jake" "$new_bin"; fi
+chmod +x "$new_bin"
+place_from_payload "jake-agent.service" "$stage/jake-agent.service"
+place_from_payload "uninstall.sh" "$stage/uninstall.sh"
 if [ "$UPDATE" -eq 1 ] && [ -f "$BIN" ]; then
   cp -f "$BIN" "$PREVIOUS_BIN"
 fi
-new_bin="$DATA_DIR/jake.new"
-if [ -n "$src_dir" ]; then cp "$src_dir/jake" "$new_bin"; else fetch "$BASE/jake" "$new_bin"; fi
-chmod +x "$new_bin"
+
+# --- stop any running unit and put the binary in place ----------------------------------------------
+
+step "stopping any running agent"
+unit_stopped=1
+systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
 mv -f "$new_bin" "$BIN"
 ok "binary in place"
 
@@ -268,8 +292,8 @@ fi
 
 step "registering the systemd user service"
 mkdir -p "$UNIT_DIR"
-place_from_payload "jake-agent.service" "$UNIT"
-place_from_payload "uninstall.sh" "$DATA_DIR/uninstall.sh"
+cp "$stage/jake-agent.service" "$UNIT"
+cp "$stage/uninstall.sh" "$DATA_DIR/uninstall.sh"
 chmod +x "$DATA_DIR/uninstall.sh"
 
 systemctl --user daemon-reload
@@ -304,6 +328,7 @@ wait_for_hub() { # mark
 
 log_mark="$(log_size)"
 systemctl --user enable --now "$UNIT_NAME"
+unit_stopped=0
 ok "service enabled and started"
 
 # --- wait briefly for the agent to reach the hub ---------------------------------------------------
@@ -319,10 +344,12 @@ if [ "$UPDATE" -eq 1 ] && [ -f "$PREVIOUS_BIN" ]; then
   else
     warn "the new build did not reach the hub${failure:+: $failure}"
     step "putting the previous build back"
+    unit_stopped=1
     systemctl --user stop "$UNIT_NAME" 2>/dev/null || true
-    mv -f "$PREVIOUS_BIN" "$BIN"
+    mv -f "$PREVIOUS_BIN" "$BIN" || die "the update did not take, and the previous build could not be put back"
     log_mark="$(log_size)"
     systemctl --user start "$UNIT_NAME"
+    unit_stopped=0
     wait_for_hub "$log_mark"
     if [ "$reached" -eq 1 ]; then
       die "the update did not take; the previous build is back and connected to the hub."

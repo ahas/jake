@@ -17,6 +17,11 @@ pub const RETRY_AFTER_MS: i64 = 60 * 60 * 1000;
 const WINDOWS_TASK: &str = "JakeUpdate";
 /// The transient user unit the Linux update runs under, outside the agent's own unit.
 const LINUX_UNIT: &str = "jake-update";
+/// The agent's own user unit on Linux.
+const LINUX_AGENT_UNIT: &str = "jake-agent.service";
+/// The logon tasks of the Windows agent and its guard, which the runner starts again where the install
+/// failed with either stopped.
+const WINDOWS_PAIR_TASKS: [&str; 2] = ["JakeAgent", "JakeGuard"];
 /// How long the runner gives the agent's command to end before it stops the agent.
 const SETTLE_SECONDS: u32 = 5;
 /// How often, and how many times, the runner asks the download for the version it was ordered onto.
@@ -113,7 +118,8 @@ fn ps_quote(value: &str) -> String {
 }
 
 /// What the Linux runner does: wait for the agent's command to end, leave a machine with no installed
-/// agent alone, wait for the download to offer the build, then run the install in its update mode.
+/// agent alone, wait for the download to offer the build, then run the install in its update mode,
+/// starting the agent again where the install failed and left it stopped.
 fn linux_runner(build: &AgentBuild) -> String {
   format!(
     r#"base={base}
@@ -122,7 +128,7 @@ log="$HOME/.local/share/jake/update.log"
 say() {{ printf '%s %s\n' "$(date -Iseconds)" "$1" >> "$log"; }}
 fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; else wget -qO- "$1"; fi; }}
 sleep {SETTLE_SECONDS}
-if ! systemctl --user is-active --quiet jake-agent.service; then
+if ! systemctl --user is-active --quiet {LINUX_AGENT_UNIT}; then
   say 'no installed agent runs here, so nothing was updated'
   exit 0
 fi
@@ -149,6 +155,10 @@ bash "$installer" --update >> "$log" 2>&1
 code=$?
 rm -f "$installer"
 say "the install ended with exit $code"
+if [ "$code" -ne 0 ] && ! systemctl --user is-active --quiet {LINUX_AGENT_UNIT}; then
+  say 'the agent is not running after the failed install, so it is started again'
+  systemctl --user start {LINUX_AGENT_UNIT} >> "$log" 2>&1 || say 'the agent could not be started'
+fi
 exit "$code""#,
     base = sh_quote(&build.download_url),
     want = sh_quote(&build.version),
@@ -164,7 +174,8 @@ fn linux_command(build: &AgentBuild) -> String {
 }
 
 /// What the Windows runner does, as the Linux one, from the folder the running agent was installed
-/// in; it deletes its own task whatever happened.
+/// in, starting the agent's and the guard's tasks again where the install failed; it deletes its own
+/// task whatever happened.
 fn windows_runner(build: &AgentBuild) -> String {
   format!(
     r#"$ErrorActionPreference = 'Stop'
@@ -173,6 +184,8 @@ $want = {want}
 $log = Join-Path $env:LOCALAPPDATA 'jake\update.log'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
 function Say($message) {{ Add-Content -LiteralPath $log -Value ((Get-Date -Format o) + ' ' + $message) -Encoding UTF8 }}
+# Set once the install may have stopped the agent and the guard, and cleared once it ended well.
+$restart = $false
 try {{
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   Start-Sleep -Seconds {SETTLE_SECONDS}
@@ -192,18 +205,28 @@ try {{
   $installer = Join-Path $work 'install.ps1'
   $web.DownloadFile("$base/install.ps1", $installer)
   Say "updating $installDir to $want"
+  $restart = $true
   $ErrorActionPreference = 'Continue'
   $install = "& ([scriptblock]::Create([System.IO.File]::ReadAllText('" + $installer.Replace("'", "''") + "'))) -Update -InstallDir '" + $installDir.Replace("'", "''") + "'"
   & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ([Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($install))) 2>&1 | Out-File -LiteralPath $log -Append -Encoding UTF8
-  Say "the install ended with exit $LASTEXITCODE"
+  $code = $LASTEXITCODE
+  $restart = $code -ne 0
+  Say "the install ended with exit $code"
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }} catch {{
   Say "the update failed: $_"
 }} finally {{
+  if ($restart) {{
+    foreach ($task in {pair_tasks}) {{
+      try {{ Start-ScheduledTask -TaskName $task -ErrorAction Stop; Say "the install failed, so $task was started again" }}
+      catch {{ Say "the install failed, and $task could not be started again: $_" }}
+    }}
+  }}
   Unregister-ScheduledTask -TaskName '{WINDOWS_TASK}' -Confirm:$false -ErrorAction SilentlyContinue
 }}"#,
     base = ps_quote(&build.download_url),
     want = ps_quote(&build.version),
+    pair_tasks = WINDOWS_PAIR_TASKS.map(ps_quote).join(", "),
   )
 }
 
@@ -267,7 +290,7 @@ mod tests {
   }
 
   #[test]
-  fn a_linux_agent_is_ordered_through_its_shell_onto_a_transient_unit() {
+  fn a_linux_agent_is_ordered_through_its_shell_onto_a_transient_unit_that_restarts_a_failed_install() {
     let order = build().order("0.1.0+g0000000", &offers(&["exec:linux", "stream:22"])).expect("ordered");
     assert_eq!(order.shell, "linux");
     assert!(
@@ -277,10 +300,11 @@ mod tests {
     );
     assert!(order.command.contains("want='\\''0.1.0+gabc1234'\\''"));
     assert!(order.command.contains("bash \"$installer\" --update"));
+    assert!(order.command.contains("systemctl --user start jake-agent.service"));
   }
 
   #[test]
-  fn a_windows_agent_is_ordered_through_powershell_onto_a_task_that_deletes_itself() {
+  fn a_windows_agent_is_ordered_onto_a_task_that_restarts_a_failed_install_and_deletes_itself() {
     let order = build()
       .order("0.1.0+g0000000", &offers(&["exec:powershell", "exec:wsl"]))
       .expect("ordered");
@@ -290,6 +314,8 @@ mod tests {
     assert!(order.command.contains("$want = '0.1.0+gabc1234'"));
     assert!(order.command.contains(") -Update -InstallDir '"));
     assert!(order.command.contains("Unregister-ScheduledTask -TaskName 'JakeUpdate'"));
+    assert!(order.command.contains("foreach ($task in 'JakeAgent', 'JakeGuard')"));
+    assert!(order.command.contains("Start-ScheduledTask -TaskName $task"));
   }
 
   #[test]

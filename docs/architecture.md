@@ -208,8 +208,12 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   process rewrites the file that records its own liveness and reads the file its peer keeps; a peer
   whose timestamp is older than the staleness threshold — or whose file is missing — reads as dead,
   so a hung peer that never exited is brought back just as a crashed one is. A process finding its
-  peer stale relaunches it; every process, on every tick, rewrites all the autostart anchors, so the
-  wipe of any single anchor is repaired within one tick as long as either process is alive.
+  peer stale relaunches it; every process, on every tick, puts back every autostart anchor that is
+  missing, so the wipe of any single anchor is repaired within one tick as long as either process is
+  alive. A tick stays cheap: the run entry is rewritten in place, the Startup shortcut is written only
+  where it is missing, and the scheduled task is read back with a plain query and registered again,
+  which takes PowerShell, only where it is missing or its definition differs from the one it must
+  hold.
 - The relaunch runs the peer's scheduled task rather than spawning the peer directly. The Task
   Scheduler service starts the peer on the caller's behalf, so the relaunched peer is not the
   caller's child and shares no teardown boundary with it — the independence the pair depends on. A
@@ -227,6 +231,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   boot. On a machine without auto-logon those are different events, and the gap between them is
   unbounded until someone logs in. Boot-time recovery, or a task that runs whether the user is logged
   on or not, would need an administrator account the install may not have, so neither is used.
+- The scheduled task has no run-time limit, and starts and keeps running on battery. Task
+  Scheduler's default limit of three days would end both processes together, since they are started
+  together, and nothing but the next logon would bring them back. The installer registers the task
+  with these settings, and a tick that reads back other settings, the defaults among them, registers
+  it again with these.
 - Because all three anchors for a run mode fire at the same logon, a single logon would otherwise
   start three copies of it. A single-instance guard prevents that: each run mode takes an exclusive
   lock on startup, and only the copy that takes it runs while the rest exit. The lock is a file created
@@ -510,7 +519,17 @@ after a fault, and returns at sign-in only where the person turned that on (docs
 - The runner installs exactly as a person re-running the install would, in the install's update mode:
   it stops the agent, replaces the binary, refreshes every registration, starts it again, and keeps
   the config. The new build must come back attached, so that mode keeps the previous binary until the
-  new one reports a connection and puts it back where none comes, ending with an error.
+  new one reports a connection and puts it back where none comes, ending with an error. On Windows
+  the wait counts from the new build's first log line, so a build whose launch is held up, as a first
+  scan of a newly written executable may hold it, is not taken for one that cannot reach the hub.
+- An update never ends with the agent stopped. Whatever fails once the install has stopped it, the
+  swap, a registration or the rollback, the install leaves an executable in place and starts the agent
+  again before it ends, on Windows the guard with it. On Linux everything is downloaded before the
+  unit is stopped. On Windows the install waits until the stopped processes have exited, since a
+  killed process holds its executable, and its task's instance refuses a new start, until it has; and
+  it never overwrites the executable but renames the one in place aside first, which Windows allows
+  even while that file still runs, and renames it back where the swap fails. The runner starts the
+  agent, and on Windows the guard, once more whenever the install ends in failure.
 - A deployment restarts the hub before it publishes the agent build, so an agent can be ordered onto a
   build the download does not offer yet. The runner therefore waits, bounded, until the published
   version is the one it was ordered onto, and changes nothing when it never is.

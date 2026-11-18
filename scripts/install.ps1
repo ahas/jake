@@ -46,7 +46,8 @@
 
 .PARAMETER Update
   An unattended update: never prompt, and put the previous executable back where the new one does not
-  reach the hub, ending with an error.
+  reach the hub, ending with an error. Whatever fails once the pair is stopped, the install leaves an
+  executable in place and starts the pair again before it ends.
 #>
 [CmdletBinding()]
 param(
@@ -73,10 +74,19 @@ $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $StartupDir = [Environment]::GetFolderPath('Startup')
 $LogPath = Join-Path $env:LOCALAPPDATA 'jake\agent.log'
 $PreviousBinary = 'jake.previous.exe'
-# How long the agent is given to report reaching the hub: longer for an update, which puts the previous
-# executable back where the new one does not. JAKE_INSTALL_WAIT_SECONDS sets it outright.
+$IncomingBinary = 'jake.new.exe'
+# How long the agent is given to report reaching the hub once it has written its first line, and how
+# long to write that line: longer for an update, which puts the previous executable back where the new
+# one does not, and whose freshly written executable may be held at its launch by a first scan.
+# JAKE_INSTALL_WAIT_SECONDS sets both outright.
 $WaitSeconds = if ($Update) { 30 } else { 15 }
-if ($env:JAKE_INSTALL_WAIT_SECONDS) { $WaitSeconds = [int]$env:JAKE_INSTALL_WAIT_SECONDS }
+$StartSeconds = if ($Update) { 120 } else { 15 }
+if ($env:JAKE_INSTALL_WAIT_SECONDS) {
+  $WaitSeconds = [int]$env:JAKE_INSTALL_WAIT_SECONDS
+  $StartSeconds = $WaitSeconds
+}
+# How long a stopped process is given to exit.
+$ExitSeconds = 120
 
 function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  $msg" -ForegroundColor Green }
@@ -159,144 +169,73 @@ $HubUrl    = Resolve-Value $HubUrl    'JAKE_HUB_URL'    'Hub URL' -fallback $Def
 $Secret    = Resolve-Value $Secret    'JAKE_SECRET'     'Shared secret' -secret
 $AgentName = Resolve-Value $AgentName 'JAKE_AGENT_NAME' 'Agent name'
 
-# --- stop any running pair (a running exe cannot be overwritten) ---------------------------------
+# --- the pair, the executable and the anchors ---------------------------------------------------
 
-Write-Step "stopping any running agent"
-Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
-  try { $_ | Stop-Process -Force } catch { }
-}
-Start-Sleep -Milliseconds 500
-
-# --- copy the payload into place ----------------------------------------------------------------
-
-Write-Step "installing to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$Previous = Join-Path $InstallDir $PreviousBinary
-if ($Update -and (Test-Path (Join-Path $InstallDir $Binary))) {
-  Copy-Item -LiteralPath (Join-Path $InstallDir $Binary) -Destination $Previous -Force
-}
-foreach ($name in @($Binary, 'agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
-  $src = Join-Path $Payload $name
-  if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
-}
 $Exe = Join-Path $InstallDir $Binary
-Write-Ok "executable in place"
+$Previous = Join-Path $InstallDir $PreviousBinary
+$Incoming = Join-Path $InstallDir $IncomingBinary
 
-if ($TempPayload -and (Test-Path $TempPayload)) {
-  Remove-Item -LiteralPath $TempPayload -Recurse -Force -ErrorAction SilentlyContinue
+# Whether the pair is stopped and not yet started again, which an install must never end with; held in
+# a table so the functions below change the one the script reads, whatever scope the script runs in.
+$Pair = @{ Down = $false }
+
+# Stop every jake process and wait for each to exit: a killed process holds its executable, and its
+# task's instance refuses a new start, until it has exited, which Stop-Process does not wait for.
+function Stop-Pair {
+  $Pair.Down = $true
+  $running = @(Get-Process -Name 'jake' -ErrorAction SilentlyContinue)
+  foreach ($process in $running) { try { $process | Stop-Process -Force } catch { } }
+  foreach ($process in $running) { try { $null = $process.WaitForExit($ExitSeconds * 1000) } catch { } }
 }
 
-# --- write agent.env, preserving any existing tuning keys ---------------------------------------
-
-Write-Step "writing agent.env"
-$envPath = Join-Path $InstallDir 'agent.env'
-if (Test-Path $envPath) {
-  $lines = [System.Collections.Generic.List[string]](Get-Content -LiteralPath $envPath)
-} else {
-  $lines = [System.Collections.Generic.List[string]]@(
-    '# jake agent configuration, written by the installer. The three required keys below are set;',
-    '# every other key falls back to its built-in default. See agent.env.example for the full list.')
-}
-function Set-EnvKey([System.Collections.Generic.List[string]]$lines, $key, $value) {
-  for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i].TrimStart().StartsWith("$key=")) { $lines[$i] = "$key=$value"; return }
-  }
-  $lines.Add("$key=$value")
-}
-Set-EnvKey $lines 'JAKE_HUB_URL' $HubUrl
-Set-EnvKey $lines 'JAKE_SECRET' $Secret
-Set-EnvKey $lines 'JAKE_AGENT_NAME' $AgentName
-if ($StreamPorts) { Set-EnvKey $lines 'JAKE_STREAM_PORTS' $StreamPorts }
-# Windows PowerShell's UTF8 encoding writes a byte order mark, so the file is written through .NET
-# without one; .NET resolves a relative path against the process directory, so it gets the full path.
-$envFullPath = Join-Path (Resolve-Path -LiteralPath $InstallDir).ProviderPath 'agent.env'
-[System.IO.File]::WriteAllLines($envFullPath, $lines, (New-Object System.Text.UTF8Encoding $false))
-Write-Ok "config written (credential stays on this machine only)"
-
-# --- the SSH side of a byte stream: the key it logs in with, and an sshd to answer -----------------
-
-if ($SshKey) {
-  Write-Step "adding the SSH key to ~\.ssh\authorized_keys"
-  $sshDir = Join-Path $env:USERPROFILE '.ssh'
-  $keys = Join-Path $sshDir 'authorized_keys'
-  New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
-  if ((Test-Path $keys) -and ((Get-Content -LiteralPath $keys) -contains $SshKey)) {
-    Write-Ok "the key was already there"
-  } else {
-    Add-Content -LiteralPath $keys -Value $SshKey -Encoding ascii
-    Write-Ok "key added"
-  }
-  # OpenSSH reads an administrator's keys from one machine-wide file instead, which needs elevation.
-  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator) -or
-    ((whoami /groups) -match 'S-1-5-32-544')
-  if ($admin) {
-    Write-Warn2 "this account is an administrator, so OpenSSH reads its keys from C:\ProgramData\ssh\administrators_authorized_keys; add the key there from an elevated PowerShell (see INSTALL.md)."
-  }
-}
-
-$ports = Get-EnvValue $envPath 'JAKE_STREAM_PORTS'
-if (-not $ports) { $ports = '22' }
-if ($ports -ne 'none') {
-  foreach ($port in $ports.Split(',')) {
-    $probe = New-Object System.Net.Sockets.TcpClient
-    try { $answered = $probe.ConnectAsync('127.0.0.1', [int]$port).Wait(1000) } catch { $answered = $false } finally { $probe.Dispose() }
-    if (-not $answered) {
-      Write-Warn2 "nothing answers on port $port here, so a stream to it will fail. For ssh, install and start the OpenSSH server (see INSTALL.md)."
+# Start both run modes through their logon tasks, as the watchdog relaunches a peer, so Task Scheduler
+# owns both and they outlive whatever ran this install, a scheduled update among them. A run mode whose
+# task cannot be started is launched directly instead.
+function Start-Pair {
+  foreach ($run in @(@{ Task = $AgentAnchor; Arguments = '' }, @{ Task = $GuardAnchor; Arguments = $GuardFlag })) {
+    try {
+      Start-ScheduledTask -TaskName $run.Task
+    } catch {
+      Write-Warn2 "the $($run.Task) task could not be started ($_), so it is launched directly"
+      if ($run.Arguments) {
+        Start-Process -FilePath $Exe -ArgumentList $run.Arguments -WorkingDirectory $InstallDir
+      } else {
+        Start-Process -FilePath $Exe -WorkingDirectory $InstallDir
+      }
     }
   }
+  $Pair.Down = $false
 }
 
-# --- register the three anchors for both run modes ----------------------------------------------
-# These mirror the agent's own anchor commands exactly, so the watchdog's per-tick rewrite keeps the
-# same registrations rather than competing with them: a per-user Run value, a logon-triggered scheduled
-# task with no stored credentials at the limited run level, and a Startup-folder shortcut. All three
-# are per-user and need no elevation. Overwriting in place is what makes a re-run add no duplicates.
-# The guard run mode launches the same exe with the guard flag.
-
-function Register-Anchor($name, $exe, $arguments, $workingDir) {
-  # Run key: value data is the quoted exe path plus any argument, as the watchdog writes it. The key
-  # itself is created only if absent — it normally already holds other apps' entries, which stay.
-  if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
-  $data = if ($arguments) { '"' + $exe + '" ' + $arguments } else { '"' + $exe + '"' }
-  New-ItemProperty -Path $RunKey -Name $name -Value $data -PropertyType String -Force | Out-Null
-
-  # Scheduled task: logon-triggered, self-owned (current user, interactive token, no stored
-  # password), limited run level. Equivalent to `schtasks /create /sc onlogon /rl limited /f`, which
-  # the watchdog uses to maintain it and `schtasks /run` to relaunch it; created here via the cmdlets
-  # to pass the exe path and argument as values rather than through fragile native-command quoting.
-  if ($arguments) {
-    $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
-  } else {
-    $action = New-ScheduledTaskAction -Execute $exe
+# Put the file at $source in $target's place. The file in place is renamed aside rather than
+# overwritten, which Windows allows even while that file still runs, and is renamed back where the move
+# fails, so $target is never left empty.
+function Replace-File($source, $target) {
+  $aside = $null
+  if (Test-Path -LiteralPath $target) {
+    $aside = "$target." + [System.Guid]::NewGuid().ToString('N') + '.old'
+    Move-Item -LiteralPath $target -Destination $aside
   }
-  $trigger = New-ScheduledTaskTrigger -AtLogOn
-  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-  Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-
-  # Startup shortcut: built through WScript.Shell, the same way the watchdog builds it.
-  $lnk = Join-Path $StartupDir "$name.lnk"
-  $shell = New-Object -ComObject WScript.Shell
-  $sc = $shell.CreateShortcut($lnk)
-  $sc.TargetPath = $exe
-  if ($arguments) { $sc.Arguments = $arguments }
-  $sc.WorkingDirectory = $workingDir
-  $sc.Save()
+  try {
+    Move-Item -LiteralPath $source -Destination $target
+  } catch {
+    if ($aside) { Move-Item -LiteralPath $aside -Destination $target }
+    throw
+  }
+  if ($aside) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Step "registering autostart anchors"
-Register-Anchor $AgentAnchor $Exe '' $InstallDir
-Register-Anchor $GuardAnchor $Exe $GuardFlag $InstallDir
-Write-Ok "anchors registered for the agent and the guard"
-
-# --- start the pair and verify it reached the hub -----------------------------------------------
-# The pair is started through its own logon tasks, as the watchdog relaunches a peer, so Task Scheduler
-# owns both and they outlive whatever ran this install, a scheduled update among them.
-
-function Start-Pair {
-  Start-ScheduledTask -TaskName $AgentAnchor
-  Start-ScheduledTask -TaskName $GuardAnchor
+# Leave an executable in place where a failed swap left none: the previous build where there is one,
+# else the incoming one, copied so the file it comes from stays whatever stopped it from moving.
+function Restore-Executable {
+  if (Test-Path -LiteralPath $Exe) { return }
+  foreach ($candidate in @($Previous, $Incoming)) {
+    if (Test-Path -LiteralPath $candidate) {
+      Copy-Item -LiteralPath $candidate -Destination $Exe -Force
+      return
+    }
+  }
 }
 
 function Get-LogSize {
@@ -304,55 +243,210 @@ function Get-LogSize {
   return 0
 }
 
-# Read what the log gained since the mark for up to $WaitSeconds: whether the agent reached the hub, or why not.
+# What the log gained since the mark; a log shorter than the mark was rotated, and is read whole.
+function Read-LogSince($logMark) {
+  if (-not (Test-Path $LogPath)) { return '' }
+  $fs = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
+  try {
+    if ($fs.Length -ge $logMark) { $fs.Position = $logMark }
+    $reader = New-Object System.IO.StreamReader($fs)
+    return $reader.ReadToEnd()
+  } finally { $fs.Close() }
+}
+
+# Read what the log gains since the mark: whether the agent reached the hub, or why not. The agent is
+# given $StartSeconds to write its first line, and $WaitSeconds from that line to reach the hub.
 function Wait-ForHub($logMark) {
   $failure = $null
-  for ($i = 0; $i -le $WaitSeconds; $i++) {
+  $startedAt = $null
+  for ($i = 0; ; $i++) {
     if ($i -gt 0) { Start-Sleep -Seconds 1 }
-    if (-not (Test-Path $LogPath)) { continue }
-    $fs = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-      # A log shorter than the mark was rotated, and is read whole; one that has not grown holds nothing new.
-      if ($fs.Length -ge $logMark) { $fs.Position = $logMark }
-      $reader = New-Object System.IO.StreamReader($fs)
-      $tail = $reader.ReadToEnd()
-    } finally { $fs.Close() }
+    $tail = Read-LogSince $logMark
     if ($tail -match '"event":"welcomed"') { return @{ Reached = $true; Failure = $null } }
-    elseif ($tail -match '"event":"rejected"') { return @{ Reached = $false; Failure = "the hub rejected the agent (the shared secret or the agent name is wrong)" } }
-    elseif ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
+    if ($tail -match '"event":"rejected"') { return @{ Reached = $false; Failure = "the hub rejected the agent (the shared secret or the agent name is wrong)" } }
+    if ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
+    if ($null -eq $startedAt -and $tail -match '"event":"agent-starting"') { $startedAt = $i }
+    $limit = if ($null -ne $startedAt) { $startedAt + $WaitSeconds } else { $StartSeconds }
+    if ($i -ge $limit) { break }
   }
+  if ($null -eq $startedAt) { $failure = "the agent did not start within $StartSeconds seconds" }
   return @{ Reached = $false; Failure = $failure }
 }
 
-Write-Step "starting the agent and guard"
-$logMark = Get-LogSize
-Start-Pair
+# --- stage the payload beside the executable, while the pair still runs ---------------------------
 
-Write-Step "waiting for the agent to reach the hub"
-$outcome = Wait-ForHub $logMark
-$reached = $outcome.Reached
-$failure = $outcome.Failure
+Write-Step "installing to $InstallDir"
+# An executable renamed aside by an earlier install is removed once nothing runs it any more.
+Get-ChildItem -LiteralPath $InstallDir -Filter "$Binary.*.old" -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+Copy-Item -LiteralPath (Join-Path $Payload $Binary) -Destination $Incoming -Force
+if ($Update -and (Test-Path -LiteralPath $Exe)) {
+  Copy-Item -LiteralPath $Exe -Destination $Previous -Force
+}
+foreach ($name in @('agent.env.example', 'uninstall.ps1', 'INSTALL.md')) {
+  $src = Join-Path $Payload $name
+  if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $InstallDir -Force }
+}
+if ($TempPayload -and (Test-Path $TempPayload)) {
+  Remove-Item -LiteralPath $TempPayload -Recurse -Force -ErrorAction SilentlyContinue
+}
 
-# An update must leave the machine attached: a new executable that does not reach the hub gives way to
-# the previous one, and the update fails.
-if ($Update -and (Test-Path $Previous)) {
-  if ($reached) {
-    Remove-Item -LiteralPath $Previous -Force -ErrorAction SilentlyContinue
+# From here the pair is stopped, and whatever fails, the install ends with an executable in place and the
+# pair started again.
+try {
+  Write-Step "stopping any running agent"
+  Stop-Pair
+
+  try {
+    Replace-File $Incoming $Exe
+  } catch {
+    throw "the new build could not be put in place: $_"
+  }
+  Write-Ok "executable in place"
+
+  # --- write agent.env, preserving any existing tuning keys -------------------------------------
+
+  Write-Step "writing agent.env"
+  $envPath = Join-Path $InstallDir 'agent.env'
+  if (Test-Path $envPath) {
+    $lines = [System.Collections.Generic.List[string]](Get-Content -LiteralPath $envPath)
   } else {
-    Write-Warn2 ("the new build did not reach the hub" + $(if ($failure) { ": $failure" } else { "" }))
-    Write-Step "putting the previous build back"
-    Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
-      try { $_ | Stop-Process -Force } catch { }
+    $lines = [System.Collections.Generic.List[string]]@(
+      '# jake agent configuration, written by the installer. The three required keys below are set;',
+      '# every other key falls back to its built-in default. See agent.env.example for the full list.')
+  }
+  function Set-EnvKey([System.Collections.Generic.List[string]]$lines, $key, $value) {
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+      if ($lines[$i].TrimStart().StartsWith("$key=")) { $lines[$i] = "$key=$value"; return }
     }
-    Start-Sleep -Milliseconds 500
-    Move-Item -LiteralPath $Previous -Destination $Exe -Force
-    $logMark = Get-LogSize
-    Start-Pair
-    $outcome = Wait-ForHub $logMark
-    if ($outcome.Reached) {
-      throw "the update did not take; the previous build is back and connected to the hub."
+    $lines.Add("$key=$value")
+  }
+  Set-EnvKey $lines 'JAKE_HUB_URL' $HubUrl
+  Set-EnvKey $lines 'JAKE_SECRET' $Secret
+  Set-EnvKey $lines 'JAKE_AGENT_NAME' $AgentName
+  if ($StreamPorts) { Set-EnvKey $lines 'JAKE_STREAM_PORTS' $StreamPorts }
+  # Windows PowerShell's UTF8 encoding writes a byte order mark, so the file is written through .NET
+  # without one; .NET resolves a relative path against the process directory, so it gets the full path.
+  $envFullPath = Join-Path (Resolve-Path -LiteralPath $InstallDir).ProviderPath 'agent.env'
+  [System.IO.File]::WriteAllLines($envFullPath, $lines, (New-Object System.Text.UTF8Encoding $false))
+  Write-Ok "config written (credential stays on this machine only)"
+
+  # --- the SSH side of a byte stream: the key it logs in with, and an sshd to answer -------------
+
+  if ($SshKey) {
+    Write-Step "adding the SSH key to ~\.ssh\authorized_keys"
+    $sshDir = Join-Path $env:USERPROFILE '.ssh'
+    $keys = Join-Path $sshDir 'authorized_keys'
+    New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+    if ((Test-Path $keys) -and ((Get-Content -LiteralPath $keys) -contains $SshKey)) {
+      Write-Ok "the key was already there"
+    } else {
+      Add-Content -LiteralPath $keys -Value $SshKey -Encoding ascii
+      Write-Ok "key added"
     }
-    throw "the update did not take; the previous build is back but has not connected yet: $($outcome.Failure)"
+    # OpenSSH reads an administrator's keys from one machine-wide file instead, which needs elevation.
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+      [Security.Principal.WindowsBuiltInRole]::Administrator) -or
+      ((whoami /groups) -match 'S-1-5-32-544')
+    if ($admin) {
+      Write-Warn2 "this account is an administrator, so OpenSSH reads its keys from C:\ProgramData\ssh\administrators_authorized_keys; add the key there from an elevated PowerShell (see INSTALL.md)."
+    }
+  }
+
+  $ports = Get-EnvValue $envPath 'JAKE_STREAM_PORTS'
+  if (-not $ports) { $ports = '22' }
+  if ($ports -ne 'none') {
+    foreach ($port in $ports.Split(',')) {
+      $probe = New-Object System.Net.Sockets.TcpClient
+      try { $answered = $probe.ConnectAsync('127.0.0.1', [int]$port).Wait(1000) } catch { $answered = $false } finally { $probe.Dispose() }
+      if (-not $answered) {
+        Write-Warn2 "nothing answers on port $port here, so a stream to it will fail. For ssh, install and start the OpenSSH server (see INSTALL.md)."
+      }
+    }
+  }
+
+  # --- register the three anchors for both run modes --------------------------------------------
+  # These mirror the agent's own anchor commands exactly, so the watchdog's per-tick rewrite keeps the
+  # same registrations rather than competing with them: a per-user Run value, a logon-triggered
+  # scheduled task with no stored credentials at the limited run level, and a Startup-folder shortcut.
+  # All three are per-user and need no elevation. Overwriting in place is what makes a re-run add no
+  # duplicates. The guard run mode launches the same exe with the guard flag.
+
+  function Register-Anchor($name, $exe, $arguments, $workingDir) {
+    # Run key: value data is the quoted exe path plus any argument, as the watchdog writes it. The key
+    # itself is created only if absent — it normally already holds other apps' entries, which stay.
+    if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
+    $data = if ($arguments) { '"' + $exe + '" ' + $arguments } else { '"' + $exe + '"' }
+    New-ItemProperty -Path $RunKey -Name $name -Value $data -PropertyType String -Force | Out-Null
+
+    # Scheduled task: logon-triggered, self-owned (current user, interactive token, no stored
+    # password), limited run level, starting and running on battery and with no run-time limit, since
+    # the default of three days would end both run modes together. The exe path and argument pass as
+    # values rather than through fragile native-command quoting.
+    if ($arguments) {
+      $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
+    } else {
+      $action = New-ScheduledTaskAction -Execute $exe
+    }
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+
+    # Startup shortcut: built through WScript.Shell, the same way the watchdog builds it.
+    $lnk = Join-Path $StartupDir "$name.lnk"
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($lnk)
+    $sc.TargetPath = $exe
+    if ($arguments) { $sc.Arguments = $arguments }
+    $sc.WorkingDirectory = $workingDir
+    $sc.Save()
+  }
+
+  Write-Step "registering autostart anchors"
+  Register-Anchor $AgentAnchor $Exe '' $InstallDir
+  Register-Anchor $GuardAnchor $Exe $GuardFlag $InstallDir
+  Write-Ok "anchors registered for the agent and the guard"
+
+  # --- start the pair and verify it reached the hub ---------------------------------------------
+
+  Write-Step "starting the agent and guard"
+  $logMark = Get-LogSize
+  Start-Pair
+
+  Write-Step "waiting for the agent to reach the hub"
+  $outcome = Wait-ForHub $logMark
+  $reached = $outcome.Reached
+  $failure = $outcome.Failure
+
+  # An update must leave the machine attached: a new executable that does not reach the hub gives way
+  # to the previous one, and the update fails.
+  if ($Update -and (Test-Path $Previous)) {
+    if ($reached) {
+      Remove-Item -LiteralPath $Previous -Force -ErrorAction SilentlyContinue
+    } else {
+      Write-Warn2 ("the new build did not reach the hub" + $(if ($failure) { ": $failure" } else { "" }))
+      Write-Step "putting the previous build back"
+      Stop-Pair
+      try {
+        Replace-File $Previous $Exe
+      } catch {
+        throw "the update did not take, and the previous build could not be put back: $_"
+      }
+      $logMark = Get-LogSize
+      Start-Pair
+      $outcome = Wait-ForHub $logMark
+      if ($outcome.Reached) {
+        throw "the update did not take; the previous build is back and connected to the hub."
+      }
+      throw "the update did not take; the previous build is back but has not connected yet: $($outcome.Failure)"
+    }
+  }
+} finally {
+  if ($Pair.Down) {
+    Write-Warn2 "the install ended before it started the agent again, so it starts the agent and guard now"
+    try { Restore-Executable } catch { Write-Warn2 "no executable could be put in place: $_" }
+    try { Start-Pair } catch { Write-Warn2 "the agent and guard could not be started: $_" }
   }
 }
 

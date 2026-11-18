@@ -92,9 +92,11 @@ into both binaries.
 ## Windows: how far it comes back on its own
 
 - Two programs — the agent and a small guard — watch each other. When one dies or hangs the other
-  brings it back, and every minute both rewrite the three autostart anchors: a logon scheduled task, a
-  registry Run value, and a Startup-folder shortcut. A deleted anchor is restored within a minute as
-  long as either program is alive.
+  brings it back, and every minute both check the three autostart anchors: a logon scheduled task, a
+  registry Run value, and a Startup-folder shortcut. A deleted anchor, or a task whose settings were
+  changed, is restored within a minute as long as either program is alive.
+- The scheduled tasks have no run-time limit and run on battery, so Task Scheduler never ends the
+  pair on its own after a few days.
 - All three anchors belong to **this user account**. They register without administrator rights, and
   so they fire when **this account logs on**, not at boot itself.
 - If both programs die together and the anchors are wiped as well, jake comes back at **this
@@ -213,8 +215,13 @@ each attached agent that runs another build onto it:
   the agent, replaces the binary, refreshes the registrations, starts it again and keeps the config.
   It does nothing on a machine where no installed agent runs, as with the desktop app's built-in one.
 - In update mode the install keeps the previous binary until the new one reaches the hub. Where the
-  new build reports no connection within thirty seconds, it puts the previous binary back, starts it
-  again and ends with an error, so the machine stays attached.
+  new build reports no connection within thirty seconds of starting, it puts the previous binary
+  back, starts it again and ends with an error, so the machine stays attached. On Windows a build
+  whose start is held up is given up to two minutes to start before those thirty seconds count.
+- Whatever else fails once the agent is stopped, a download, the swap of the binary, a registration
+  or putting the previous binary back, the install still leaves a binary in place and starts the
+  agent again, on Windows the guard with it, before it ends with an error. The runner starts them
+  once more where the install itself ended in failure.
 - What the runner did is written to `update.log` beside the agent's own log. The hub writes a line to
   its log for each order and how the command ended, and does not order the same agent again for an
   hour.
