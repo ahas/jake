@@ -1,4 +1,4 @@
-// The bundled status page: draws the app's status and asks the app's three commands.
+// The bundled status page: draws the app's status and asks the app's commands.
 
 const invoke = (command) => window.__TAURI_INTERNALS__.invoke(command);
 const element = (id) => document.getElementById(id);
@@ -55,5 +55,6 @@ function wire(id, command) {
 
 wire("console", "console");
 wire("retry", "retry");
+wire("settings", "open_settings");
 refresh();
 setInterval(refresh, REFRESH_MS);

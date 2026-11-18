@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "jake-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "jake-agent",
@@ -2162,6 +2162,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

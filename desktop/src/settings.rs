@@ -1,49 +1,223 @@
-// The app's own settings: the console's address, from settings.json in the app's config directory.
+// The app's own settings, kept in settings.json in the app's config directory.
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use url::Url;
 
 /// The console the deployment serves, which the window opens unless the settings name another.
 pub const DEFAULT_CONSOLE_URL: &str = "https://ai.example.org/bmo/";
+const CONSOLE_KEY: &str = "consoleUrl";
+const FILE_NAME: &str = "settings.json";
 
-#[derive(Default, Deserialize)]
+/// A setting a person turns on or off on the settings screen, named in the file by its camelCase key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct File {
-  console_url: Option<String>,
+pub enum Switch {
+  KeepControlWhileLocked,
+  CloseToTray,
+  StartAtSignIn,
+  StartInTray,
+  KeepAwake,
+}
+
+impl Switch {
+  /// Every switch, in the order the screen shows them.
+  pub const ALL: [Self; 5] = [
+    Self::KeepControlWhileLocked,
+    Self::CloseToTray,
+    Self::StartAtSignIn,
+    Self::StartInTray,
+    Self::KeepAwake,
+  ];
+
+  /// The value a switch the file does not name runs on.
+  pub fn default_on(self) -> bool {
+    match self {
+      Self::KeepControlWhileLocked | Self::CloseToTray => true,
+      Self::StartAtSignIn | Self::StartInTray | Self::KeepAwake => false,
+    }
+  }
+
+  /// Whether this platform acts on the switch: the lock and the system's sleep are read on Windows
+  /// alone.
+  pub fn offered(self) -> bool {
+    match self {
+      Self::KeepControlWhileLocked | Self::KeepAwake => cfg!(windows),
+      Self::CloseToTray | Self::StartAtSignIn | Self::StartInTray => true,
+    }
+  }
+
+  fn key(self) -> String {
+    match serde_json::to_value(self) {
+      Ok(Value::String(key)) => key,
+      _ => unreachable!("a unit variant serializes as its name"),
+    }
+  }
+}
+
+/// The switches as the file states them; one it does not state runs on its default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Switches(BTreeMap<Switch, bool>);
+
+impl Switches {
+  /// Whether the switch is on.
+  pub fn on(&self, switch: Switch) -> bool {
+    self.stated(switch).unwrap_or_else(|| switch.default_on())
+  }
+
+  /// The value the file states, if it states one.
+  pub fn stated(&self, switch: Switch) -> Option<bool> {
+    self.0.get(&switch).copied()
+  }
+
+  /// The same switches with this one stated.
+  pub fn with(mut self, switch: Switch, on: bool) -> Self {
+    self.0.insert(switch, on);
+    self
+  }
+}
+
+/// The settings as the settings page draws them: the switches this platform offers, and why the file
+/// cannot be changed, where it cannot.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsView {
+  pub switches: Vec<SwitchView>,
+  pub unreadable: Option<String>,
+}
+
+/// One switch on the settings page.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchView {
+  pub switch: Switch,
+  pub on: bool,
+}
+
+impl Switches {
+  /// The page's view of these switches, with the file's reason where it cannot be read.
+  pub fn view(&self, unreadable: Option<&str>) -> SettingsView {
+    let offered = Switch::ALL.into_iter().filter(|switch| switch.offered());
+    SettingsView {
+      switches: offered
+        .map(|switch| SwitchView {
+          switch,
+          on: self.on(switch),
+        })
+        .collect(),
+      unreadable: unreadable.map(str::to_owned),
+    }
+  }
 }
 
 /// What the app runs with.
+#[derive(Clone, Debug)]
 pub struct Settings {
   /// The console's address, ending in a slash so its API paths join onto it.
   pub console: Url,
+  pub switches: Switches,
 }
 
 impl Settings {
-  /// The settings kept in `dir`, the defaults where no file is kept; a file that cannot be read is an
-  /// error naming it.
-  pub fn read(dir: &Path) -> Result<Self, String> {
-    let path = dir.join("settings.json");
-    let file: File = match std::fs::read(&path) {
-      Ok(bytes) => {
-        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?
-      }
-      Err(error) if error.kind() == ErrorKind::NotFound => File::default(),
-      Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    let console = console_url(file.console_url.as_deref().unwrap_or(DEFAULT_CONSOLE_URL))?;
-    Ok(Self { console })
-  }
-
   /// The settings a fresh install runs with.
   pub fn defaults() -> Self {
     Self {
       console: console_url(DEFAULT_CONSOLE_URL).expect("the default console address is well-formed"),
+      switches: Switches::default(),
     }
   }
+
+  fn from_document(document: &Map<String, Value>) -> Result<Self, String> {
+    let console = match document.get(CONSOLE_KEY) {
+      None => DEFAULT_CONSOLE_URL,
+      Some(Value::String(raw)) => raw,
+      Some(_) => return Err(format!("{CONSOLE_KEY} is not a string")),
+    };
+    let mut switches = Switches::default();
+    for switch in Switch::ALL {
+      let key = switch.key();
+      match document.get(&key) {
+        None => {}
+        Some(Value::Bool(on)) => switches = switches.with(switch, *on),
+        Some(_) => return Err(format!("{key} is not true or false")),
+      }
+    }
+    Ok(Self {
+      console: console_url(console)?,
+      switches,
+    })
+  }
+}
+
+/// The settings file: what it held as read, every key the app does not know among it, or why it could
+/// not be read, in which case the app runs on its defaults and writes nothing over it.
+pub struct SettingsFile {
+  path: PathBuf,
+  kept: Result<(Map<String, Value>, Settings), String>,
+}
+
+impl SettingsFile {
+  /// The file in `dir`; a missing file reads as an empty one.
+  pub fn open(dir: &Path) -> Self {
+    let path = dir.join(FILE_NAME);
+    let kept = read(&path).map_err(|reason| format!("{}: {reason}", path.display()));
+    Self { path, kept }
+  }
+
+  /// The settings the app runs with: the file's, or the defaults where it cannot be read.
+  pub fn settings(&self) -> Settings {
+    match &self.kept {
+      Ok((_, settings)) => settings.clone(),
+      Err(_) => Settings::defaults(),
+    }
+  }
+
+  /// Why the file cannot be read, where it cannot.
+  pub fn unreadable(&self) -> Option<&str> {
+    self.kept.as_ref().err().map(String::as_str)
+  }
+
+  /// State a switch and write the whole file at once, keeping every other key as it was read; the
+  /// switches as they now stand.
+  pub fn set(&mut self, switch: Switch, on: bool) -> Result<Switches, String> {
+    let (document, settings) = self.kept.as_mut().map_err(|reason| reason.clone())?;
+    let mut changed = document.clone();
+    changed.insert(switch.key(), Value::Bool(on));
+    write(&self.path, &changed).map_err(|error| format!("{}: {error}", self.path.display()))?;
+    *document = changed;
+    settings.switches = std::mem::take(&mut settings.switches).with(switch, on);
+    Ok(settings.switches.clone())
+  }
+}
+
+fn read(path: &Path) -> Result<(Map<String, Value>, Settings), String> {
+  let document = match std::fs::read(path) {
+    Ok(bytes) => match serde_json::from_slice(&bytes).map_err(|error| error.to_string())? {
+      Value::Object(document) => document,
+      _ => return Err("the file is not a JSON object".to_owned()),
+    },
+    Err(error) if error.kind() == ErrorKind::NotFound => Map::new(),
+    Err(error) => return Err(error.to_string()),
+  };
+  let settings = Settings::from_document(&document)?;
+  Ok((document, settings))
+}
+
+/// Replace the file whole by a rename, so a reader never sees half of it.
+fn write(path: &Path, document: &Map<String, Value>) -> std::io::Result<()> {
+  if let Some(dir) = path.parent() {
+    std::fs::create_dir_all(dir)?;
+  }
+  let mut text = serde_json::to_vec_pretty(document)?;
+  text.push(b'\n');
+  let staged = path.with_extension("json.new");
+  std::fs::write(&staged, text)?;
+  std::fs::rename(&staged, path)
 }
 
 /// A console address as the base its API paths join onto: HTTPS, or plain HTTP on the loopback alone,
@@ -71,6 +245,34 @@ pub fn console_url(raw: &str) -> Result<Url, String> {
 mod tests {
   use super::*;
 
+  /// A directory of the test's own, removed when the test ends.
+  struct Dir(PathBuf);
+
+  impl Dir {
+    fn new(name: &str) -> Self {
+      let dir = std::env::temp_dir().join(format!("jake-desktop-{name}-{}", std::process::id()));
+      let _ = std::fs::remove_dir_all(&dir);
+      std::fs::create_dir_all(&dir).unwrap();
+      Self(dir)
+    }
+
+    fn holding(name: &str, text: &str) -> Self {
+      let dir = Self::new(name);
+      std::fs::write(dir.0.join(FILE_NAME), text).unwrap();
+      dir
+    }
+
+    fn file(&self) -> Value {
+      serde_json::from_slice(&std::fs::read(self.0.join(FILE_NAME)).unwrap()).unwrap()
+    }
+  }
+
+  impl Drop for Dir {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir_all(&self.0);
+    }
+  }
+
   #[test]
   fn a_console_address_becomes_a_base_its_paths_join_onto() {
     let base = console_url("https://console.example/bmo?tab=1#top").unwrap();
@@ -84,18 +286,79 @@ mod tests {
   }
 
   #[test]
-  fn the_settings_file_names_the_console_or_leaves_the_default() {
-    let dir = std::env::temp_dir().join(format!("jake-desktop-settings-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let absent = Settings::read(&dir).map(|settings| settings.console);
-    std::fs::write(dir.join("settings.json"), r#"{"consoleUrl":"https://console.example/"}"#).unwrap();
-    let named = Settings::read(&dir).map(|settings| settings.console);
-    std::fs::write(dir.join("settings.json"), "{").unwrap();
-    let broken = Settings::read(&dir).map(|settings| settings.console);
-    std::fs::remove_dir_all(&dir).unwrap();
+  fn a_missing_file_runs_on_the_defaults() {
+    let dir = Dir::new("settings-missing");
+    let file = SettingsFile::open(&dir.0);
 
-    assert_eq!(absent.unwrap().as_str(), DEFAULT_CONSOLE_URL);
-    assert_eq!(named.unwrap().as_str(), "https://console.example/");
-    assert!(broken.unwrap_err().contains("settings.json"));
+    assert_eq!(file.unreadable(), None);
+    let settings = file.settings();
+    assert_eq!(settings.console.as_str(), DEFAULT_CONSOLE_URL);
+    let on: Vec<bool> = Switch::ALL.iter().map(|switch| settings.switches.on(*switch)).collect();
+    assert_eq!(on, [true, true, false, false, false]);
+    assert_eq!(settings.switches.stated(Switch::StartAtSignIn), None);
+  }
+
+  #[test]
+  fn the_file_names_the_console_and_states_switches() {
+    let dir = Dir::holding(
+      "settings-named",
+      r#"{"consoleUrl":"https://console.example/","closeToTray":false,"keepAwake":true}"#,
+    );
+    let settings = SettingsFile::open(&dir.0).settings();
+
+    assert_eq!(settings.console.as_str(), "https://console.example/");
+    assert!(!settings.switches.on(Switch::CloseToTray));
+    assert!(settings.switches.on(Switch::KeepAwake));
+    assert!(settings.switches.on(Switch::KeepControlWhileLocked));
+  }
+
+  #[test]
+  fn a_file_that_cannot_be_read_whole_runs_on_the_defaults_and_is_never_written() {
+    for (name, text) in [
+      ("settings-broken", "{"),
+      ("settings-wrong-type", r#"{"consoleUrl":"https://console.example/","closeToTray":"no"}"#),
+    ] {
+      let dir = Dir::holding(name, text);
+      let mut file = SettingsFile::open(&dir.0);
+
+      assert!(file.unreadable().unwrap().contains(FILE_NAME), "{name}");
+      assert_eq!(file.settings().console.as_str(), DEFAULT_CONSOLE_URL, "{name}");
+      assert!(file.set(Switch::KeepAwake, true).is_err(), "{name}");
+      assert_eq!(std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap(), text, "{name}");
+    }
+  }
+
+  #[test]
+  fn a_change_is_written_at_once_and_keeps_every_other_key() {
+    let dir = Dir::holding(
+      "settings-change",
+      r#"{"consoleUrl":"https://console.example/","laterSetting":{"kept":[1,2]}}"#,
+    );
+    let mut file = SettingsFile::open(&dir.0);
+    let switches = file.set(Switch::CloseToTray, false).unwrap();
+
+    assert!(!switches.on(Switch::CloseToTray));
+    assert_eq!(
+      dir.file(),
+      serde_json::json!({
+        "consoleUrl": "https://console.example/",
+        "laterSetting": { "kept": [1, 2] },
+        "closeToTray": false,
+      })
+    );
+    let reopened = SettingsFile::open(&dir.0).settings();
+    assert!(!reopened.switches.on(Switch::CloseToTray));
+    assert!(!dir.0.join("settings.json.new").exists());
+  }
+
+  #[test]
+  fn a_first_change_makes_the_file_and_its_directory() {
+    let dir = Dir::new("settings-first");
+    let mut file = SettingsFile::open(&dir.0.join("config"));
+    file.set(Switch::StartAtSignIn, true).unwrap();
+
+    let written: Value =
+      serde_json::from_slice(&std::fs::read(dir.0.join("config").join(FILE_NAME)).unwrap()).unwrap();
+    assert_eq!(written, serde_json::json!({ "startAtSignIn": true }));
   }
 }

@@ -1,4 +1,4 @@
-/* The bundled status page: one panel, light and dark, on the shared spacing and type scale. */
+/* The bundled pages: one panel, light and dark, on the shared spacing and type scale. */
 
 :root {
   color-scheme: light dark;
@@ -15,7 +15,13 @@
   --good: #15803d;
   --attention: #b45309;
   --focus: #0f766e;
+  --switch-off: #71717a;
+  --switch-off-hover: #52525b;
+  --switch-off-press: #3f3f46;
   --radius: 8px;
+  /* The shared motion set: a state changing in place, with both ends eased. */
+  --quick: 150ms;
+  --move: cubic-bezier(0.4, 0, 0.2, 1);
   font-family: "Apple SD Gothic Neo", Pretendard, system-ui, sans-serif;
   font-variant-numeric: tabular-nums;
 }
@@ -35,6 +41,9 @@
     --good: #4ade80;
     --attention: #fbbf24;
     --focus: #2dd4bf;
+    --switch-off: #71717a;
+    --switch-off-hover: #a1a1aa;
+    --switch-off-press: #d4d4d8;
   }
 }
 
@@ -180,6 +189,132 @@ button[aria-busy="true"]::before {
   animation: spin 1s linear infinite;
 }
 
+/* The settings page reads from the top, a switch to a row. */
+body.sheet {
+  place-items: start center;
+}
+
+.switches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.setting-text {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.setting-text label {
+  cursor: pointer;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.error,
+.notice {
+  display: grid;
+  gap: 4px;
+  color: var(--attention);
+  font-size: 14px;
+}
+
+.error p,
+.notice p {
+  margin: 0;
+}
+
+/* What the system said, in its own words. */
+.machine {
+  font-family: "CaskaydiaCove Nerd Font", ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
+button.switch {
+  flex: none;
+  width: 44px;
+  height: 24px;
+  padding: 2px;
+  border: none;
+  border-radius: 999px;
+  background: var(--switch-off);
+}
+
+button.switch::after {
+  content: "";
+  width: 20px;
+  height: 20px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: margin-left var(--quick) var(--move);
+}
+
+button.switch:hover {
+  background: var(--switch-off-hover);
+}
+
+button.switch:active {
+  background: var(--switch-off-press);
+}
+
+button.switch[aria-checked="true"] {
+  background: var(--accent);
+}
+
+button.switch[aria-checked="true"]:hover {
+  background: var(--accent-hover);
+}
+
+button.switch[aria-checked="true"]:active {
+  background: var(--accent-press);
+}
+
+button.switch[aria-checked="true"]::after {
+  margin-left: 20px;
+}
+
+button.switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.switch:disabled:hover,
+button.switch:disabled:active {
+  background: var(--switch-off);
+}
+
+button.switch[aria-checked="true"]:disabled:hover,
+button.switch[aria-checked="true"]:disabled:active {
+  background: var(--accent);
+}
+
+/* A switch at work spins its knob in place of the button's own spinner. */
+button.switch[aria-busy="true"]::before {
+  content: none;
+}
+
+button.switch[aria-busy="true"]::after {
+  border: 3px solid var(--surface);
+  border-top-color: transparent;
+  background: transparent;
+  animation: spin 1s linear infinite;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -187,8 +322,13 @@ button[aria-busy="true"]::before {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  button.switch::after {
+    transition: none;
+  }
+
   .mark.working,
-  button[aria-busy="true"]::before {
+  button[aria-busy="true"]::before,
+  button.switch[aria-busy="true"]::after {
     animation-duration: 3s;
   }
 }

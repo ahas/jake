@@ -30,6 +30,8 @@ pub enum AgentState {
   Link(Link),
   /// The agent panicked and starts again after this pause.
   Restarting(Duration),
+  /// The session is locked and control is not kept while it is, so the agent waits for the unlock.
+  Paused,
   /// An installed agent of this name runs on the machine, so the built-in one stays off.
   HeldOff(String),
   /// Another connection took this name at the hub, so the built-in agent gave it up.
@@ -69,6 +71,8 @@ impl Default for Status {
 pub enum Tone {
   Good,
   Working,
+  /// Waiting on the person, with nothing wrong and nothing under way.
+  Idle,
   Attention,
 }
 
@@ -180,6 +184,12 @@ impl AgentState {
         "에이전트를 다시 시작합니다".into(),
         vec![format!("오류로 중지되어 {}초 후 다시 실행합니다.", pause.as_secs().max(1))],
         Tone::Attention,
+        None,
+      ),
+      Self::Paused => (
+        "PC 잠금 중 일시 중지".into(),
+        line("잠금을 해제하면 다시 연결합니다."),
+        Tone::Idle,
         None,
       ),
       Self::HeldOff(name) => (

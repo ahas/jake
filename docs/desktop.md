@@ -14,13 +14,13 @@ to it.
 - **A built-in agent while the app runs.** The app runs the agent crate as a library on its own
   runtime, under the person's own machine credential, so the machine is reachable through the hub for
   as long as the app is open, with the same shells, transfers and streams an installed agent offers.
-- **A tray icon.** Closing the window hides it and the agent carries on; the tray opens the console
-  again, shows the agent's state, turns starting at sign-in on and off, and quits. Quitting stops the
-  agent.
+- **A tray icon.** The tray opens the console again, shows the agent's state, opens the settings,
+  turns starting at sign-in on and off, and quits. Quitting stops the agent.
+- **Settings of its own,** on a screen the tray and the window open: whether control is kept while
+  the PC is locked, what closing the window does, starting at sign-in, starting in the tray, and
+  keeping the PC awake (「Settings」).
 - **One copy at a time.** A second launch brings the running copy's window forward and exits, since two
   copies would hold one name twice.
-- **Starting at sign-in is off until the person turns it on,** through Tauri's autostart plugin: a
-  per-user registration that needs no administrator rights.
 
 ## The crate and its workspace
 
@@ -113,8 +113,8 @@ flowchart TD
   stops the agent and offers pairing again, since the hub has removed this machine.
 - **The state is shown** in the tray icon's tooltip and on the local page: starting, pairing, pairing
   failed, no credential store, connecting, attached, refused by the hub, hub unreachable, restarting
-  after a fault, held off for an installed agent, given up to another agent of its name, and removed
-  by the hub.
+  after a fault, paused while the PC is locked, held off for an installed agent, given up to another
+  agent of its name, and removed by the hub.
 
 ## One agent per name
 
@@ -134,17 +134,147 @@ end, so the built-in agent gives way, twice over.
   distribution of the same machine, therefore wins after a single replacement, and the two never loop.
 - **The installed agent is unchanged:** it redials when superseded, as it always has.
 
+## Settings
+
+The app's settings are kept in its `settings.json`, the file that holds the console's address.
+
+| Key | Setting | Default | Offered on |
+|---|---|---|---|
+| `keepControlWhileLocked` | Keep control while the PC is locked | on | Windows |
+| `closeToTray` | Closing the window sends it to the tray rather than quitting | on | every platform |
+| `startAtSignIn` | Start the app when the person signs in | off | every platform |
+| `startInTray` | Start in the tray, with no window, when started at sign-in | off | every platform |
+| `keepAwake` | Keep the PC from sleeping while the built-in agent serves | off | Windows |
+| `consoleUrl` | The console's address | `https://ai.example.org/bmo/` | the file alone |
+
+### Reading and writing
+
+- **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON or
+  a value of the wrong type, leaves the app on its defaults with the reason in its log, and the
+  settings screen then says the file cannot be read and changes nothing, since writing it would
+  overwrite the hand edit it could not read.
+- **A change is written the moment it is made,** the whole file replaced by a rename, so a reader never
+  sees half of it. Every key the app does not know is written back as it was read, so a key a newer
+  version wrote survives an older one.
+- **Every setting takes effect at once,** with no restart: each is read again where it acts, at the next
+  close of the window, the next lock of the session, the next sign-in, or at once where it holds
+  something now (starting at sign-in, keeping awake).
+- **The console's address is not on the screen.** Another address is another console, whose pairing
+  the stored credential does not answer to, so it stays a hand edit read at start.
+
+### Closing the window
+
+- **On, closing the window hides it** and the agent carries on until the tray's quit.
+- **Off, closing the window quits the app** as the tray's quit does: the built-in agent stops first, then
+  the app exits.
+
+### Starting at sign-in
+
+- **The registration is Tauri's autostart plugin,** a per-user one that needs no administrator rights:
+  a run entry in the registry on Windows, an autostart entry in the person's config on Linux. It fires
+  at the person's sign-in, not at boot; on a machine that signs in by itself at boot the two are one
+  moment.
+- **The file holds the wanted state, and the registration is brought into line with it** whenever the
+  setting changes and at every start of the app, so a registration a reset of the machine wiped is put
+  back the next time the app runs. Where the file holds no value, the registration as it stands is
+  taken as the setting and written into the file.
+- **The tray's check item and the settings screen show the one value:** a change from either is written
+  to the file and shown on the other at once.
+- **A registration the system refuses leaves the setting as it was,** with the reason shown where the
+  change was made: beside the switch on the screen, and in the log for the tray, whose item springs
+  back.
+- **Starting in the tray.** The registration starts the app with an argument that says it was started
+  at sign-in. Started so with `startInTray` on, the app opens no window: the tray and the agent start as
+  they always do, and the tray opens the window. Started by hand, the app always opens its window. A
+  pairing needs the person, so one that opens shows the window however the app was started.
+
+### The settings screen
+
+- **A window of its own, one at a time,** opened from the tray's settings item, from the main window's
+  menu, and from the local page. Opening it again brings the open one forward.
+- **The main window carries a menu bar of one menu,** holding the settings, the status page and quit,
+  since the console fills the rest of the window and the console's own pages get no command of the
+  app's (「The window and what the console may call」).
+- **A page of standing switches.** Each switch takes effect and is written the moment it is turned;
+  there is no save button and nothing is held unsaved, so the values on the screen never differ from
+  what is saved and closing the window, by its close button, Esc or Back, asks nothing.
+- **A switch whose change fails** returns to the saved value, with the reason beside it.
+- **Only the settings the platform offers are shown.**
+- **It is a bundled page,** as the local page is, and reads and changes the settings through the app's
+  commands alone.
+
+## While the PC is locked
+
+### What a locked Windows session allows
+
+Locking hands the screen and input to the system's secure desktop. The person's session, its
+processes and its network stay as they were.
+
+- **What goes on:** the app and its built-in agent keep running and the agent stays attached. Commands
+  run as the person, with their files and network, and may start programs; transfers, byte streams and
+  streams back carry on.
+- **What stops:** everything that needs the screen or input. A process of the person's cannot read the
+  secure desktop, so a screenshot taken by a command fails; keys and pointer movements a command
+  injects reach nothing; a window a command opens stands behind the lock, unseen.
+- **What no process of the person's can do:** see or drive the lock screen, or unlock the session.
+  The lock screen and the secure attention sequence belong to the system.
+- **The remote desktop.** BMO's remote desktop reaches only the machine its own service runs on,
+  through that machine's RDP server, and does not reach a machine through jake, locked or not. A
+  remote desktop that shows and drives a locked Windows session needs either a helper running as a
+  system service, which captures the secure desktop and injects input from the system account, or
+  Windows's own Remote Desktop host, whose logon takes the session over. Both need administrator
+  rights to install, which this per-user app does not have, and the app offers neither.
+- **Sleep.** Locking does not sleep the PC, but a locked PC left alone is idle, and the power plan
+  sleeps it after its idle time; a sleeping PC drops the connection until it wakes. `keepAwake`
+  answers that.
+
+### Keeping control while locked
+
+- **On, nothing changes when the session locks:** the agent stays attached and serves all that a locked
+  session allows.
+- **Off, the moment the session locks the app stops the built-in agent,** with the stop signal its quit
+  uses, so the connection closes and everything in flight ends as it does on a lost connection: running
+  commands' process trees are ended, transfers fail, streams and streams back close. The hub lists the
+  machine as not attached, not as departed, and the state reads as paused while the PC is locked.
+- **On unlock the agent starts again at once.** A pause is not a fault, so it leaves the restart pause
+  after a panic as it was.
+- **Stopping rather than refusing.** Staying attached and refusing each request would need the agent
+  library, shared with the installed agent, to carry a lock gate and a refusal the hub and the console
+  surface, and would leave a stream already open live; stopping ends every kind of control at once, by
+  the path a lost connection already takes.
+- **How the lock is read.** The app registers for its own session's change notifications, taking a lock
+  and an unlock as they come, and reads at start whether the session is locked, so an app started
+  behind a lock starts paused. Switching to another person's account locks the session and counts as a
+  lock.
+- **A change takes effect at the next lock.** A pairing under way when the session locks goes on, and
+  the agent it ends in starts once the session is unlocked.
+- **It governs the built-in agent alone.** An installed agent is not the app's and serves while the
+  session is locked; where one serves the machine, the built-in agent is held off and the setting has
+  nothing to govern.
+- **On Linux the app reads no lock,** so the setting is not offered and the agent serves whether the
+  session is locked or not.
+
+### Keeping the PC awake
+
+- **On, while the built-in agent serves,** the app asks Windows to keep the system from sleeping for
+  idleness, a request any per-user process may make. The display still turns off and the session
+  still locks as the power plan says; a sleep the person chooses, a closed lid and the power button
+  still sleep it.
+- **The request is released** while the agent is paused or held off, when the setting is turned off,
+  and when the app quits.
+- **Off, the power plan alone decides,** as it does for any program.
+
 ## The window and what the console may call
 
 - **Navigation stays on the console's origin.** The main window goes only to the console's origin and
   to the app's own bundled page; a link to anywhere else opens in the person's default browser.
 - **The bundled page** says when the console cannot be reached, shows the agent's state and the
-  pairing code, and offers to try the console again, pair again, or look again for an installed agent
-  or a credential store.
+  pairing code, and offers to try the console again, pair again, look again for an installed agent or
+  a credential store, or open the settings.
 - **The console's origin gets no Tauri command.** Pairing needs no hand-off from the page, because the
-  Rust side polls for the approval itself, so no capability lists a remote origin. The bundled page
-  alone may call the app's three commands, each named in its capability: read the status, try the
-  console again, and retry (pair again, or look again).
+  Rust side polls for the approval itself, so no capability lists a remote origin. The bundled pages
+  alone may call the app's commands, each named in their capability: read the status, try the console
+  again, retry (pair again, or look again), open the settings, and read and change a setting.
 - **The console is checked before it is shown:** the app asks the console's address over HTTPS first,
   and shows the bundled page with the reason when it does not answer.
 

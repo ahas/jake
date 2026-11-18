@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, watch};
 use url::Url;
 
 use crate::pairing::{Console, Machine, PairingError};
+use crate::pause::serve_unpaused;
 use crate::status::{AgentState, ConsoleState, PairingFailure, Status};
 use crate::supervisor::supervise;
 use crate::vault::{NoStore, Vault};
@@ -28,6 +29,8 @@ pub struct Controller<W: Window> {
   pub window: Arc<W>,
   pub status: watch::Sender<Status>,
   pub quit: watch::Receiver<bool>,
+  /// Whether the agent is paused while the session is locked.
+  pub paused: watch::Receiver<bool>,
   /// The page's asks to try again: pair again, or look again.
   pub retries: mpsc::Receiver<()>,
 }
@@ -76,15 +79,27 @@ impl<W: Window> Controller<W> {
       Ok(machine) => machine,
       Err(state) => return Some(state),
     };
+    let (mut paused, mut quit) = (self.paused.clone(), self.quit.clone());
+    let pause = || {
+      self.log.info("built-in-agent-paused", json!({ "agent": machine.node }));
+      self.set_agent(AgentState::Paused);
+    };
+    serve_unpaused(|stop| self.held_or_serve(&machine, stop), &mut paused, &mut quit, pause)
+      .await
+      .flatten()
+  }
+
+  /// The machine's agent served until `stop`, or the state it was held off in; none once stopped.
+  async fn held_or_serve(&self, machine: &Machine, stop: watch::Receiver<bool>) -> Option<AgentState> {
     let installed = tokio::task::spawn_blocking(jake_agent::installed::running_agent_name)
       .await
       .ok()
       .flatten();
     if installed.as_deref() == Some(machine.node.as_str()) {
       self.log.info("built-in-agent-held-off", json!({ "agent": machine.node }));
-      return Some(AgentState::HeldOff(machine.node));
+      return Some(AgentState::HeldOff(machine.node.clone()));
     }
-    match self.serve(&machine).await {
+    match self.serve(machine, stop).await {
       Ended::Stopped => None,
       Ended::Left => {
         self.log.warn("machine-removed", json!({ "agent": machine.node }));
@@ -94,7 +109,7 @@ impl<W: Window> Controller<W> {
         }
         Some(AgentState::Removed)
       }
-      Ended::Superseded => Some(AgentState::Yielded(machine.node)),
+      Ended::Superseded => Some(AgentState::Yielded(machine.node.clone())),
     }
   }
 
@@ -151,9 +166,10 @@ impl<W: Window> Controller<W> {
     }
   }
 
-  /// Run the built-in agent under the machine's credential, supervised, until it ends.
-  async fn serve(&self, machine: &Machine) -> Ended {
-    let (status, log, quit) = (self.status.clone(), self.log.clone(), self.quit.clone());
+  /// Run the built-in agent under the machine's credential, supervised, until it ends or `stop` turns
+  /// true.
+  async fn serve(&self, machine: &Machine, mut stop: watch::Receiver<bool>) -> Ended {
+    let (status, log, halt) = (self.status.clone(), self.log.clone(), stop.clone());
     let start = || {
       status.send_modify(|status| status.agent = AgentState::Link(Link::Connecting));
       let config =
@@ -162,17 +178,24 @@ impl<W: Window> Controller<W> {
         Agent::new(config, AGENT_VERSION.to_owned(), log.clone()).when_superseded(WhenSuperseded::GiveUp);
       let mut link = agent.link();
       let status = status.clone();
-      // The watch's sender goes with the agent, so this ends with the task however the task ends.
+      // The watch's sender goes with the agent, so this ends with the task however the task ends. A
+      // link reported once the agent is stopped never covers the state the stop left.
       tokio::spawn(async move {
         while link.changed().await.is_ok() {
           let now = link.borrow_and_update().clone();
-          status.send_modify(|status| status.agent = AgentState::Link(now));
+          status.send_if_modified(|status| {
+            let serving = matches!(status.agent, AgentState::Link(_));
+            if serving {
+              status.agent = AgentState::Link(now);
+            }
+            serving
+          });
         }
       });
-      let mut quit = quit.clone();
+      let mut halt = halt.clone();
       tokio::spawn(async move {
         let stop = async move {
-          let _ = quit.wait_for(|quit| *quit).await;
+          let _ = halt.wait_for(|halt| *halt).await;
         };
         jake_agent::run(&agent, stop).await
       })
@@ -183,8 +206,7 @@ impl<W: Window> Controller<W> {
         .warn("agent-panicked", json!({ "message": message, "restartInMs": pause.as_millis() as u64 }));
       self.status.send_modify(|status| status.agent = AgentState::Restarting(pause));
     };
-    let mut quit = self.quit.clone();
-    supervise(start, &mut quit, restarting).await
+    supervise(start, &mut stop, restarting).await
   }
 
   fn set_agent(&self, state: AgentState) {
