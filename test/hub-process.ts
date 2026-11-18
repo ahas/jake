@@ -14,6 +14,8 @@ export interface HubSeams {
   reverseTargets?: string;
   // The key scoped control credentials are made with, as JAKE_CONTROL_KEY.
   controlKey?: string;
+  // The key an agent's credential of its own name is made with, as JAKE_AGENT_KEY.
+  agentKey?: string;
   /** The agent and control ports to bind, so a hub started again answers where the last one did; free ones when omitted. */
   ports?: [number, number];
   pingIntervalMs?: number;
@@ -119,6 +121,7 @@ export async function startHubProcess(secret: string, controlToken: string, seam
   if (seams.socketBacklogBytes !== undefined) env.JAKE_HUB_SOCKET_BACKLOG_BYTES = String(seams.socketBacklogBytes);
   if (seams.reverseTargets !== undefined) env.JAKE_REVERSE_TARGETS = seams.reverseTargets;
   if (seams.controlKey !== undefined) env.JAKE_CONTROL_KEY = seams.controlKey;
+  if (seams.agentKey !== undefined) env.JAKE_AGENT_KEY = seams.agentKey;
   if (seams.agentBuildDir === undefined) env.JAKE_AGENT_UPDATE = "off";
   else env.JAKE_AGENT_BUILD_DIR = seams.agentBuildDir;
   env.JAKE_AGENT_DOWNLOAD_URL = AGENT_DOWNLOAD_URL;

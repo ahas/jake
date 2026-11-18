@@ -556,7 +556,11 @@ describe("streams back", () => {
 });
 
 describe("leaving", () => {
-  test("a leave stops the agent, hands its removal to a detached systemd unit, and exits", async () => {
+  // A hub sends a leave to a welcomed agent, and in the welcome's place to a hello under a revoked name.
+  test.each([
+    ["once welcomed", true],
+    ["in answer to the hello", false],
+  ])("a leave %s stops the agent, hands its removal to a detached systemd unit, and exits", async (_when, welcome) => {
     const home = tempDir();
     const bin = join(home, "bin");
     mkdirSync(bin);
@@ -565,7 +569,7 @@ describe("leaving", () => {
 
     const hub = standInHub();
     const leaving = agent(hub.url, { PATH: `${bin}:${process.env.PATH ?? ""}` }, home);
-    const connection = await hub.welcomed(0);
+    const connection = welcome ? await hub.welcomed(0) : await hub.connection(0);
     connection.send({ type: "leave" });
     expect(await leaving.exited).toBe(0);
     await until("the teardown to be handed off", () => existsSync(record));
@@ -577,7 +581,7 @@ describe("leaving", () => {
     expect(args).toContain(`rm -rf '${dataDir}'`);
   });
 
-  test("the uninstaller's leave notice says hello, sends a leave once welcomed, and exits; a refusal fails it", async () => {
+  test("the uninstaller's leave notice says hello, sends a leave once welcomed, takes a revoked name's leave as told, and exits; a refusal fails it", async () => {
     const hub = standInHub();
     const notice = (secret: string) => {
       const home = tempDir();
@@ -595,6 +599,13 @@ describe("leaving", () => {
     const connection = await hub.welcomed(0);
     await connection.next((f) => f.type === "leave", "the leave notice");
     expect(await told.exited).toBe(0);
+
+    // A hub that answers the hello with a leave has recorded the departure itself, and is sent nothing.
+    const revoked = notice(SECRET);
+    const answered = await hub.connection(1);
+    answered.send({ type: "leave" });
+    expect(await revoked.exited).toBe(0);
+    expect(answered.frames.map((f) => f.type)).toEqual(["hello"]);
 
     const refused = notice("wrong-secret");
     expect(await refused.exited).not.toBe(0);

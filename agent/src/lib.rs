@@ -14,7 +14,7 @@ mod stream;
 mod transfer;
 
 pub use config::AgentConfig;
-pub use connection::{Agent, Ended, Link, WhenSuperseded, backoff};
+pub use connection::{Agent, Ended, LeaveNotice, Link, WhenSuperseded, backoff};
 pub use exec::{ExecRequest, Invocation, invocation};
 pub use log::Log;
 

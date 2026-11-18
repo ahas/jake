@@ -546,6 +546,9 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
   for (const agent of snapshot.departed ?? []) {
     lines.push(`${agent.name} departed ${formatDuration(now - agent.departedAt)} ago`);
   }
+  for (const agent of snapshot.revoked ?? []) {
+    lines.push(`${agent.name} revoked ${formatDuration(now - agent.revokedAt)} ago`);
+  }
   return `${lines.join("\n")}\n`;
 }
 

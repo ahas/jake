@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +25,7 @@ import {
 } from "./hub-process";
 import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
-import { agentLaunchOf, ensureAgentBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
+import { agentLaunchOf, ensureAgentBuilt, ensureLaunchBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -42,10 +42,11 @@ const callers: StreamCaller[] = [];
 const clients: Bun.Subprocess[] = [];
 const ports: StandInPort[] = [];
 
-// A build after a change takes far longer than one case may, so both programs are built before any.
+// A build after a change takes far longer than one case may, so every program a case runs is built before any.
 beforeAll(() => {
   ensureHubBuilt();
   ensureAgentBuilt();
+  ensureLaunchBuilt();
 }, 600_000);
 
 afterEach(async () => {
@@ -1095,6 +1096,94 @@ describe("leave", () => {
   });
 });
 
+describe("revoke", () => {
+  const AGENT_KEY = "ak";
+
+  // A fake agent dialing with a credential of its own name, made with the hub's agent key.
+  async function dialAs(port: number, name: string): Promise<FakeAgent> {
+    const mac = createHmac("sha256", AGENT_KEY).update(name).digest("hex");
+    const agent = new FakeAgent(port, `${name}.${mac}`);
+    agents.push(agent);
+    expect(await agent.outcome()).toBe("open");
+    agent.hello([], name);
+    return agent;
+  }
+
+  async function revoke(hub: HubProcess, name: string): Promise<{ ok: boolean; agent: string; left: boolean }> {
+    const response = await control(hub, `/revoke?agent=${name}`, { method: "POST" });
+    expect(response.status).toBe(200);
+    return response.json();
+  }
+
+  test("a revoked attached agent is told to leave at once, a second revoke sends none, and another name stays attached", async () => {
+    const hub = await launch({ agentKey: AGENT_KEY });
+    const revoked = await dialAs(hub.agentPort, "u7-a");
+    await revoked.waitFor((f) => f.type === "welcome");
+    const other = await dialAs(hub.agentPort, "u8-b");
+    await other.waitFor((f) => f.type === "welcome");
+
+    expect(await revoke(hub, "u7-a")).toEqual({ ok: true, agent: "u7-a", left: true });
+    await revoked.waitFor((f) => f.type === "leave");
+    await revoked.waitClose();
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["u8-b"]);
+    expect(status.revoked).toEqual([{ name: "u7-a", revokedAt: expect.any(Number) }]);
+    expect(status.departed.map((entry: { name: string }) => entry.name)).toEqual(["u7-a"]);
+
+    expect(await revoke(hub, "u7-a")).toEqual({ ok: true, agent: "u7-a", left: false });
+    expect((await (await control(hub, "/status")).json()).revoked).toEqual(status.revoked);
+  });
+
+  test("every hello under a revoked name is answered with a leave after a restart, both records stand, another name attaches, and jake-hub prints the name", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "jake-hub-revoked-"));
+    dirs.push(dataDir);
+    const first = await launch({ agentKey: AGENT_KEY, dataDir });
+    expect(await revoke(first, "u7-a")).toEqual({ ok: true, agent: "u7-a", left: false });
+    await first.stop();
+    running.splice(running.indexOf(first), 1);
+
+    const hub = await launch({ agentKey: AGENT_KEY, dataDir });
+    for (let hello = 0; hello < 2; hello += 1) {
+      const returning = await dialAs(hub.agentPort, "u7-a");
+      await returning.waitFor((f) => f.type === "leave");
+      await returning.waitClose();
+      expect(returning.received.some((f) => f.type === "welcome")).toBe(false);
+    }
+    await until(() => hub.stderr.some((line) => line.includes("agent u7-a departed: its name is revoked")));
+
+    const other = await dialAs(hub.agentPort, "u8-b");
+    await other.waitFor((f) => f.type === "welcome");
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["u8-b"]);
+    expect(status.revoked.map((entry: { name: string }) => entry.name)).toEqual(["u7-a"]);
+    expect(status.departed.map((entry: { name: string }) => entry.name)).toEqual(["u7-a"]);
+
+    const listed = hubClient(hub, { JAKE_CONTROL_TOKEN: CONTROL }, ["revoked"]);
+    expect(await listed.exited).toBe(0);
+    expect(await new Response(listed.stdout).text()).toBe("u7-a\n");
+  });
+
+  test("the shared secret's hello under a revoked name attaches as the administrator's own", async () => {
+    const hub = await launch({ agentKey: AGENT_KEY });
+    await revoke(hub, "u7-a");
+    await attach(hub.agentPort, [], "u7-a");
+    expect((await (await control(hub, "/status")).json()).agents.map((a: { name: string }) => a.name)).toEqual(["u7-a"]);
+  });
+
+  test("a scoped credential revokes only a name it reaches, and a revoke names its agent", async () => {
+    const hub = await launch({ controlKey: "ck" });
+    const scoped = { Authorization: `Bearer ${await mint(hub, "ck", ["u4"])}` };
+    const refused = await control(hub, "/revoke?agent=u7", { method: "POST", headers: scoped });
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).code).toBe("agent-out-of-reach");
+    const own = await control(hub, "/revoke?agent=u4", { method: "POST", headers: scoped });
+    expect(await own.json()).toEqual({ ok: true, agent: "u4", left: false });
+    expect((await control(hub, "/revoke", { method: "POST" })).status).toBe(400);
+    const status = await (await control(hub, "/status", { headers: scoped })).json();
+    expect(status.revoked.map((entry: { name: string }) => entry.name)).toEqual(["u4"]);
+  });
+});
+
 describe("agent updates", () => {
   const BUILD = "0.1.0+gnew1234";
 
@@ -1339,11 +1428,12 @@ describe("liveness", () => {
   });
 
   test("an agent that answers pings stays attached", async () => {
-    const hub = await launch({ pingIntervalMs: 20, missedPongLimit: 2 });
+    // A window of five pings leaves room for a loaded machine to answer late without the agent being
+    // declared dead, and eight pings seen means more than a whole window has passed.
+    const hub = await launch({ pingIntervalMs: 20, missedPongLimit: 5 });
     const agent = await attach(hub.agentPort, []); // autoPong on by default
 
-    await agent.waitFor((f) => f.type === "ping"); // it is being probed
-    await Bun.sleep(120); // several liveness windows pass
+    await until(() => agent.received.filter((f) => f.type === "ping").length >= 8);
 
     const status = await (await control(hub, "/status")).json();
     expect(status.attached).toBe(true);

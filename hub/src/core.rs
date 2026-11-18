@@ -16,12 +16,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
 
 use crate::credential::{self, Reach};
-use crate::departed::Departed;
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
   Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SUPERSEDED_REASON,
   SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
 };
+use crate::timed_names::TimedNames;
 use crate::update::{self, AgentBuild};
 
 /// The version the hub names in its welcome.
@@ -34,6 +34,8 @@ const TAIL_BACKLOG: usize = 1024;
 const CLOSE_HUB_INITIATED: u16 = 4000;
 /// The close code of a socket whose hello named another name than its credential was made for.
 const CLOSE_OTHER_NAME: u16 = 4003;
+/// The reason a revoked name's departure is logged and its socket closed with.
+const REVOKED_REASON: &str = "its name is revoked";
 /// How much of an update order's output the hub's log keeps.
 const UPDATE_REPORT_BYTES: usize = 4096;
 
@@ -50,6 +52,8 @@ pub struct HubOptions {
   pub socket_backlog_bytes: usize,
   /// Where the departed agents are recorded; none keeps the record in memory alone.
   pub departed_path: Option<PathBuf>,
+  /// Where the revoked agent names are recorded; none keeps the record in memory alone.
+  pub revoked_path: Option<PathBuf>,
   /// The `host:port` targets a stream back from an agent may reach.
   pub reverse_targets: Vec<String>,
   /// The agent build attached agents are ordered onto; none orders no agent.
@@ -233,7 +237,9 @@ struct State {
   traffic_seq: u64,
   traffic_tx: broadcast::Sender<Arc<TrafficEntry>>,
   id_seq: u64,
-  departed: Departed,
+  departed: TimedNames,
+  // The names whose credentials the hub no longer takes: a hello under one is answered with a leave.
+  revoked: TimedNames,
   // What each agent is to listen on for streams back, by name and port, with the target each joins:
   // asked again on every connection the agent makes.
   listens: HashMap<String, std::collections::BTreeMap<u16, String>>,
@@ -420,6 +426,21 @@ impl State {
     self.detach(name, how, true);
     self.departed.record(name, now_ms());
     eprintln!("jake hub: agent {name} departed: {how}");
+  }
+
+  // A hello under a revoked name, made with that name's credential, attaches nothing: the leave goes
+  // out in the welcome's place, ahead of the socket's close, and the attempt is a departure.
+  fn answer_revoked(&mut self, link: &Link, name: &str, summary: Value) {
+    self.record(Some(name), "in", "hello", summary);
+    // Whatever name the socket held goes with the socket rather than staying attached to a closed link.
+    if let Some(held) = self.by_socket.get(&link.socket_id).cloned() {
+      self.detach(&held, "the connection said hello under a revoked name", false);
+    }
+    link.send(Frame::Leave.encode());
+    self.record(Some(name), "out", Frame::Leave.kind(), Frame::Leave.summary());
+    link.close(CLOSE_HUB_INITIATED, REVOKED_REASON);
+    self.departed.record(name, now_ms());
+    eprintln!("jake hub: agent {name} departed: {REVOKED_REASON}");
   }
 
   fn fail_transfer(&mut self, name: &str, id: &str, code: &str, message: &str) {
@@ -670,7 +691,8 @@ impl Hub {
       traffic_seq: 0,
       traffic_tx,
       id_seq: 0,
-      departed: Departed::load(options.departed_path.clone()),
+      departed: TimedNames::load(options.departed_path.clone(), "departedAt"),
+      revoked: TimedNames::load(options.revoked_path.clone(), "revokedAt"),
       listens: HashMap::new(),
       updates_ordered: HashMap::new(),
     };
@@ -762,6 +784,10 @@ impl Hub {
         return;
       }
       let summary = frame.summary();
+      if link.only.is_some() && state.revoked.contains(agent) {
+        state.answer_revoked(link, agent, summary);
+        return;
+      }
       state.attach(link, agent.clone(), agent_version.clone(), capabilities.clone(), summary);
       let probe = self.probe(agent.clone(), link.socket_id);
       if let Some(attached) = state.agents.get_mut(agent) {
@@ -1219,8 +1245,24 @@ impl Hub {
     Ok(name)
   }
 
-  /// Every attached agent the caller reaches, ordered by name, every departed one it reaches, and
-  /// this process's run tag.
+  /// Record `name` as revoked, keeping the time of an earlier revocation, and send a leave to an
+  /// agent attached under it; whether a leave was sent.
+  pub fn revoke(&self, name: &str) -> bool {
+    let mut state = self.lock();
+    if !state.revoked.contains(name) {
+      state.revoked.record(name, now_ms());
+      eprintln!("jake hub: agent name {name} revoked");
+    }
+    if !state.agents.contains_key(name) {
+      return false;
+    }
+    state.send(name, &Frame::Leave);
+    state.depart(name, REVOKED_REASON);
+    true
+  }
+
+  /// Every attached agent the caller reaches, ordered by name, every departed one and every revoked
+  /// name it reaches, and this process's run tag.
   pub fn status(&self, reach: &Reach) -> Value {
     let state = self.lock();
     let mut agents: Vec<(&String, &Agent)> =
@@ -1240,13 +1282,20 @@ impl Hub {
         })
       })
       .collect();
-    let departed: Vec<Value> = state
-      .departed
-      .list()
-      .into_iter()
-      .filter(|entry| entry["name"].as_str().is_some_and(|name| reach.admits(name)))
-      .collect();
-    json!({ "run": self.run, "attached": !agents.is_empty(), "agents": agents, "departed": departed })
+    let reached = |record: &TimedNames| -> Vec<Value> {
+      record
+        .list()
+        .into_iter()
+        .filter(|entry| entry["name"].as_str().is_some_and(|name| reach.admits(name)))
+        .collect()
+    };
+    json!({
+      "run": self.run,
+      "attached": !agents.is_empty(),
+      "agents": agents,
+      "departed": reached(&state.departed),
+      "revoked": reached(&state.revoked),
+    })
   }
 
   /// The traffic recorded after `after_id`, and the live feed from the very next entry on.
@@ -1463,6 +1512,7 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes,
       departed_path: None,
+      revoked_path: None,
       reverse_targets: Vec::new(),
       agent_build: None,
     })
@@ -1550,6 +1600,25 @@ mod tests {
     );
     assert!(matches!(other_queue.try_recv(), Ok(Outbound::Close(4003, _))));
     assert!(!attached_names(&hub).contains(&"hass".to_owned()));
+  }
+
+  #[tokio::test]
+  async fn a_revoked_hello_on_an_attached_socket_takes_the_name_it_held_down_with_it() {
+    let hub = hub(CAP);
+    let hello = r#"{"type":"hello","v":1,"agent":"u7","agentVersion":"0.1.0","capabilities":[]}"#;
+    let (link, mut queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    let link = link.held_to(Some("u7".into()));
+    hub.on_message(&link, hello);
+    assert_eq!(attached_names(&hub), ["u7"]);
+    while queue.try_recv().is_ok() {}
+
+    // Revoked under the socket's feet, the name's next hello is answered with a leave and a close.
+    hub.lock().revoked.record("u7", 1);
+    hub.on_message(&link, hello);
+    assert!(matches!(queue.try_recv(), Ok(Outbound::Text(text)) if text.contains(r#""type":"leave""#)));
+    assert!(matches!(queue.try_recv(), Ok(Outbound::Close(CLOSE_HUB_INITIATED, _))));
+    assert!(attached_names(&hub).is_empty());
+    assert!(hub.lock().by_socket.is_empty());
   }
 
   #[tokio::test]
@@ -1652,6 +1721,7 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes: CAP,
       departed_path: None,
+      revoked_path: None,
       reverse_targets: Vec::new(),
       agent_build: None,
     });
@@ -1676,6 +1746,7 @@ mod tests {
       missed_pong_limit: 3,
       socket_backlog_bytes: CAP,
       departed_path: None,
+      revoked_path: None,
       reverse_targets: vec![address.clone(), "127.0.0.1:4555".into()],
       agent_build: None,
     });

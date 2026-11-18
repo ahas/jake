@@ -22,7 +22,13 @@ export interface DepartedAgent {
   departedAt: number;
 }
 
-/** The hub's status: its run tag, whether any agent is attached, every attached and every departed agent by name. */
+/** An agent name whose credential the hub no longer takes, and when it was revoked. */
+export interface RevokedAgent {
+  name: string;
+  revokedAt: number;
+}
+
+/** The hub's status: its run tag, whether any agent is attached, every attached and every departed agent and every revoked name. */
 export interface StatusSnapshot {
   /** Identifies the hub process, so a console can tell its traffic cursor is still valid. */
   run: string;
@@ -30,6 +36,8 @@ export interface StatusSnapshot {
   agents: AgentStatus[];
   /** Absent from a hub that keeps no record of departures, which the console still reads. */
   departed?: DepartedAgent[];
+  /** Absent from a hub that keeps no record of revocations, which the console still reads. */
+  revoked?: RevokedAgent[];
 }
 
 /** One frame that crossed the tunnel, reduced to its shape, as the hub's traffic feed carries it. */

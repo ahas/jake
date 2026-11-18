@@ -7,9 +7,10 @@ mod control;
 mod control_client;
 mod core;
 mod credential;
-mod departed;
 mod exec;
 mod link;
+mod revoked;
+mod timed_names;
 mod up;
 mod update;
 
@@ -56,6 +57,7 @@ async fn run() -> Result<(), String> {
     missed_pong_limit: config.missed_pong_limit,
     socket_backlog_bytes: config.socket_backlog_bytes,
     departed_path: Some(config.departed_path),
+    revoked_path: Some(config.revoked_path),
     reverse_targets: config.reverse_targets,
     agent_build: config.agent_update.and_then(|update| {
       match AgentBuild::read(&update.build_dir, &update.download_url) {
@@ -137,6 +139,8 @@ enum Verb {
   },
   /// Ask the running hub once whether both its ports answer, and exit 0 only where they do
   Up,
+  /// Print the agent names the running hub has revoked, one a line
+  Revoked,
 }
 
 // A control credential for the named agents, from the hub's own control key.
@@ -174,6 +178,7 @@ async fn main() -> ExitCode {
       }
     },
     Some(Verb::Up) => ExitCode::from(up::run().await),
+    Some(Verb::Revoked) => ExitCode::from(revoked::run().await),
     None => match run().await {
       Ok(()) => ExitCode::SUCCESS,
       Err(message) => {

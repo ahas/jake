@@ -144,11 +144,17 @@ Departure:
   the service unit on a Linux host — removes its autostart registrations, deletes its executable,
   config, log, and data, and exits; it sends no reply, and the hub reads the departure from the
   connection dropping. The scheme it triggers is in docs/architecture.md.
+- **leave** — hub to agent, in answer to a hello: an agent presenting a credential of its own name
+  says hello under a name the hub has revoked. The hub sends the leave in place of the welcome,
+  attaches nothing and closes the connection, and the agent departs as above whether or not it was
+  ever welcomed. A socket that held a name gives it up first. An uninstaller's leave notice that
+  meets this leave sends none of its own, since the hub has recorded the departure already.
 - **leave** — agent to hub, after a welcome: this agent has been uninstalled by hand. Its uninstaller
   sends it through a short-lived connection of its own once the agent is stopped. The hub drops the
   connection and records the agent as departed; it sends no reply.
 - Either way the hub records the agent as departed and no longer lists it as attached, until a hello
-  under the same name arrives.
+  under the same name arrives; a hello under a revoked name is answered with a leave again and
+  leaves it departed.
 
 Liveness:
 

@@ -57,18 +57,21 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   leave — names its target agent. A request that names none goes to the one agent attached when exactly one is,
   and is refused when there are several, so a request never lands on a machine nobody chose. A
   request naming an agent that is not attached is refused rather than sent elsewhere. Cancelling a
-  command needs no name, because a command's id is unique across the whole hub.
+  command needs no name, because a command's id is unique across the whole hub. A revoke always
+  names its agent, attached or not, since it stands for the name rather than a connection.
 - The status the control API reports lists every attached agent — its name, version, capabilities,
-  when it connected, when it last answered a ping, and the commands running on it — and every
-  departed one with when it left, and the traffic log tags each frame with the agent it crossed to
-  or from.
+  when it connected, when it last answered a ping, and the commands running on it — every
+  departed one with when it left, and every revoked name with when it was revoked; the traffic log
+  tags each frame with the agent it crossed to or from.
 - A departed agent is one that was uninstalled, told apart from one that is merely disconnected. An
   agent the hub sends a leave to is recorded as departed at once, and so is an agent whose
   uninstaller tells the hub it was removed by hand; either is dropped from the attached list. A
   disconnected agent is simply absent from the attached list, so a reader that expects a machine can
   tell a box that is down from one that is gone. The record is kept in a file under the hub's data
   directory, so a restart does not forget it, and a later hello under a departed name — a reinstall —
-  removes the name from it. The hub writes a line to its log for every departure and every return.
+  removes the name from it. A hello under a revoked name is no return: it is answered with a leave
+  and recorded as a departure again (「Configuration and secrets」). The hub writes a line to its log
+  for every departure and every return.
 
 ## What crosses the tunnel
 
@@ -144,6 +147,18 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   machine an invited person installs, and for the machine a person pairs the desktop app with — so a
   person is given a credential for their own machine's name and never the shared secret. A hub with no
   agent key accepts the shared secret alone.
+- **A name is revoked for good:** a name credential carries no expiry, so the hub keeps a record of
+  revoked agent names in a file under its data directory, read at startup. `POST /revoke?agent=<name>`,
+  taken with the control token or a scoped credential whose reach admits the name, records it and,
+  where an agent is attached under it, sends that agent a leave at once; it answers 200 with whether
+  a leave was sent, and revoking a name already revoked changes nothing. Where an agent presenting a
+  name credential says hello under a revoked name, the hub accepts the upgrade and answers the hello
+  with a leave instead of a welcome, so the desktop app forgets its credential and offers pairing
+  again and an installed agent uninstalls itself, and it records and logs the attempt as a departure.
+  A hello never lifts a revocation and no route does: a pairing always binds a fresh name, so a
+  revoked name never needs to come back. A hello under a revoked name with the shared secret is the
+  administrator's own and attaches as any other. `jake-hub revoked` prints the revoked names the
+  configured control credential reaches.
 - **A control caller may present a credential scoped to named agents** instead of the control token:
   `<names>.<mac>`, where the names are agent names joined by commas and the mac is the lowercase hex
   of HMAC-SHA256 over that list, keyed by the hub's control key (`JAKE_CONTROL_KEY`). The control
@@ -271,8 +286,9 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   removal that undid only part of the install would be repaired by the part it left running, so
   leaving is a single ordered act that stops every part and removes every file it placed.
 - The leave signal reaches the agent over the tunnel — it is the one instruction the hub carries that
-  is not a shell command. Only the agent holds the tunnel, so a leave is possible only while the agent
-  is attached, and it reaches only the agent it names; the others stay installed.
+  is not a shell command. Only the agent holds the tunnel, so a leave reaches an agent only while it is
+  attached, or, for a name the hub has revoked, the next time it says hello (「Configuration and
+  secrets」); it reaches only the agent it names, and the others stay installed.
 - On a Linux host, leaving is what the service manager already makes simple: the agent stops and
   disables its own `systemd --user` unit so nothing restarts it, removes the unit file, deletes its
   data directory and log, and exits. Because the executable was placed as an ordinary per-user file,
@@ -300,7 +316,9 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   just as a leave is. Once it has stopped the agent, and before it deletes the executable, it runs the
   executable once in its leave-notice mode: that process dials the hub with the configured secret
   and name, says hello, and once welcomed sends a leave frame of its own and exits. The agent is
-  already stopped, so this hello displaces no live connection. A hub that cannot be reached does not
+  already stopped, so this hello displaces no live connection. Under a revoked name the hub answers
+  that hello with a leave and has recorded the departure itself, so the notice sends nothing, says
+  the hub already holds the agent as left, and succeeds. A hub that cannot be reached does not
   stop the uninstall; the uninstaller says the hub was not told and carries on.
 
 ## Running commands

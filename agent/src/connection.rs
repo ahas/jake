@@ -81,6 +81,16 @@ pub enum Ended {
   Superseded,
 }
 
+/// How the hub learned of a leave the uninstaller announced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaveNotice {
+  /// The hub welcomed the hello and was sent the leave.
+  Sent,
+  /// The hub answered the hello with a leave of its own: the name is revoked, and the hub has
+  /// recorded the departure already.
+  AlreadyRecorded,
+}
+
 enum DialError {
   /// The hub answered the upgrade and turned the credential away with this status.
   Refused(u16),
@@ -196,7 +206,7 @@ impl Agent {
   }
 
   /// Tell the hub this agent is uninstalled, so it is forgotten rather than counted as disconnected.
-  pub async fn announce_leave(&self) -> Result<(), String> {
+  pub async fn announce_leave(&self) -> Result<LeaveNotice, String> {
     let socket = self.dial().await.map_err(|error| match error {
       DialError::Refused(status) => format!("the hub refused the shared secret (HTTP {status})"),
       DialError::Failed(error) => format!("the hub could not be reached: {error}"),
@@ -210,7 +220,8 @@ impl Agent {
       while let Some(Ok(message)) = stream.next().await {
         if let Message::Text(text) = message {
           match decode_frame(text.as_str(), self.config.max_payload_bytes) {
-            Ok(Frame::Welcome { .. }) => return Ok(()),
+            Ok(Frame::Welcome { .. }) => return Ok(LeaveNotice::Sent),
+            Ok(Frame::Leave) => return Ok(LeaveNotice::AlreadyRecorded),
             Ok(Frame::Reject { reason }) => return Err(format!("the hub refused the agent: {reason}")),
             _ => {}
           }
@@ -218,11 +229,17 @@ impl Agent {
       }
       Err("the hub closed the connection before welcoming it".to_owned())
     });
-    answer.await.map_err(|_| "the hub did not answer the hello".to_owned())??;
-    send(&mut sink, Frame::Leave).await?;
+    let notice = answer.await.map_err(|_| "the hub did not answer the hello".to_owned())??;
+    if notice == LeaveNotice::Sent {
+      send(&mut sink, Frame::Leave).await?;
+    }
     let _ = timeout(CLOSE_GRACE, sink.close()).await;
-    self.log.warn("leave-announced", json!({ "agent": self.config.agent_name }));
-    Ok(())
+    let event = match notice {
+      LeaveNotice::Sent => "leave-announced",
+      LeaveNotice::AlreadyRecorded => "leave-already-recorded",
+    };
+    self.log.warn(event, json!({ "agent": self.config.agent_name }));
+    Ok(notice)
   }
 }
 

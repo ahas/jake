@@ -388,6 +388,16 @@ pub async fn entry(State(control): State<Arc<Control>>, request: Request) -> Res
         Err(reason) => json(409, &json!({ "ok": false, "reason": reason })),
       },
     },
+    (Method::POST, "/revoke") => {
+      let Some(name) = query.agent().filter(|name| !name.is_empty()).map(str::to_owned) else {
+        return error(400, "the agent query parameter is required");
+      };
+      if !reach.admits(&name) {
+        return refusal(&Refusal::out_of_reach(&name));
+      }
+      let left = hub.revoke(&name);
+      json(200, &json!({ "ok": true, "agent": name, "left": left }))
+    }
     (Method::POST | Method::DELETE, "/listen") => {
       let Some(name) = query.agent().filter(|name| !name.is_empty()).map(str::to_owned) else {
         return error(400, "the agent query parameter is required");

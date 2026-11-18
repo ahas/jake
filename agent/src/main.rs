@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
 use jake_agent::platform::{self, Platform, Role};
-use jake_agent::{Agent, Ended, Log, VERSION, config, departure};
+use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure};
 use serde_json::json;
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
@@ -149,8 +149,12 @@ async fn run_guard(start: Start) -> ExitCode {
 async fn run_leave(start: Start) -> ExitCode {
   let agent = Agent::new(start.config, VERSION.to_owned(), start.log);
   match agent.announce_leave().await {
-    Ok(()) => {
+    Ok(LeaveNotice::Sent) => {
       println!("the hub was told {} has left", agent.config.agent_name);
+      ExitCode::SUCCESS
+    }
+    Ok(LeaveNotice::AlreadyRecorded) => {
+      println!("the hub had already recorded {} as left: its name is revoked", agent.config.agent_name);
       ExitCode::SUCCESS
     }
     Err(error) => {
