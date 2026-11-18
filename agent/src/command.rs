@@ -5,9 +5,14 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-/// The Windows process-creation flag that gives a console program no visible window.
+/// How every child starts on Windows: a console of its own with no visible window, and a process group
+/// of its own, so a console event a child sends to its group or its console never reaches the agent.
 #[cfg(windows)]
-pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const CHILD_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 /// A command whose standard streams are discarded and which opens no window of its own.
 pub fn quiet(argv: &[String]) -> Option<Command> {
@@ -15,7 +20,7 @@ pub fn quiet(argv: &[String]) -> Option<Command> {
   let mut command = Command::new(file);
   command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
   #[cfg(windows)]
-  command.creation_flags(CREATE_NO_WINDOW);
+  command.creation_flags(CHILD_CREATION_FLAGS);
   Some(command)
 }
 

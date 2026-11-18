@@ -95,13 +95,21 @@ into both binaries.
   brings it back, and every minute both check the three autostart anchors: a logon scheduled task, a
   registry Run value, and a Startup-folder shortcut. A deleted anchor, or a task whose settings were
   changed, is restored within a minute as long as either program is alive.
+- Neither program opens a window, so there is no console window to close by accident, and closing a
+  terminal or pressing Ctrl+C anywhere does not stop them.
+- If both programs die together while this account is logged on, Task Scheduler starts them again
+  within five minutes: each scheduled task repeats every five minutes, and a start that finds its
+  program already running is dropped. It also starts a task again up to three times, a minute apart,
+  after a run it counts as failed.
 - The scheduled tasks have no run-time limit and run on battery, so Task Scheduler never ends the
   pair on its own after a few days.
 - All three anchors belong to **this user account**. They register without administrator rights, and
-  so they fire when **this account logs on**, not at boot itself.
-- If both programs die together and the anchors are wiped as well, jake comes back at **this
-  account's next logon**. On a machine without auto-logon, boot and logon are different events; while
-  the machine sits powered on with nobody logged in, jake stays down for that stretch.
+  so they fire when **this account logs on**, and repeat only while it stays logged on, not at boot
+  itself.
+- If both programs die together while nobody is logged on, or the anchors are wiped as well, jake
+  comes back at **this account's next logon**. On a machine without auto-logon, boot and logon are
+  different events; while the machine sits powered on with nobody logged in, jake stays down for that
+  stretch.
 - **With auto-logon on**, boot is logon, so jake comes back on its own after a reset or reboot with no
   one touching it. On a machine that resets often, auto-logon makes recovery certain.
 - Starting at boot before logon needs an administrator account, and the install stays without

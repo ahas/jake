@@ -3,6 +3,7 @@
 mod command;
 pub mod config;
 mod connection;
+pub mod console;
 pub mod departure;
 mod exec;
 pub mod installed;

@@ -1,5 +1,8 @@
 // The jake executable: the agent, the Windows guard, or the uninstaller's leave notice, by its argument.
 
+// On Windows it opens no console, so no console's close or key can end it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,27 +43,26 @@ fn start() -> Result<Start, String> {
   })
 }
 
-/// Resolves when the process is asked to stop.
-async fn stop_requested() {
-  #[cfg(unix)]
-  {
-    use tokio::signal::unix::{SignalKind, signal};
-    match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
-      (Ok(mut interrupt), Ok(mut terminate)) => {
-        tokio::select! {
-          _ = interrupt.recv() => {}
-          _ = terminate.recv() => {}
-        }
+/// Resolves when the process is asked to stop, by an interrupt or a termination signal.
+#[cfg(unix)]
+async fn stop_requested(_log: &Log) {
+  use tokio::signal::unix::{SignalKind, signal};
+  match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+    (Ok(mut interrupt), Ok(mut terminate)) => {
+      tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
       }
-      _ => std::future::pending().await,
     }
+    _ => std::future::pending().await,
   }
-  #[cfg(windows)]
-  {
-    if tokio::signal::ctrl_c().await.is_err() {
-      std::future::pending::<()>().await;
-    }
-  }
+}
+
+/// Resolves when the process is asked to stop, by a console event that ends it anyway; the log takes
+/// every console event it is sent.
+#[cfg(windows)]
+async fn stop_requested(log: &Log) {
+  jake_agent::console::stop_requested(log.clone()).await;
 }
 
 /// The lock and watchdog that keep one copy of a Windows run mode alive, or nothing elsewhere.
@@ -71,11 +73,12 @@ struct Pair {
 
 impl Pair {
   /// Take this run mode's lock and start its watchdog; none when another copy already holds the lock,
-  /// since the three anchors all fire at one logon and only the first copy is to run.
+  /// since the three anchors all fire at one logon and the task's repeating trigger fires while it
+  /// runs, and only the first copy is to run. A copy that finds the lock held exits writing nothing, so
+  /// the repeating trigger adds no line to the log.
   fn start(role: Role, start: &Start) -> Option<Self> {
     let lock = PathBuf::from(Platform::Windows.lock_path(&start.env, role));
     if !pair::acquire_lock(&lock, std::process::id(), pair::pid_alive) {
-      start.log.info(&format!("{}-already-running", role.name()), json!({}));
       return None;
     }
     let watchdog = Watchdog {
@@ -118,7 +121,7 @@ async fn run_agent(start: Start) -> ExitCode {
   );
   let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone());
   // The tunnel ends only on a hub's leave; by then every run and transfer it carried has ended.
-  let leave = jake_agent::run(&agent, stop_requested()).await == Ended::Left;
+  let leave = jake_agent::run(&agent, stop_requested(&log)).await == Ended::Left;
   // The watchdog stops before anything is torn down, so it neither rewrites an anchor nor revives the guard.
   if let Some(pair) = pair {
     pair.stop();
@@ -138,7 +141,7 @@ async fn run_guard(start: Start) -> ExitCode {
     "guard-starting",
     json!({ "installDir": start.install_dir.to_string_lossy(), "version": VERSION }),
   );
-  stop_requested().await;
+  stop_requested(&start.log).await;
   pair.stop();
   ExitCode::SUCCESS
 }

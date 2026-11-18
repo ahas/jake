@@ -204,6 +204,18 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   process is caught and repaired by something that is still running, and the agent returns the favour.
   They are distinct processes with distinct anchors and distinct scheduled tasks, so either can be
   relaunched on its own, and each watches the other.
+- Neither process has a console. The executable is built for the Windows subsystem, so whatever
+  starts it, a task, the Run value or the Startup shortcut, opens no console window, and no console
+  close, Ctrl+C or Ctrl+Break can reach either process. A console program started from an
+  interactive task gets a console window of its own, and Windows ends it, writing nothing, with the
+  status 0xC000013A when that window closes; two such windows closed together end the pair together.
+  Should a console event reach a process all the same, its own handler answers it in place of
+  Windows' default: an interrupt, a break or a logoff notice is written to the log and ignored, and a
+  console close or a shutdown, which end the process whatever the handler answers, is written to the
+  log and stops the run cleanly first.
+- Every child the agent starts, a command a caller runs and the helpers the watchdog runs alike,
+  starts with a hidden console and a process group of its own, so a console event a child sends to
+  its group or its console never reaches the agent.
 - Each process watches the other by a heartbeat, not by watching for an exit. On every tick a
   process rewrites the file that records its own liveness and reads the file its peer keeps; a peer
   whose timestamp is older than the staleness threshold — or whose file is missing — reads as dead,
@@ -222,23 +234,32 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   configuration rather than constants. Three ticks means a peer is declared dead only after it has
   missed three consecutive heartbeat writes, so one slow or paused tick does not cause a false
   relaunch, while a real death or hang is caught within about three minutes.
-- The three anchors are all per-user and need no elevation: a logon-triggered scheduled task with no
-  stored credentials, a per-user run entry in the registry, and a shortcut in the Startup folder.
-  Both run modes are anchored all three ways — the agent's anchors launch the executable with no
-  argument, the guard's launch it with the guard-mode flag — so either can return on its own at
-  logon. The consequence of staying per-user is stated plainly: after a kill that ends both processes
-  and wipes the anchors, recovery is bound to this user's **next interactive logon**, not to the next
+- The three anchors are all per-user and need no elevation: a scheduled task with no stored
+  credentials, a per-user run entry in the registry, and a shortcut in the Startup folder. Both run
+  modes are anchored all three ways — the agent's anchors launch the executable with no argument, the
+  guard's launch it with the guard-mode flag — so either can return on its own at logon.
+- The pair is the first supervisor and Task Scheduler the second. Each run mode's task starts it at
+  logon and also on a trigger that repeats every five minutes, from registration on, with no end, so
+  a pair that dies together while the user stays logged on is started again by Task Scheduler within
+  five minutes, with neither process alive to do it. A repeat that finds the run mode running is
+  dropped: by Task Scheduler where the task's own copy runs, by the single-instance lock where a copy
+  another anchor started runs. The task is also started again up to three times, a minute apart,
+  after a run Task Scheduler counts as failed; a process that ends with an error code is not always
+  counted so, and the repeating trigger is what covers it.
+- The consequence of staying per-user is stated plainly: the tasks run only while this user is
+  logged on, so after a kill that ends both processes while nobody is logged on, or one that also
+  wipes the anchors, recovery is bound to this user's **next interactive logon**, not to the next
   boot. On a machine without auto-logon those are different events, and the gap between them is
   unbounded until someone logs in. Boot-time recovery, or a task that runs whether the user is logged
   on or not, would need an administrator account the install may not have, so neither is used.
 - The scheduled task has no run-time limit, and starts and keeps running on battery. Task
   Scheduler's default limit of three days would end both processes together, since they are started
-  together, and nothing but the next logon would bring them back. The installer registers the task
-  with these settings, and a tick that reads back other settings, the defaults among them, registers
-  it again with these.
-- Because all three anchors for a run mode fire at the same logon, a single logon would otherwise
-  start three copies of it. A single-instance guard prevents that: each run mode takes an exclusive
-  lock on startup, and only the copy that takes it runs while the rest exit. The lock is a file created
+  together. The installer registers the task with these settings, the two triggers and the restarts,
+  and a tick that reads back other settings, the defaults among them, registers it again with these.
+- Because all three anchors for a run mode fire at the same logon, and the repeating trigger fires
+  while it runs, a single logon would otherwise start three copies of it and every repeat one more. A
+  single-instance guard prevents that: each run mode takes an exclusive lock on startup, and only the
+  copy that takes it runs while the rest exit, writing nothing to the log. The lock is a file created
   atomically — the OS lets exactly one exclusive create win, so even near-simultaneous copies cannot
   both take it — and it holds the holder's process id, so a lock left behind by a crashed process is
   reclaimed once that id is seen to be gone, rather than blocking the binary forever.

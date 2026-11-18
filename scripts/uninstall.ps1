@@ -50,11 +50,20 @@ Start-Sleep -Milliseconds 500
 # Tell the hub this agent is gone, so it is recorded as departed rather than shown as disconnected.
 # The pair is already stopped, so the notice's own hello displaces no live connection. A hub that
 # cannot be reached does not stop the removal.
+# jake.exe opens no console, so PowerShell would not wait on it run as a command: it is started and
+# waited on, and what it printed is read back from files.
 $Exe = Join-Path $InstallDir 'jake.exe'
 if (Test-Path $Exe) {
   Write-Step "telling the hub this agent has left"
-  & $Exe --leave
-  if ($LASTEXITCODE -ne 0) { Write-Host "  ! the hub was not told; it will show this agent as disconnected" -ForegroundColor Yellow }
+  $said = Join-Path ([System.IO.Path]::GetTempPath()) ('jake-leave-' + [System.Guid]::NewGuid().ToString('N'))
+  $leave = Start-Process -FilePath $Exe -ArgumentList '--leave' -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$said.out" -RedirectStandardError "$said.err"
+  foreach ($file in @("$said.out", "$said.err")) {
+    if (Test-Path -LiteralPath $file) {
+      Get-Content -LiteralPath $file | ForEach-Object { Write-Host "  $_" }
+      Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
+  }
+  if ($leave.ExitCode -ne 0) { Write-Host "  ! the hub was not told; it will show this agent as disconnected" -ForegroundColor Yellow }
 }
 
 Write-Step "removing autostart anchors"

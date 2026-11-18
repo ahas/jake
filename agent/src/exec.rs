@@ -366,7 +366,7 @@ fn spawn(invocation: &Invocation) -> std::io::Result<tokio::process::Child> {
   #[cfg(unix)]
   command.process_group(0);
   #[cfg(windows)]
-  command.creation_flags(crate::command::CREATE_NO_WINDOW);
+  command.creation_flags(crate::command::CHILD_CREATION_FLAGS);
   command.spawn()
 }
 

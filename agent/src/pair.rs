@@ -115,11 +115,26 @@ pub fn run_key_remove_command(target: &AnchorTarget) -> Vec<String> {
   owned(&["reg", "delete", RUN_KEY, "/v", target.name, "/f"])
 }
 
-/// Create, or overwrite in place, the logon-triggered task for this run mode, with the settings the
-/// installer registers it with. It stores no credential and runs non-elevated; a boot trigger or a
-/// task that runs logged off would need an administrator. It starts and keeps running on battery and
-/// has no run-time limit, since Task Scheduler's default of three days would end both run modes
-/// together; `schtasks /create` cannot set either, so the task is registered through PowerShell.
+/// How often the task's repeating trigger starts its run mode, so Task Scheduler itself brings back a
+/// pair that died together while this user stays logged on. A start while the run mode runs is
+/// dropped: by Task Scheduler where the task's own copy runs, by the lock where another anchor's does.
+pub const TASK_REPEAT_MINUTES: u32 = 5;
+/// How many times, and how far apart, Task Scheduler starts the task again after a run it counts as
+/// failed; the repeating trigger covers an end it does not count.
+pub const TASK_RESTART_COUNT: u32 = 3;
+pub const TASK_RESTART_MINUTES: u32 = 1;
+
+/// A whole number of minutes as Task Scheduler writes a duration.
+fn task_minutes(minutes: u32) -> String {
+  format!("PT{minutes}M")
+}
+
+/// Create, or overwrite in place, the task for this run mode, with the settings the installer
+/// registers it with. It starts at logon and on a trigger repeating from registration on with no end,
+/// and is started again after a failed run. It stores no credential and runs non-elevated; a boot
+/// trigger or a task that runs logged off would need an administrator. It starts and keeps running on
+/// battery and has no run-time limit, since Task Scheduler's default of three days would end both run
+/// modes together; `schtasks /create` cannot set those, so the task is registered through PowerShell.
 pub fn task_create_command(target: &AnchorTarget) -> Vec<String> {
   let mut action = format!("New-ScheduledTaskAction -Execute {}", ps_single_quote(&target.binary_path));
   if !target.args.is_empty() {
@@ -127,15 +142,21 @@ pub fn task_create_command(target: &AnchorTarget) -> Vec<String> {
   }
   let lines = [
     format!("$action = {action}"),
-    "$trigger = New-ScheduledTaskTrigger -AtLogOn".to_owned(),
-    "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
-     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)"
-      .to_owned(),
+    "$logon = New-ScheduledTaskTrigger -AtLogOn".to_owned(),
+    format!(
+      "$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes \
+       {TASK_REPEAT_MINUTES})"
+    ),
+    format!(
+      "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
+       -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount {TASK_RESTART_COUNT} \
+       -RestartInterval (New-TimeSpan -Minutes {TASK_RESTART_MINUTES})"
+    ),
     "$principal = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -LogonType Interactive \
      -RunLevel Limited"
       .to_owned(),
     format!(
-      "Register-ScheduledTask -TaskName {} -Action $action -Trigger $trigger -Settings $settings \
+      "Register-ScheduledTask -TaskName {} -Action $action -Trigger @($logon, $repeat) -Settings $settings \
        -Principal $principal -Force | Out-Null",
       ps_single_quote(target.name)
     ),
@@ -165,9 +186,10 @@ pub fn query_text(bytes: &[u8]) -> String {
 }
 
 /// Whether a task definition, as `schtasks /query /xml` prints it, is the one `task_create_command`
-/// registers for this run mode: a logon trigger, the action that runs this run mode, no run-time
-/// limit, and starting, and running on, battery. An element left out holds Task Scheduler's default,
-/// and a definition that cannot be read is not the one.
+/// registers for this run mode: an enabled logon trigger and an enabled trigger repeating at the
+/// interval with no end, the action that runs this run mode, the restarts after a failed run, no
+/// run-time limit, and starting, and running on, battery. An element left out holds Task Scheduler's
+/// default, and a definition that cannot be read is not the one.
 pub fn task_definition_holds(xml: &str, target: &AnchorTarget) -> bool {
   let Ok(document) = roxmltree::Document::parse(xml) else {
     return false;
@@ -176,17 +198,33 @@ pub fn task_definition_holds(xml: &str, target: &AnchorTarget) -> bool {
   let Some(settings) = child(task, "Settings") else {
     return false;
   };
-  let logon_trigger = child(task, "Triggers").and_then(|triggers| child(triggers, "LogonTrigger"));
+  let triggers = child(task, "Triggers");
+  let logon_trigger = triggers.and_then(|triggers| child(triggers, "LogonTrigger"));
+  let time_trigger = triggers.and_then(|triggers| child(triggers, "TimeTrigger"));
+  let repetition = time_trigger.and_then(|trigger| child(trigger, "Repetition"));
+  let restart = child(settings, "RestartOnFailure");
   let exec = child(task, "Actions").and_then(|actions| child(actions, "Exec"));
   let command = text(exec.and_then(|exec| child(exec, "Command")), "");
   let arguments = text(exec.and_then(|exec| child(exec, "Arguments")), "");
-  logon_trigger.is_some()
+  logon_trigger.is_some_and(enabled)
+    && time_trigger.is_some_and(enabled)
+    && text(repetition.and_then(|repetition| child(repetition, "Interval")), "")
+      == task_minutes(TASK_REPEAT_MINUTES)
+    && text(repetition.and_then(|repetition| child(repetition, "Duration")), "").is_empty()
     && command.trim_matches('"').eq_ignore_ascii_case(&target.binary_path)
     && arguments == target.args.join(" ")
+    && text(restart.and_then(|restart| child(restart, "Count")), "") == TASK_RESTART_COUNT.to_string()
+    && text(restart.and_then(|restart| child(restart, "Interval")), "")
+      == task_minutes(TASK_RESTART_MINUTES)
     && text(child(settings, "ExecutionTimeLimit"), "PT72H") == "PT0S"
     && text(child(settings, "DisallowStartIfOnBatteries"), "true") == "false"
     && text(child(settings, "StopIfGoingOnBatteries"), "true") == "false"
     && text(child(settings, "StartWhenAvailable"), "false") == "true"
+}
+
+/// Whether a trigger fires: one with no `Enabled` element does.
+fn enabled(trigger: roxmltree::Node<'_, '_>) -> bool {
+  text(child(trigger, "Enabled"), "true") == "true"
 }
 
 /// The child element of a task definition's element with the given name, whatever its namespace.
@@ -475,22 +513,28 @@ mod tests {
   }
 
   #[test]
-  fn every_rewrite_registers_the_task_with_no_run_time_limit_and_running_on_battery() {
+  fn every_rewrite_registers_the_task_repeating_and_restarting_with_no_run_time_limit_and_on_battery() {
     for target in install_targets("C:\\jake") {
       let task = decode(&task_create_command(&target)[6]);
+      assert!(task.contains("$logon = New-ScheduledTaskTrigger -AtLogOn\n"));
+      assert!(task.contains(
+        "$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)\n"
+      ));
       assert!(task.contains(
         "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries \
-         -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)\n"
+         -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval \
+         (New-TimeSpan -Minutes 1)\n"
       ));
-      assert!(task.contains("-Settings $settings"));
+      assert!(task.contains("-Trigger @($logon, $repeat) -Settings $settings"));
     }
   }
 
   const INSTALL_DIR: &str = "C:\\Users\\tester\\AppData\\Local\\Programs\\jake";
 
-  /// The guard's task as `schtasks /query /xml` printed it into a pipe on a Windows PC, once
-  /// registered the way the installer and `task_create_command` register it: single-byte text under a
-  /// declaration that names UTF-16. The user's SID and folder are replaced.
+  /// The guard's task as `schtasks /query /xml` prints it into a pipe on a Windows PC, once registered
+  /// the way the installer and `task_create_command` register it: single-byte text under a declaration
+  /// that names UTF-16. The user's SID and folder are replaced. A PC printed it before the restarts and
+  /// the repeating trigger were registered; those are laid out as Task Scheduler's schema writes them.
   const REGISTERED_AS_IT_MUST_BE: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -515,9 +559,20 @@ mod tests {
       <RestartOnIdle>false</RestartOnIdle>
     </IdleSettings>
     <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
   </Settings>
   <Triggers>
     <LogonTrigger />
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-11-18T10:16:40+09:00</StartBoundary>
+    </TimeTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec>
@@ -579,10 +634,30 @@ mod tests {
   }
 
   #[test]
-  fn a_task_with_the_three_day_limit_or_none_at_all_is_registered_again() {
+  fn a_task_missing_any_setting_or_absent_is_registered_again() {
     let [agent, guard] = install_targets(INSTALL_DIR);
-    let limited = REGISTERED_AS_IT_MUST_BE.replace("PT0S", "PT72H");
-    assert_eq!(task_refresh_command(&guard, Some(&limited)), Some(task_create_command(&guard)));
+    let restarts = "    <RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>3</Count>\n    </RestartOnFailure>\n";
+    let changed = [
+      (
+        "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+        "<ExecutionTimeLimit>PT72H</ExecutionTimeLimit>",
+      ),
+      (restarts, ""),
+      ("<Count>3</Count>", "<Count>1</Count>"),
+      ("<Interval>PT5M</Interval>", "<Interval>PT1H</Interval>"),
+      ("<StopAtDurationEnd>", "<Duration>P1D</Duration>\n        <StopAtDurationEnd>"),
+      ("</StartBoundary>", "</StartBoundary>\n      <Enabled>false</Enabled>"),
+      ("<LogonTrigger />", "<LogonTrigger><Enabled>false</Enabled></LogonTrigger>"),
+    ];
+    for (held, changed_to) in changed {
+      assert!(REGISTERED_AS_IT_MUST_BE.contains(held), "{held}");
+      let changed = REGISTERED_AS_IT_MUST_BE.replace(held, changed_to);
+      assert_eq!(
+        task_refresh_command(&guard, Some(&changed)),
+        Some(task_create_command(&guard)),
+        "{changed_to}"
+      );
+    }
     let by_schtasks = query_text(REGISTERED_BY_SCHTASKS.as_bytes());
     assert_eq!(task_refresh_command(&agent, Some(&by_schtasks)), Some(task_create_command(&agent)));
     assert_eq!(task_refresh_command(&guard, None), Some(task_create_command(&guard)));

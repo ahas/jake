@@ -170,7 +170,8 @@ describe("install.sh --update", () => {
 });
 
 // The Windows commands install.ps1 calls, stood in for under pwsh: the registry value and the Startup
-// shortcut are accepted and dropped, a registered task is recorded with its run-time limit, the jake
+// shortcut are accepted and dropped, a registered task is recorded with its triggers, its run-time limit
+// and its restarts, the jake
 // processes are the tasks started and not since stopped, and starting the agent's task logs it starting
 // and, where the executable in place says it does, reaching the hub. Moving the file JAKE_TEST_FAIL_MOVE
 // names fails, as a swap or a rollback may while the file is held.
@@ -206,15 +207,20 @@ function New-Object {
   Microsoft.PowerShell.Utility\\New-Object @args
 }
 function New-ScheduledTaskAction { param($Execute, $Argument) @{ Argument = $Argument } }
-function New-ScheduledTaskTrigger { param([switch]$AtLogOn) }
+function New-ScheduledTaskTrigger {
+  param([switch]$AtLogOn, [switch]$Once, $At, $RepetitionInterval, $RepetitionDuration)
+  if ($AtLogOn) { return 'at logon' }
+  if ($null -ne $RepetitionDuration) { return "every $RepetitionInterval for $RepetitionDuration" }
+  "every $RepetitionInterval"
+}
 function New-ScheduledTaskSettingsSet {
-  param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $ExecutionTimeLimit)
-  @{ ExecutionTimeLimit = $ExecutionTimeLimit }
+  param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $ExecutionTimeLimit, $RestartCount, $RestartInterval)
+  @{ ExecutionTimeLimit = $ExecutionTimeLimit; RestartCount = $RestartCount; RestartInterval = $RestartInterval }
 }
 function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) }
 function Register-ScheduledTask {
   param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force)
-  $global:JakeRegistered += "$TaskName limit $($Settings.ExecutionTimeLimit)"
+  $global:JakeRegistered += "$TaskName $($Trigger -join ' and ') limit $($Settings.ExecutionTimeLimit) restart $($Settings.RestartCount) after $($Settings.RestartInterval)"
 }
 function Start-ScheduledTask {
   param($TaskName)
@@ -284,7 +290,7 @@ catch { "OUTCOME: $_" }
 
 // Each case starts PowerShell, which takes seconds on a loaded machine.
 describe("install.ps1 -Update", () => {
-  test("a new executable that reaches the hub stays, the previous one is dropped, and the tasks have no run-time limit", async () => {
+  test("a new executable that reaches the hub stays, the previous one is dropped, and the tasks repeat and restart with no run-time limit", async () => {
     const at = windowsMachine("old reaches", "new reaches");
     const { outcome, output, running, registered } = await windowsUpdate(at);
     expect(outcome).toBe("installed");
@@ -292,7 +298,8 @@ describe("install.ps1 -Update", () => {
     expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("new reaches");
     expect(existsSync(join(at.install, "jake.previous.exe"))).toBe(false);
     expect(running).toBe("JakeAgent JakeGuard");
-    expect(registered).toBe("JakeAgent limit 00:00:00, JakeGuard limit 00:00:00");
+    const task = "at logon and every 00:05:00 limit 00:00:00 restart 3 after 00:01:00";
+    expect(registered).toBe(`JakeAgent ${task}, JakeGuard ${task}`);
   }, 30_000);
 
   test("a new executable that never reaches the hub gives way to the previous one, though the log held an earlier welcome", async () => {

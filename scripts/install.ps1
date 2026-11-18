@@ -367,8 +367,9 @@ try {
 
   # --- register the three anchors for both run modes --------------------------------------------
   # These mirror the agent's own anchor commands exactly, so the watchdog's per-tick rewrite keeps the
-  # same registrations rather than competing with them: a per-user Run value, a logon-triggered
-  # scheduled task with no stored credentials at the limited run level, and a Startup-folder shortcut.
+  # same registrations rather than competing with them: a per-user Run value, a scheduled task started
+  # at logon and on a repeating trigger with no stored credentials at the limited run level, and a
+  # Startup-folder shortcut.
   # All three are per-user and need no elevation. Overwriting in place is what makes a re-run add no
   # duplicates. The guard run mode launches the same exe with the guard flag.
 
@@ -379,19 +380,23 @@ try {
     $data = if ($arguments) { '"' + $exe + '" ' + $arguments } else { '"' + $exe + '"' }
     New-ItemProperty -Path $RunKey -Name $name -Value $data -PropertyType String -Force | Out-Null
 
-    # Scheduled task: logon-triggered, self-owned (current user, interactive token, no stored
-    # password), limited run level, starting and running on battery and with no run-time limit, since
-    # the default of three days would end both run modes together. The exe path and argument pass as
-    # values rather than through fragile native-command quoting.
+    # Scheduled task: started at logon and every five minutes from now on with no end, so Task
+    # Scheduler itself brings back a pair that died together while this user stays logged on, a start
+    # while the run mode runs being dropped; started again up to three times a minute apart after a
+    # run it counts as failed. Self-owned (current user, interactive token, no stored password),
+    # limited run level, starting and running on battery and with no run-time limit, since the default
+    # of three days would end both run modes together. The exe path and argument pass as values rather
+    # than through fragile native-command quoting.
     if ($arguments) {
       $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments
     } else {
       $action = New-ScheduledTaskAction -Execute $exe
     }
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $logon = New-ScheduledTaskTrigger -AtLogOn
+    $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger @($logon, $repeat) -Settings $settings -Principal $principal -Force | Out-Null
 
     # Startup shortcut: built through WScript.Shell, the same way the watchdog builds it.
     $lnk = Join-Path $StartupDir "$name.lnk"
