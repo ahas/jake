@@ -82,12 +82,20 @@ flowchart TD
 - **The page never touches the credential.** The Rust side asks for the pairing and polls it over its
   own HTTPS client; the window only shows the approval page, so the credential never passes through
   the page's JavaScript.
-- **The code is shown on both sides.** The app shows the pairing's code in its window title and on its
-  local page, and the approval page shows the same code, so the person can see they are approving this
-  app.
+- **The code is shown on both sides.** The approval page shows the pairing's code, and the app shows
+  the same code at the head of its main window's title, as `연결 코드 <code> · BMO`, so the person can
+  see they are approving this app. Once the console answers, the main window shows the approval page
+  itself, so the title bar is the one place the app's copy of the code stays visible; the code leads
+  the title so a title cut short still shows it. The local page shows the code too, but only while the
+  console cannot be reached.
 - **The answer is checked before it is kept:** the credential must name the machine the answer names,
   and the hub's URL must be a WebSocket address. An approval page outside the console's origin is
   refused.
+- **The built-in agent announces itself as the app's.** The version in its hello is always
+  `desktop-<version>`, the app's own version behind the prefix `desktop-`. The prefix is a contract:
+  the account service reads it to list the machine's kind as desktop, and it is what tells the
+  built-in agent from an installed one, whose version names its build. The hub orders no update onto
+  such a version (docs/install.md), since the app brings its agent along with its own updates.
 - **A pairing that fails is offered again,** by a button on the local page; the app never asks the
   console for pairings in a loop of its own.
 

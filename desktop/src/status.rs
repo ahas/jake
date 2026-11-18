@@ -121,10 +121,11 @@ impl Status {
     }
   }
 
-  /// The window's title: the product, and the pairing code while one is open.
+  /// The window's title: the product, led by the pairing code while one is open so a title cut short
+  /// still shows it.
   pub fn title(&self) -> String {
     match &self.agent {
-      AgentState::Pairing { code, .. } => format!("BMO · 연결 코드 {code}"),
+      AgentState::Pairing { code, .. } => format!("연결 코드 {code} · BMO"),
       _ => "BMO".to_owned(),
     }
   }
@@ -217,5 +218,23 @@ impl AgentState {
         Some(Action::PairAgain),
       ),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn the_title_leads_with_an_open_pairing_code() {
+    let pairing = Status {
+      console: ConsoleState::Shown,
+      agent: AgentState::Pairing {
+        code: "ABCD-EFGH".to_owned(),
+        approve_url: Url::parse("https://console.example.test/desktop/pair").expect("url"),
+      },
+    };
+    assert_eq!(pairing.title(), "연결 코드 ABCD-EFGH · BMO");
+    assert_eq!(Status::default().title(), "BMO");
   }
 }
