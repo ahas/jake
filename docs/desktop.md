@@ -153,6 +153,8 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   a value of the wrong type, leaves the app on its defaults with the reason in its log, and the
   settings screen then says the file cannot be read and changes nothing, since writing it would
   overwrite the hand edit it could not read.
+- **A byte-order mark at the file's start is read past,** since Windows editors and PowerShell write
+  one before UTF-8; the app writes none.
 - **A change is written the moment it is made,** the whole file replaced by a rename, so a reader never
   sees half of it. Every key the app does not know is written back as it was read, so a key a newer
   version wrote survives an older one.
@@ -170,10 +172,12 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
 
 ### Starting at sign-in
 
-- **The registration is Tauri's autostart plugin,** a per-user one that needs no administrator rights:
-  a run entry in the registry on Windows, an autostart entry in the person's config on Linux. It fires
-  at the person's sign-in, not at boot; on a machine that signs in by itself at boot the two are one
-  moment.
+- **The registration is per-user and needs no administrator rights,** made through the `auto-launch`
+  crate: a run entry in the person's own registry hive on Windows, an autostart entry in the person's
+  config on Linux. It is never the machine-wide run entry, even where the app runs elevated, since that
+  one would start the app for every account. The entry names the app's executable in quotes, so a path
+  with a space in it still starts. It fires at the person's sign-in, not at boot; on a machine that
+  signs in by itself at boot the two are one moment.
 - **The file holds the wanted state, and the registration is brought into line with it** whenever the
   setting changes and at every start of the app, so a registration a reset of the machine wiped is put
   back the next time the app runs. Where the file holds no value, the registration as it stands is

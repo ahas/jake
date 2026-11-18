@@ -23,7 +23,6 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
 use tauri::{App, AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::{mpsc, watch};
 use url::Url;
@@ -33,7 +32,7 @@ use crate::follow::follow;
 use crate::navigation::Navigation;
 use crate::pairing::Console;
 use crate::settings::{SettingsFile, SettingsView, Switch, Switches};
-use crate::sign_in::Alignment;
+use crate::sign_in::{Alignment, Registration};
 use crate::status::{AgentState, Status, View};
 use crate::vault::Vault;
 
@@ -57,6 +56,8 @@ struct Shared {
   _locked: watch::Sender<bool>,
   /// The tray's starting-at-sign-in item, kept in step with the settings screen.
   autostart: CheckMenuItem<Wry>,
+  /// The person's sign-in registration, or why it cannot be made.
+  registration: Result<Registration, String>,
 }
 
 /// The main window, as the controller asks things of it.
@@ -135,11 +136,11 @@ fn change(app: &AppHandle, switch: Switch, on: bool) -> Result<(), String> {
   }
   let signing_in = switch == Switch::StartAtSignIn;
   if signing_in {
-    register_at_sign_in(app, on)?;
+    shared.registration.as_ref().map_err(String::clone)?.set(on)?;
   }
   let switches = file.set(switch, on).inspect_err(|_| {
-    if signing_in {
-      let _ = register_at_sign_in(app, !on);
+    if let (true, Ok(registration)) = (signing_in, &shared.registration) {
+      let _ = registration.set(!on);
     }
   })?;
   drop(file);
@@ -150,18 +151,22 @@ fn change(app: &AppHandle, switch: Switch, on: bool) -> Result<(), String> {
   Ok(())
 }
 
-fn register_at_sign_in(app: &AppHandle, on: bool) -> Result<(), String> {
-  let autolaunch = app.autolaunch();
-  let done = if on { autolaunch.enable() } else { autolaunch.disable() };
-  done.map_err(|error| error.to_string())
-}
-
 /// Bring the sign-in registration into line with the setting as the app starts; the switches as they
 /// then stand.
-fn align_sign_in(app: &App, file: &mut SettingsFile, log: &Log) -> Switches {
+fn align_sign_in(
+  registration: &Result<Registration, String>,
+  file: &mut SettingsFile,
+  log: &Log,
+) -> Switches {
   let switches = file.settings().switches;
-  let registered = app.autolaunch().is_enabled().unwrap_or(false);
-  let alignment = sign_in::align(switches.stated(Switch::StartAtSignIn), registered);
+  let registration = match registration {
+    Ok(registration) => registration,
+    Err(reason) => {
+      log.warn("autostart-unavailable", json!({ "reason": reason }));
+      return switches;
+    }
+  };
+  let alignment = sign_in::align(switches.stated(Switch::StartAtSignIn), registration.is_set());
   let registering = match alignment {
     Alignment::Adopt(on) => {
       return file
@@ -169,13 +174,13 @@ fn align_sign_in(app: &App, file: &mut SettingsFile, log: &Log) -> Switches {
         .unwrap_or_else(|_| switches.with(Switch::StartAtSignIn, on));
     }
     Alignment::Keep => return switches,
-    Alignment::Register => app.autolaunch().enable(),
-    Alignment::Unregister => app.autolaunch().disable(),
+    Alignment::Register => registration.set(true),
+    Alignment::Unregister => registration.set(false),
   };
   if let Err(error) = registering {
     log.warn(
       "autostart-not-aligned",
-      json!({ "alignment": format!("{alignment:?}"), "error": error.to_string() }),
+      json!({ "alignment": format!("{alignment:?}"), "error": error }),
     );
   }
   switches
@@ -407,7 +412,8 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
     log.warn("settings-unreadable", json!({ "reason": reason }));
   }
   let settings = file.settings();
-  let switches = align_sign_in(app, &mut file, &log);
+  let registration = Registration::new(&app.package_info().name);
+  let switches = align_sign_in(&registration, &mut file, &log);
   let console = Arc::new(Console::new(settings.console.clone()));
   let status = watch::Sender::new(Status::default());
   let (retries, retried) = mpsc::channel(1);
@@ -480,6 +486,7 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
     switches,
     _locked: locked,
     autostart,
+    registration,
   });
   Ok(())
 }
@@ -488,12 +495,8 @@ fn main() {
   let context = tauri::generate_context!();
   // The updater runs only once the owner's public key is written into the configuration.
   let updates = context.config().plugins.0.contains_key("updater");
-  let mut builder = tauri::Builder::default()
-    .plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)))
-    .plugin(tauri_plugin_autostart::init(
-      MacosLauncher::LaunchAgent,
-      Some(vec![sign_in::AT_SIGN_IN]),
-    ));
+  let mut builder =
+    tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)));
   if updates {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }

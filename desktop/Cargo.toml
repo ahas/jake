@@ -1,6 +1,6 @@
 [package]
 name = "jake-desktop"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
 
@@ -16,6 +16,8 @@ path = "src/main.rs"
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+# The person's own sign-in registration, pinned to the per-user hive (docs/desktop.md, 「Starting at sign-in」).
+auto-launch = "0.6"
 jake-agent = { path = "../agent" }
 # Windows Credential Manager, the Secret Service over D-Bus and the macOS Keychain, and no file store.
 keyring = "4.2"
@@ -23,7 +25,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.12", features = ["tray-icon"] }
-tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2.5"
 tauri-plugin-updater = "2.14"

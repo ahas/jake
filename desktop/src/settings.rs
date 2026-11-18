@@ -13,6 +13,8 @@ use url::Url;
 pub const DEFAULT_CONSOLE_URL: &str = "https://ai.example.org/bmo/";
 const CONSOLE_KEY: &str = "consoleUrl";
 const FILE_NAME: &str = "settings.json";
+/// The byte-order mark Windows editors and PowerShell write before UTF-8.
+const BYTE_ORDER_MARK: &[u8] = b"\xEF\xBB\xBF";
 
 /// A setting a person turns on or off on the settings screen, named in the file by its camelCase key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -197,7 +199,9 @@ impl SettingsFile {
 
 fn read(path: &Path) -> Result<(Map<String, Value>, Settings), String> {
   let document = match std::fs::read(path) {
-    Ok(bytes) => match serde_json::from_slice(&bytes).map_err(|error| error.to_string())? {
+    Ok(bytes) => match serde_json::from_slice(bytes.strip_prefix(BYTE_ORDER_MARK).unwrap_or(&bytes))
+      .map_err(|error| error.to_string())?
+    {
       Value::Object(document) => document,
       _ => return Err("the file is not a JSON object".to_owned()),
     },
@@ -310,6 +314,18 @@ mod tests {
     assert!(!settings.switches.on(Switch::CloseToTray));
     assert!(settings.switches.on(Switch::KeepAwake));
     assert!(settings.switches.on(Switch::KeepControlWhileLocked));
+  }
+
+  #[test]
+  fn a_byte_order_mark_before_the_file_is_read_past() {
+    let dir = Dir::new("settings-bom");
+    let mut text = BYTE_ORDER_MARK.to_vec();
+    text.extend_from_slice(br#"{"keepAwake":true}"#);
+    std::fs::write(dir.0.join(FILE_NAME), text).unwrap();
+    let file = SettingsFile::open(&dir.0);
+
+    assert_eq!(file.unreadable(), None);
+    assert!(file.settings().switches.on(Switch::KeepAwake));
   }
 
   #[test]
