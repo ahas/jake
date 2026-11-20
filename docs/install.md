@@ -257,8 +257,10 @@ each attached agent that runs another build onto it:
   hour.
 - The hub's `JAKE_AGENT_UPDATE=off` turns the orders off (hub.env.example).
 
-`jake --version` (or `jake.exe --version` with its output captured, as in `& jake.exe --version |
-Out-String`) prints the build an installed binary is. The binary takes no other command: `jake
+`jake --version` prints the build an installed binary is. On Windows pipe its output, as in
+`& jake.exe --version | Out-String`: `jake.exe` opens no console, and PowerShell waits for such a
+program and takes what it prints only when its output goes into a pipe, not when it is merely
+assigned to a variable. The binary takes no other command: `jake
 status` is the hub's console on main-host, and the agent's binary refuses it.
 
 To update by hand, run the one-liner again, or run the install script again from a new build folder.
