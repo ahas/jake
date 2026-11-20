@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, interval_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
-use crate::exec::encode_powershell_script;
+use crate::exec::{encode_powershell_script, tree_kill_command};
 use crate::log::Log;
 use crate::platform::{Platform, Role, startup_dir};
 
@@ -339,54 +342,123 @@ pub fn read_number(path: &Path) -> Option<u64> {
   fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok())
 }
 
-/// Whether a process id is running. When unsure it answers yes, so a lock is never stolen from a
-/// holder that may still be alive.
+/// What runs under the process id a lock holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+  /// Nothing does, or another program that took the id over once the holder had ended.
+  Gone,
+  /// A copy of this executable.
+  Jake,
+  /// Something runs that cannot be told apart, so the lock is never stolen from it nor is it ended.
+  Unknown,
+}
+
+impl Holder {
+  /// Whether the lock is still held: by anything but a holder that is gone.
+  pub fn holds(self) -> bool {
+    self != Self::Gone
+  }
+}
+
+/// What runs under a process id. A Linux host runs no pair, so there a living process is not told
+/// apart from another program.
 #[cfg(unix)]
-pub fn pid_alive(pid: u32) -> bool {
-  let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+pub fn lock_holder(pid: u32) -> Holder {
+  let Ok(pid) = libc::pid_t::try_from(pid) else { return Holder::Unknown };
   // SAFETY: signal 0 only asks whether the process exists; nothing is delivered.
   if unsafe { libc::kill(pid, 0) } == 0 {
-    return true;
+    return Holder::Unknown;
   }
-  std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+  if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+    Holder::Gone
+  } else {
+    Holder::Unknown
+  }
 }
 
 #[cfg(windows)]
-pub fn pid_alive(pid: u32) -> bool {
+pub fn lock_holder(pid: u32) -> Holder {
+  match process_image(pid) {
+    ProcessImage::Gone => Holder::Gone,
+    ProcessImage::Unreadable => Holder::Unknown,
+    ProcessImage::Path(path) => {
+      let named = path.file_name().and_then(|name| name.to_str());
+      if named.is_some_and(|name| name.eq_ignore_ascii_case(JAKE_BINARY)) {
+        Holder::Jake
+      } else {
+        Holder::Gone
+      }
+    }
+  }
+}
+
+/// The executable a running process was started from, as far as this user may read it.
+#[cfg(windows)]
+pub enum ProcessImage {
+  Gone,
+  Unreadable,
+  Path(std::path::PathBuf),
+}
+
+#[cfg(windows)]
+pub fn process_image(pid: u32) -> ProcessImage {
+  use std::os::windows::ffi::OsStringExt as _;
   use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE};
   use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
   };
-  // SAFETY: the handle is checked before use and closed once read.
-  unsafe {
+  let mut path = vec![0u16; 32 * 1024];
+  let mut length = u32::try_from(path.len()).unwrap_or(u32::MAX);
+  // SAFETY: the handle is checked before use and closed once read; the buffer's length is passed
+  // with it and the call writes at most that many units, reporting how many it wrote.
+  let read = unsafe {
     let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
     if handle.is_null() {
-      return GetLastError() != ERROR_INVALID_PARAMETER;
+      return if GetLastError() == ERROR_INVALID_PARAMETER {
+        ProcessImage::Gone
+      } else {
+        ProcessImage::Unreadable
+      };
     }
     let mut code = 0u32;
-    let read = GetExitCodeProcess(handle, &mut code);
+    let running = GetExitCodeProcess(handle, &mut code) == 0 || code == STILL_ACTIVE as u32;
+    let named = running
+      && QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut length) != 0;
     CloseHandle(handle);
-    read == 0 || code == STILL_ACTIVE as u32
+    if !running {
+      return ProcessImage::Gone;
+    }
+    named
+  };
+  if !read {
+    return ProcessImage::Unreadable;
   }
+  path.truncate(usize::try_from(length).unwrap_or(0));
+  ProcessImage::Path(std::path::PathBuf::from(std::ffi::OsString::from_wide(&path)))
 }
 
 // --- The watchdog ----------------------------------------------------------------------------------
 
-/// Start a helper command and leave it to run; anchor rewrites and relaunches are quick, their output
-/// is not needed, and a tick never stalls the connection the agent holds.
+/// Start a helper command and leave it to run; anchor rewrites and relaunches are quick and their
+/// output is not needed.
 fn launch(argv: &[String]) {
   if let Some(mut command) = crate::command::quiet(argv) {
     let _ = command.spawn();
   }
 }
 
-/// How long a tick waits on Task Scheduler to print a task's definition.
-const QUERY_WITHIN: Duration = Duration::from_secs(10);
+/// How long a tick waits on Task Scheduler to print a task's definition, and on a hung peer's tree to
+/// be ended before its task is run again.
+const HELPER_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long a stop waits for the watchdog's thread to end what it was doing.
+const STOP_WITHIN: Duration = Duration::from_secs(15);
 
 /// Read the run mode's task back and register it again only where it is absent or not as it must be,
 /// so a tick that finds it in order starts nothing but the query.
 async fn refresh_task(target: AnchorTarget) {
-  let held = crate::command::output(&task_query_command(&target), QUERY_WITHIN)
+  let held = crate::command::output(&task_query_command(&target), HELPER_WITHIN)
     .await
     .ok()
     .map(|bytes| query_text(&bytes));
@@ -405,6 +477,90 @@ pub fn peer_stale(now: u64, seen: Option<u64>, stale: Duration) -> bool {
   seen.is_none_or(|seen| now.saturating_sub(seen) > stale.as_millis() as u64)
 }
 
+/// Since when the watchdog has ticked without a break. A gap of more than two ticks, or a clock set
+/// back, means it was not running itself, as when the machine slept or stalled, and it starts over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Watching {
+  pub since: u64,
+  last: u64,
+}
+
+impl Watching {
+  pub fn new(now: u64) -> Self {
+    Self {
+      since: now,
+      last: now,
+    }
+  }
+
+  /// Take one tick at `now`, the ticks meant to come `tick` apart.
+  pub fn tick(&mut self, now: u64, tick: Duration) {
+    let gap_allowed = 2 * tick.as_millis() as u64;
+    if now < self.last || now - self.last > gap_allowed {
+      self.since = now;
+    }
+    self.last = now;
+  }
+}
+
+/// What a tick does about its peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerAction {
+  /// Its heartbeat is fresh.
+  Leave,
+  /// Run its task: it is gone, or this watchdog has not watched it long enough to judge it hung.
+  Relaunch,
+  /// End the hung copy holding its lock, whole tree, then run its task, which the hung copy's task
+  /// instance and lock would otherwise drop.
+  EndAndRelaunch(u32),
+}
+
+/// What to do about a peer last seen at `seen`, whose lock `holder` names a running copy of this
+/// executable or nothing. A copy is ended only once this watchdog has itself ticked without a break
+/// for longer than `stale`, so a stall both processes shared, a sleep of the machine among them, is
+/// never read as the peer hanging alone, and the two never end each other.
+pub fn peer_action(
+  now: u64,
+  seen: Option<u64>,
+  stale: Duration,
+  watching: Watching,
+  holder: Option<u32>,
+) -> PeerAction {
+  if !peer_stale(now, seen, stale) {
+    return PeerAction::Leave;
+  }
+  match holder {
+    Some(pid) if now.saturating_sub(watching.since) > stale.as_millis() as u64 => {
+      PeerAction::EndAndRelaunch(pid)
+    }
+    _ => PeerAction::Relaunch,
+  }
+}
+
+/// The last moment the process's own runtime ran, stamped from that runtime and read by the
+/// watchdog's thread, so the heartbeat it writes goes stale when the runtime that carries the tunnel
+/// hangs, while what the watchdog runs never holds that runtime up.
+#[derive(Clone)]
+struct Pulse(Arc<AtomicU64>);
+
+impl Pulse {
+  fn new() -> Self {
+    Self(Arc::new(AtomicU64::new(epoch_ms())))
+  }
+
+  fn beat(&self) {
+    self.0.store(epoch_ms(), Ordering::Relaxed);
+  }
+
+  fn last(&self) -> u64 {
+    self.0.load(Ordering::Relaxed)
+  }
+}
+
+/// How many times the pulse is stamped between two ticks of the watchdog, so the heartbeat a tick
+/// writes is never much older than the tick itself.
+const PULSE_BEATS_PER_TICK: u32 = 4;
+
 /// What one process's watchdog over its peer works with.
 pub struct Watchdog {
   pub role: Role,
@@ -415,29 +571,92 @@ pub struct Watchdog {
   pub log: Log,
 }
 
+/// A started watchdog: the pulse on the caller's runtime and the thread the watchdog runs on.
+pub struct Running {
+  pulse: JoinHandle<()>,
+  stop: oneshot::Sender<()>,
+  thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+  /// Stop the watchdog and wait for its thread to end, so it neither rewrites an anchor nor revives
+  /// the peer once this returns; a thread that has not ended within the bound is left behind.
+  pub async fn stop(self) {
+    self.pulse.abort();
+    let _ = self.stop.send(());
+    if let Some(thread) = self.thread {
+      let _ = tokio::time::timeout(STOP_WITHIN, tokio::task::spawn_blocking(move || thread.join())).await;
+    }
+  }
+}
+
 impl Watchdog {
-  /// Tick at once — so the first heartbeat and the anchors are in place immediately — then on every
-  /// tick: refresh this process's heartbeat, put back every anchor that is missing or, for the task,
-  /// not as it must be, and relaunch the peer's task when its heartbeat is missing or stale. A
-  /// redundant relaunch is harmless, as the peer's lock drops it.
-  pub fn start(self) -> JoinHandle<()> {
-    tokio::spawn(async move {
-      let mut ticks = interval_at(Instant::now(), self.tick);
+  /// Start the pulse on the caller's runtime, the one carrying the tunnel, and the watchdog on a
+  /// thread and runtime of its own, where starting a helper, waiting on one and writing a file never
+  /// hold the tunnel up. Missed ticks are skipped rather than run in a burst.
+  pub fn start(self) -> Running {
+    let pulse = Pulse::new();
+    let beating = pulse.clone();
+    let beat_every = self.tick / PULSE_BEATS_PER_TICK;
+    let pulse_task = tokio::spawn(async move {
+      let mut ticks = skipping_interval(beat_every);
       loop {
         ticks.tick().await;
-        self.run_tick();
+        beating.beat();
       }
-    })
+    });
+    let (stop, stopped) = oneshot::channel();
+    let log = self.log.clone();
+    let thread = std::thread::Builder::new()
+      .name("watchdog".to_owned())
+      .spawn(move || self.run(pulse, stopped))
+      .inspect_err(|error| log.warn("watchdog-unavailable", json!({ "error": error.to_string() })))
+      .ok();
+    Running {
+      pulse: pulse_task,
+      stop,
+      thread,
+    }
   }
 
-  fn run_tick(&self) {
+  /// Tick at once — so the first heartbeat and the anchors are in place immediately — then on every
+  /// tick until stopped.
+  fn run(self, pulse: Pulse, stopped: oneshot::Receiver<()>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+      Ok(runtime) => runtime,
+      Err(error) => {
+        self.log.warn("watchdog-unavailable", json!({ "error": error.to_string() }));
+        return;
+      }
+    };
+    runtime.block_on(async move {
+      let mut ticks = skipping_interval(self.tick);
+      let mut watching = Watching::new(epoch_ms());
+      let watch = async {
+        loop {
+          ticks.tick().await;
+          watching.tick(epoch_ms(), self.tick);
+          self.run_tick(&pulse, watching).await;
+        }
+      };
+      tokio::select! {
+        () = watch => {}
+        _ = stopped => {}
+      }
+    });
+  }
+
+  /// Write the heartbeat as the pulse last stamped it, put back every anchor that is missing or, for
+  /// the task, not as it must be, and act on the peer as `peer_action` says. A redundant relaunch is
+  /// harmless, as the peer's lock drops it.
+  async fn run_tick(&self, pulse: &Pulse, watching: Watching) {
     let windows = Platform::Windows;
     let now = epoch_ms();
     let own = windows.heartbeat_path(&self.env, self.role);
     if let Some(parent) = Path::new(&own).parent() {
       let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(&own, now.to_string());
+    let _ = fs::write(&own, pulse.last().to_string());
     for target in install_targets(&self.install_dir) {
       launch(&run_key_add_command(&target));
       if !Path::new(&startup_shortcut_path(&target, &self.env)).exists() {
@@ -448,14 +667,35 @@ impl Watchdog {
 
     let peer = self.role.peer();
     let seen = read_number(Path::new(&windows.heartbeat_path(&self.env, peer)));
-    if peer_stale(now, seen, self.stale) {
-      let age = seen.map(|seen| now.saturating_sub(seen));
-      self
-        .log
-        .warn("peer-stale", json!({ "peer": anchor_name(peer), "lastSeenMs": seen, "ageMs": age }));
-      launch(&task_run_command(anchor_name(peer)));
+    let holder = read_number(Path::new(&windows.lock_path(&self.env, peer)))
+      .and_then(|pid| u32::try_from(pid).ok())
+      .filter(|pid| lock_holder(*pid) == Holder::Jake);
+    let action = peer_action(now, seen, self.stale, watching, holder);
+    if action == PeerAction::Leave {
+      return;
     }
+    let age = seen.map(|seen| now.saturating_sub(seen));
+    let name = anchor_name(peer);
+    match action {
+      PeerAction::EndAndRelaunch(pid) => {
+        self
+          .log
+          .warn("peer-hung", json!({ "peer": name, "lastSeenMs": seen, "ageMs": age, "pid": pid }));
+        if let Err(error) = crate::command::run(&tree_kill_command(pid), HELPER_WITHIN).await {
+          self.log.warn("peer-end-failed", json!({ "peer": name, "pid": pid, "error": error }));
+        }
+      }
+      _ => self.log.warn("peer-stale", json!({ "peer": name, "lastSeenMs": seen, "ageMs": age })),
+    }
+    launch(&task_run_command(name));
   }
+}
+
+/// An interval that ticks at once, then every `period`, skipping the ticks it missed.
+fn skipping_interval(period: Duration) -> tokio::time::Interval {
+  let mut ticks = interval_at(Instant::now(), period);
+  ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+  ticks
 }
 
 #[cfg(test)]
@@ -718,7 +958,34 @@ mod tests {
   }
 
   #[test]
-  fn this_process_reads_as_alive() {
-    assert!(pid_alive(std::process::id()));
+  fn a_stall_longer_than_two_ticks_or_a_clock_set_back_starts_the_watching_over() {
+    let tick = Duration::from_secs(60);
+    let mut watching = Watching::new(1_000_000);
+    watching.tick(1_120_000, tick);
+    assert_eq!(watching.since, 1_000_000);
+    watching.tick(1_240_001, tick);
+    assert_eq!(watching.since, 1_240_001);
+    watching.tick(1_200_000, tick);
+    assert_eq!(watching.since, 1_200_000);
+  }
+
+  #[test]
+  fn a_stale_peer_is_ended_only_once_this_watchdog_watched_it_longer_than_the_threshold() {
+    let stale = Duration::from_secs(180);
+    let now = 10_000_000;
+    let long_watched = Watching::new(now - 180_001);
+    let just_woken = Watching::new(now - 60_000);
+    let fresh = Some(now - 60_000);
+    let silent = Some(now - 600_000);
+    assert_eq!(peer_action(now, fresh, stale, long_watched, Some(42)), PeerAction::Leave);
+    assert_eq!(peer_action(now, silent, stale, long_watched, Some(42)), PeerAction::EndAndRelaunch(42));
+    assert_eq!(peer_action(now, silent, stale, just_woken, Some(42)), PeerAction::Relaunch);
+    assert_eq!(peer_action(now, silent, stale, long_watched, None), PeerAction::Relaunch);
+    assert_eq!(peer_action(now, None, stale, long_watched, None), PeerAction::Relaunch);
+  }
+
+  #[test]
+  fn this_process_does_not_read_as_a_gone_lock_holder() {
+    assert!(lock_holder(std::process::id()).holds());
   }
 }

@@ -1,4 +1,4 @@
-// The jake executable: the agent, the Windows guard, or the uninstaller's leave notice, by its argument.
+// The jake executable: the agent, the Windows guard, a leave notice or a WSL hold, by its argument.
 
 // On Windows it opens no console, so no console's close or key can end it.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
 use jake_agent::platform::{self, Platform, Role};
+use jake_agent::wsl::{self, HOLD_WSL_FLAG};
 use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure};
 use serde_json::json;
 
@@ -68,7 +69,7 @@ async fn stop_requested(log: &Log) {
 /// The lock and watchdog that keep one copy of a Windows run mode alive, or nothing elsewhere.
 struct Pair {
   lock: PathBuf,
-  watchdog: tokio::task::JoinHandle<()>,
+  watchdog: pair::Running,
 }
 
 impl Pair {
@@ -78,7 +79,7 @@ impl Pair {
   /// the repeating trigger adds no line to the log.
   fn start(role: Role, start: &Start) -> Option<Self> {
     let lock = PathBuf::from(Platform::Windows.lock_path(&start.env, role));
-    if !pair::acquire_lock(&lock, std::process::id(), pair::pid_alive) {
+    if !pair::acquire_lock(&lock, std::process::id(), |pid| pair::lock_holder(pid).holds()) {
       return None;
     }
     let watchdog = Watchdog {
@@ -93,8 +94,8 @@ impl Pair {
     Some(Self { lock, watchdog })
   }
 
-  fn stop(self) {
-    self.watchdog.abort();
+  async fn stop(self) {
+    self.watchdog.stop().await;
     pair::release_lock(&self.lock);
   }
 }
@@ -124,7 +125,7 @@ async fn run_agent(start: Start) -> ExitCode {
   let leave = jake_agent::run(&agent, stop_requested(&log)).await == Ended::Left;
   // The watchdog stops before anything is torn down, so it neither rewrites an anchor nor revives the guard.
   if let Some(pair) = pair {
-    pair.stop();
+    pair.stop().await;
   }
   if leave {
     departure::depart(Platform::HOST, &start.install_dir.to_string_lossy(), &start.env, &log).await;
@@ -142,7 +143,7 @@ async fn run_guard(start: Start) -> ExitCode {
     json!({ "installDir": start.install_dir.to_string_lossy(), "version": VERSION }),
   );
   stop_requested(&start.log).await;
-  pair.stop();
+  pair.stop().await;
   ExitCode::SUCCESS
 }
 
@@ -164,8 +165,38 @@ async fn run_leave(start: Start) -> ExitCode {
   }
 }
 
+fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+  tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| {
+    eprintln!("jake: cannot start: {error}");
+    ExitCode::FAILURE
+  })
+}
+
+/// Hold a WSL distribution running, which needs neither the agent's config nor its log: a WSL
+/// install's task runs it where Windows refuses that task a session of its own with no logon.
+fn hold_wsl(distribution: &str) -> ExitCode {
+  if Platform::HOST != Platform::Windows {
+    eprintln!("jake: {HOLD_WSL_FLAG} holds a WSL distribution from Windows, and this is not Windows");
+    return ExitCode::FAILURE;
+  }
+  if distribution.is_empty() {
+    eprintln!("jake: {HOLD_WSL_FLAG} takes the name of the distribution to hold");
+    return ExitCode::FAILURE;
+  }
+  match runtime() {
+    Ok(runtime) => {
+      runtime.block_on(wsl::hold(distribution));
+      ExitCode::SUCCESS
+    }
+    Err(code) => code,
+  }
+}
+
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
+  if let Some(at) = arguments.iter().position(|argument| argument == HOLD_WSL_FLAG) {
+    return hold_wsl(arguments.get(at + 1).map_or("", String::as_str));
+  }
   let mode = if arguments.iter().any(|argument| argument == GUARD_MODE_FLAG) {
     Mode::Guard
   } else if arguments.iter().any(|argument| argument == LEAVE_FLAG) {
@@ -180,12 +211,9 @@ fn main() -> ExitCode {
       return ExitCode::FAILURE;
     }
   };
-  let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+  let runtime = match runtime() {
     Ok(runtime) => runtime,
-    Err(error) => {
-      eprintln!("jake: cannot start: {error}");
-      return ExitCode::FAILURE;
-    }
+    Err(code) => return code,
   };
   runtime.block_on(async move {
     match mode {

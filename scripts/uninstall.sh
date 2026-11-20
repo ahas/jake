@@ -10,6 +10,7 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="$UNIT_DIR/$UNIT_NAME"
 
 step() { printf '\033[36m· %s\033[0m\n' "$1"; }
+warn() { printf '\033[33m  ! %s\033[0m\n' "$1"; }
 die()  { printf '\033[31mjake uninstall failed: %s\033[0m\n' "$1" >&2; exit 1; }
 
 REMOVE_CONFIG=0
@@ -40,12 +41,50 @@ systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
 # that cannot be reached does not stop the removal.
 if [ -x "$BIN" ]; then
   step "telling the hub this agent has left"
-  "$BIN" --leave || printf '\033[33m  ! the hub was not told; it will show this agent as disconnected\033[0m\n'
+  "$BIN" --leave || warn "the hub was not told; it will show this agent as disconnected"
 fi
 
 step "removing the unit"
 rm -f "$UNIT"
 systemctl --user daemon-reload 2>/dev/null || true
+
+# On WSL, the Windows task the install registered to keep this distribution running goes too, with the
+# hold's executable where the task needed one. It needs Windows interop, which a WSL shell has.
+ps_quote() { # value → a PowerShell single-quoted literal
+  printf "'%s'" "${1//\'/\'\'}"
+}
+
+windows_powershell() { # → the path of Windows PowerShell reached through interop, or nothing
+  local path
+  if path="$(command -v powershell.exe 2>/dev/null)"; then printf '%s' "$path"; return 0; fi
+  path="$(wslpath -u 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 2>/dev/null)" || return 0
+  if [ -x "$path" ]; then printf '%s' "$path"; fi
+}
+
+wsl_task_name() { printf 'JakeWsl-%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '-')"; }
+
+remove_keep_alive() {
+  local distribution="${WSL_DISTRO_NAME:-}" powershell name script encoded
+  [ -n "$distribution" ] || return 0
+  step "removing the Windows task that keeps $distribution running"
+  powershell="$(windows_powershell)"
+  if [ -z "$powershell" ]; then
+    warn "Windows interop is not reachable from here, so the task $(wsl_task_name "$distribution") is left in Task Scheduler. Run the uninstall again from a WSL shell to remove it."
+    return 0
+  fi
+  name="$(ps_quote "$(wsl_task_name "$distribution")")"
+  script="\$name = $name
+if (Get-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue) {
+  Stop-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName \$name -Confirm:\$false
+}
+Remove-Item -LiteralPath (Join-Path \$env:LOCALAPPDATA ('Programs\\jake-wsl\\' + \$name)) -Recurse -Force -ErrorAction SilentlyContinue"
+  encoded="$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
+  "$powershell" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" >/dev/null 2>&1 \
+    || warn "the task $(wsl_task_name "$distribution") could not be removed; remove it in Task Scheduler"
+}
+
+remove_keep_alive
 
 step "deleting the install layout"
 if [ "$REMOVE_CONFIG" -eq 1 ]; then

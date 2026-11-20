@@ -31,7 +31,7 @@ fn running_agent_pid() -> Option<u32> {
   [Role::Agent, Role::Guard].into_iter().find_map(|role| {
     let lock = PathBuf::from(Platform::Windows.lock_path(&env, role));
     let pid = u32::try_from(crate::pair::read_number(&lock)?).ok()?;
-    crate::pair::pid_alive(pid).then_some(pid)
+    crate::pair::lock_holder(pid).holds().then_some(pid)
   })
 }
 
@@ -59,30 +59,10 @@ fn executable_dir(pid: u32) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn executable_dir(pid: u32) -> Option<PathBuf> {
-  use std::os::windows::ffi::OsStringExt as _;
-  use windows_sys::Win32::Foundation::CloseHandle;
-  use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-  };
-  let mut path = vec![0u16; 32 * 1024];
-  let mut length = u32::try_from(path.len()).ok()?;
-  // SAFETY: the handle is checked before use and closed once read; the buffer's length is passed
-  // with it and the call writes at most that many units, reporting how many it wrote.
-  let written = unsafe {
-    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if handle.is_null() {
-      return None;
-    }
-    let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut length);
-    CloseHandle(handle);
-    ok != 0
-  };
-  if !written {
-    return None;
+  match crate::pair::process_image(pid) {
+    crate::pair::ProcessImage::Path(exe) => exe.parent().map(Path::to_path_buf),
+    _ => None,
   }
-  path.truncate(usize::try_from(length).ok()?);
-  let exe = PathBuf::from(std::ffi::OsString::from_wide(&path));
-  exe.parent().map(Path::to_path_buf)
 }
 
 #[cfg(test)]

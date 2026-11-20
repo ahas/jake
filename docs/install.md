@@ -81,7 +81,23 @@ into both binaries.
 
 - On a Linux host the agent runs as a `systemd --user` service. The install enables it and turns on
   lingering for the user (`loginctl enable-linger`) so the service starts at boot and runs whether or
-  not that user is logged in, and restarts on its own after a crash.
+  not that user is logged in, and restarts on its own five seconds after any exit, however often it
+  exits.
+- **On WSL the distribution itself has to stay running,** and WSL stops a distribution, with every
+  service in it, once no Windows program holds a session into it. So an install run from a WSL shell
+  also registers a scheduled task on the Windows side, `JakeWsl-<distribution>`, that holds a session
+  open with no window. Like the Windows agent's tasks it starts at logon and again every five minutes
+  while it is not running, with no run-time limit and on battery, so closing any terminal, locking the
+  screen or an ended session does not stop the distribution for longer than that.
+- Where Windows lets this account register it so, the task runs **whether or not the account is logged
+  on, with no password stored** (the S4U logon type): it holds the distribution from boot, before
+  anyone logs on, and the install says so. Where Windows refuses that, as it may for an account
+  without administrator rights, the install places the Windows jake executable under
+  `%LOCALAPPDATA%\Programs\jake-wsl\JakeWsl-<distribution>` and registers the task to run it in its
+  windowless hold mode from **this account's logon** instead, and says that and why Windows refused.
+- The task is registered through Windows interop, which a WSL shell has. An unattended update runs
+  inside the agent's systemd service, which has no interop, so an update leaves the task as it is;
+  running the install again from a WSL shell registers it afresh.
 - **WSL is Linux only when systemd is running as its init.** Where it is not, the install cannot
   register a user service and stops with a clear message rather than leaving an agent that never comes
   back. Enabling systemd in WSL is a host step 하스 takes himself: set `[boot] systemd=true` in
@@ -95,6 +111,12 @@ into both binaries.
   brings it back, and every minute both check the three autostart anchors: a logon scheduled task, a
   registry Run value, and a Startup-folder shortcut. A deleted anchor, or a task whose settings were
   changed, is restored within a minute as long as either program is alive.
+- A program that hangs without exiting is ended, with everything it started, before it is started
+  again, about three minutes after it stopped answering. When the whole machine stalls or sleeps, both
+  programs wait out three more minutes of their own before either judges the other, so the two never
+  end each other over a stall they shared.
+- The checks every minute run apart from the agent's connection to the hub, so a machine slow to start
+  a program does not hold the connection up.
 - Neither program opens a window, so there is no console window to close by accident, and closing a
   terminal or pressing Ctrl+C anywhere does not stop them.
 - If both programs die together while this account is logged on, Task Scheduler starts them again
@@ -244,7 +266,9 @@ config is left as it is.
 Run the uninstall script for the platform:
 
 - Linux/WSL: `./uninstall.sh` (or from the install location). It stops and disables the user service,
-  tells the hub the agent has left, removes the unit, and deletes the install layout.
+  tells the hub the agent has left, removes the unit, and deletes the install layout. Run from a WSL
+  shell, it also stops and removes the Windows task that keeps the distribution running, with the
+  hold's executable where the task had one.
 - Windows: `& "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1"`. It stops the programs, tells the hub
   the agent has left, removes all three anchors for both run modes, and deletes the install folder.
 
@@ -263,5 +287,7 @@ secret. To leave nothing behind, pass `--remove-config` (Linux) or `-RemoveConfi
 There is also a remote counterpart to the uninstaller, sent from main-host rather than run on this
 machine: `jake leave --yes`. It tells the attached agent to uninstall itself — the binary, the
 config, the log, and every autostart registration — stop whatever keeps it running, and detach for
-good. It is irreversible and keeps no config, so the console refuses it without `--yes`, and it works
+good. On WSL the agent cannot reach Windows from its service, so the task that keeps the distribution
+running stays registered until the uninstall script is run from a WSL shell or the task is deleted in
+Task Scheduler. It is irreversible and keeps no config, so the console refuses it without `--yes`, and it works
 only while the agent is attached.

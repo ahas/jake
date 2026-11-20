@@ -7,8 +7,9 @@ Wants=network-online.target
 # The file lives with the runtime data rather than in a git tree, where an untracked secret is one
 # `git clean` from gone.
 ConditionPathExists=%h/.local/share/jake/agent.env
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# No start limit: an agent that keeps exiting is started again five seconds after each exit for as
+# long as it does, never given up on after a burst of failed starts.
+StartLimitIntervalSec=0
 
 [Service]
 WorkingDirectory=%h/.local/share/jake

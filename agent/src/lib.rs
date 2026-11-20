@@ -12,6 +12,7 @@ pub mod pair;
 pub mod platform;
 mod stream;
 mod transfer;
+pub mod wsl;
 
 pub use config::AgentConfig;
 pub use connection::{Agent, Ended, LeaveNotice, Link, WhenSuperseded, backoff};

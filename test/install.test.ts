@@ -329,3 +329,115 @@ describe("install.ps1 -Update", () => {
     expect(running).toBe("JakeAgent JakeGuard");
   }, 30_000);
 });
+
+// The Windows side a WSL install reaches through interop, stood in for: powershell.exe runs the script
+// it is handed under pwsh behind stand-ins that record each task registered and started, refusing an
+// S4U task where JAKE_TEST_REFUSE_S4U is set; wslpath turns a Windows path's backslashes into slashes,
+// which PowerShell on Linux also reads as separators.
+const WSL_STAND_INS = `
+function New-ScheduledTaskTrigger { param([switch]$AtLogOn, $User, [switch]$Once, $At, $RepetitionInterval) }
+function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $ExecutionTimeLimit, $RestartCount, $RestartInterval, $MultipleInstances) }
+function New-ScheduledTaskAction { param($Execute, $Argument) "$Execute $Argument" }
+function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) "$LogonType" }
+function Register-ScheduledTask {
+  param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force)
+  if ($Principal -eq 'S4U' -and $env:JAKE_TEST_REFUSE_S4U) { throw 'Access is denied.' }
+  Add-Content -LiteralPath $env:JAKE_TEST_TASKS -Value "registered $TaskName as $Principal running $Action"
+}
+function Get-ScheduledTask { [CmdletBinding()] param($TaskName) $TaskName }
+function Start-ScheduledTask { [CmdletBinding()] param($TaskName) Add-Content -LiteralPath $env:JAKE_TEST_TASKS -Value "started $TaskName" }
+function Stop-ScheduledTask { [CmdletBinding()] param($TaskName) Add-Content -LiteralPath $env:JAKE_TEST_TASKS -Value "stopped $TaskName" }
+function Unregister-ScheduledTask { param($TaskName, $Confirm) Add-Content -LiteralPath $env:JAKE_TEST_TASKS -Value "unregistered $TaskName" }
+`;
+
+// A WSL machine: the installed machine above with the Windows executable in its build folder, and the
+// stand-ins for interop where `interop` is set.
+function wslMachine(interop: boolean): ReturnType<typeof machine> & { localAppData: string; tasks: string } {
+  const at = machine("old reaches", "new reaches");
+  writeFileSync(join(at.folder, "jake.exe"), "the windows build");
+  const localAppData = join(at.home, "windows", "local");
+  mkdirSync(localAppData, { recursive: true });
+  const tasks = join(at.home, "windows", "tasks");
+  writeFileSync(tasks, "");
+  if (interop) {
+    writeFileSync(join(at.home, "windows", "stand-ins.ps1"), WSL_STAND_INS);
+    const powershell = [
+      "#!/bin/sh",
+      'while [ "$1" != -EncodedCommand ]; do shift; done',
+      `script="${join(at.home, "windows", "script.ps1")}"`,
+      `cat "${join(at.home, "windows", "stand-ins.ps1")}" > "$script"`,
+      'printf %s "$2" | base64 -d | iconv -f UTF-16LE -t UTF-8 >> "$script"',
+      'exec pwsh -NoProfile -NonInteractive -File "$script"',
+    ].join("\n");
+    writeFileSync(join(at.stubs, "powershell.exe"), powershell, { mode: 0o755 });
+    writeFileSync(join(at.stubs, "wslpath"), "#!/bin/sh\nprintf '%s\\n' \"$2\" | tr '\\\\' /\n", { mode: 0o755 });
+  }
+  return { ...at, localAppData, tasks };
+}
+
+async function runOnWsl(
+  at: ReturnType<typeof wslMachine>,
+  script: string[],
+  refuseS4u = false,
+): Promise<{ code: number; output: string }> {
+  const proc = Bun.spawn(["bash", ...script], {
+    env: {
+      PATH: `${at.stubs}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      HOME: at.home,
+      XDG_CONFIG_HOME: join(at.home, ".config"),
+      JAKE_INSTALL_WAIT_SECONDS: "0",
+      WSL_DISTRO_NAME: "Ubuntu-24.04",
+      LOCALAPPDATA: at.localAppData,
+      JAKE_TEST_TASKS: at.tasks,
+      JAKE_TEST_REFUSE_S4U: refuseS4u ? "1" : "",
+    },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [output, errors] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code: await proc.exited, output: output + errors };
+}
+
+const install = (at: ReturnType<typeof wslMachine>, refuseS4u = false) =>
+  runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive"], refuseS4u);
+
+// Each case that reaches Windows starts PowerShell, which takes seconds on a loaded machine.
+describe("install.sh on WSL", () => {
+  test("registers and starts a task that holds the distribution with no password stored", async () => {
+    const at = wslMachine(true);
+    const { code, output } = await install(at);
+    expect(output).toContain("registered: it holds Ubuntu-24.04 from boot, whether or not you are logged on");
+    expect(code).toBe(0);
+    expect(readFileSync(at.tasks, "utf8")).toBe(
+      'registered JakeWsl-Ubuntu-24.04 as S4U running wsl.exe -d "Ubuntu-24.04" --exec sleep infinity\nstarted JakeWsl-Ubuntu-24.04\n',
+    );
+  }, 30_000);
+
+  test("where Windows refuses that task, places the Windows executable and has it hold the distribution from logon", async () => {
+    const at = wslMachine(true);
+    const { code, output } = await install(at, true);
+    expect(output).toContain("from your logon only, since Windows refused a task that runs without it: Access is denied.");
+    expect(code).toBe(0);
+    const launcher = join(at.localAppData, "Programs", "jake-wsl", "JakeWsl-Ubuntu-24.04", "jake.exe");
+    expect(readFileSync(launcher, "utf8")).toBe("the windows build");
+    const registered = readFileSync(at.tasks, "utf8").split("\n")[0];
+    expect(registered).toStartWith("registered JakeWsl-Ubuntu-24.04 as Interactive running ");
+    expect(registered).toEndWith('jake.exe --hold-wsl "Ubuntu-24.04"');
+  }, 30_000);
+
+  test("without interop, leaves the task as it is and still installs", async () => {
+    const at = wslMachine(false);
+    const { code, output } = await install(at);
+    expect(output).toContain("Windows interop is not reachable from here, so the task is left as it is.");
+    expect(code).toBe(0);
+  });
+
+  test("the uninstall stops and removes the task", async () => {
+    const at = wslMachine(true);
+    copyFileSync(join(import.meta.dir, "..", "scripts", "uninstall.sh"), join(at.folder, "uninstall.sh"));
+    const { code } = await runOnWsl(at, [join(at.folder, "uninstall.sh")]);
+    expect(code).toBe(0);
+    expect(readFileSync(at.tasks, "utf8")).toBe("stopped JakeWsl-Ubuntu-24.04\nunregistered JakeWsl-Ubuntu-24.04\n");
+  }, 30_000);
+});

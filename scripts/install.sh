@@ -358,6 +358,98 @@ if [ "$UPDATE" -eq 1 ] && [ -f "$PREVIOUS_BIN" ]; then
   fi
 fi
 
+# --- WSL: a Windows task that keeps this distribution running -------------------------------------
+# WSL stops a distribution once no Windows process holds a session into it, and its systemd services,
+# the agent among them, stop with it. So the install registers a per-user scheduled task on the Windows
+# side that holds a windowless session open: from boot, whether or not the user is logged on and with
+# no password stored (S4U), where Windows lets this account register that, and otherwise from logon
+# through the Windows jake executable's windowless hold. It needs Windows interop, which a WSL shell
+# has and the systemd service an unattended update runs in does not; without it the task is left as
+# it is.
+
+ps_quote() { # value → a PowerShell single-quoted literal
+  printf "'%s'" "${1//\'/\'\'}"
+}
+
+windows_powershell() { # → the path of Windows PowerShell reached through interop, or nothing
+  local path
+  if path="$(command -v powershell.exe 2>/dev/null)"; then printf '%s' "$path"; return 0; fi
+  path="$(wslpath -u 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 2>/dev/null)" || return 0
+  if [ -x "$path" ]; then printf '%s' "$path"; fi
+}
+
+run_powershell() { # powershell script → what the script printed, line ends made plain
+  local encoded
+  encoded="$(printf '%s' "$2" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
+  "$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" 2>&1 | tr -d '\r'
+}
+
+# The task's name for one distribution: its name with anything but letters, digits, dots and dashes
+# made a dash. The hold's executable, where one is needed, has a folder of the same name.
+wsl_task_name() { printf 'JakeWsl-%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '-')"; }
+
+keep_alive_script() { # distribution → the script that registers and starts the task, printing the road
+  local distribution="$1"
+  cat <<SCRIPT
+\$ErrorActionPreference = 'Stop'
+\$name = $(ps_quote "$(wsl_task_name "$distribution")")
+\$distribution = $(ps_quote "$distribution")
+\$launcher = Join-Path \$env:LOCALAPPDATA ('Programs\\jake-wsl\\' + \$name + '\\jake.exe')
+\$user = "\$env:USERDOMAIN\\\$env:USERNAME"
+\$triggers = @(
+  (New-ScheduledTaskTrigger -AtLogOn -User \$user),
+  (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
+)
+\$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+try {
+  \$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument ('-d "' + \$distribution + '" --exec sleep infinity')
+  \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType S4U -RunLevel Limited
+  Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
+  \$road = 'unattended'
+} catch {
+  \$refusal = \$_.Exception.Message
+  if (-not (Test-Path -LiteralPath \$launcher)) { "needs-launcher \$launcher"; exit 0 }
+  \$action = New-ScheduledTaskAction -Execute \$launcher -Argument ('--hold-wsl "' + \$distribution + '"')
+  \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType Interactive -RunLevel Limited
+  Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
+  \$road = 'at-logon ' + \$refusal
+}
+Start-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue
+\$road
+SCRIPT
+}
+
+keep_distribution_running() {
+  local distribution="${WSL_DISTRO_NAME:-}" powershell answer launcher
+  [ -n "$distribution" ] || return 0
+  step "registering the Windows task that keeps $distribution running"
+  powershell="$(windows_powershell)"
+  if [ -z "$powershell" ]; then
+    warn "Windows interop is not reachable from here, so the task is left as it is. Run the install again from a WSL shell to register it."
+    return 0
+  fi
+  answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || {
+    warn "the task could not be registered: $answer"
+    return 0
+  }
+  if [ "${answer%% *}" = "needs-launcher" ]; then
+    launcher="$(wslpath -u "${answer#needs-launcher }")"
+    mkdir -p "$(dirname "$launcher")"
+    place_from_payload "jake.exe" "$launcher"
+    answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || {
+      warn "the task could not be registered: $answer"
+      return 0
+    }
+  fi
+  case "$answer" in
+    unattended) ok "registered: it holds $distribution from boot, whether or not you are logged on" ;;
+    at-logon*) warn "registered to hold $distribution from your logon only, since Windows refused a task that runs without it: ${answer#at-logon }" ;;
+    *) warn "the task registration answered: $answer" ;;
+  esac
+}
+
+keep_distribution_running
+
 echo ""
 if [ "$reached" -eq 1 ]; then
   ok "Installed. The agent is connected to the hub."

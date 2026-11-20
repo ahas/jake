@@ -202,10 +202,31 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   Windows host cannot get without an administrator account. This is the same shape the hub already
   uses on main-host, so the Linux agent needs no guard, no heartbeat pair, and no anchor rewriting —
   the service manager is the supervisor.
+- The unit has no start limit: an agent that keeps exiting is started again a few seconds after each
+  exit for as long as it does, since a service manager that gives up leaves the machine detached
+  until someone looks.
 - A WSL host is Linux only when systemd is running as its init. Where it is not, `systemctl --user`
   cannot register anything, and the install **fails loudly** with that reason rather than writing a
   unit that would never run — enabling systemd in WSL is a host step 하스 takes, not something the
   agent can arrange for itself from inside the session it would run in.
+- On WSL, systemd and lingering keep the agent running only while the distribution runs, and WSL stops
+  a distribution once no Windows process holds a session into it. The distribution is therefore held
+  from the Windows side by a per-user scheduled task, one per distribution, whose action is a session
+  that runs `sleep` forever. It starts at logon and on a trigger repeating every five minutes with no
+  end, has no run-time limit and runs on battery, the settings the Windows pair's tasks carry, so a
+  session that ends for any reason is opened again within five minutes.
+- The task takes the least privilege that holds the distribution with no window. It is registered with
+  the S4U logon type, which runs it whether or not the user is logged on and stores no password; such
+  a task runs in a non-interactive session, so the session it opens has no window anyone could close,
+  and its repeating trigger fires from boot on. Windows may refuse an S4U task to an account without
+  administrator rights. There the task runs at this user's logon, interactively, and its action is the
+  Windows executable in its hold mode: a program of the Windows subsystem, which opens no console,
+  starting the session with no window of its own and opening it again a few seconds after it ends.
+  The executable is placed in a folder of its own per distribution, apart from a Windows agent's
+  install, whose update or removal therefore leaves it alone.
+- The task is registered by the install through Windows interop, which only a WSL session started from
+  Windows has; the agent's systemd service has none, so neither an unattended update nor a leave
+  reaches it, and the uninstall script, run from a WSL shell, removes it.
 
 ### On a Windows host
 
@@ -241,6 +262,18 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   where it is missing, and the scheduled task is read back with a plain query and registered again,
   which takes PowerShell, only where it is missing or its definition differs from the one it must
   hold.
+- The watchdog runs on a thread and runtime of its own, so starting a helper, waiting on one or
+  writing a file, any of which a starved machine can hold up for seconds, never holds up the runtime
+  that carries the tunnel. The liveness it records is that runtime's, not its own: the runtime stamps
+  a shared moment on every tick and the heartbeat carries that moment, so a hung tunnel runtime reads
+  as hung to the peer. Ticks missed while a process could not run are skipped, never run in a burst.
+- A hung peer still holds its single-instance lock, and its scheduled task still counts as running, so
+  running its task again would start nothing. A process that finds its peer stale while the peer's
+  lock names a running copy of this executable therefore ends that copy's whole tree first, then runs
+  its task. It does so only once it has ticked without a break for longer than the staleness
+  threshold itself: a gap of more than two ticks in its own ticking, as when the machine slept or
+  stalled for both, starts its watch over, so a stall the two shared is never read as the peer hanging
+  alone and the two never end each other.
 - The relaunch runs the peer's scheduled task rather than spawning the peer directly. The Task
   Scheduler service starts the peer on the caller's behalf, so the relaunched peer is not the
   caller's child and shares no teardown boundary with it — the independence the pair depends on. A
@@ -277,7 +310,10 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   copy that takes it runs while the rest exit, writing nothing to the log. The lock is a file created
   atomically — the OS lets exactly one exclusive create win, so even near-simultaneous copies cannot
   both take it — and it holds the holder's process id, so a lock left behind by a crashed process is
-  reclaimed once that id is seen to be gone, rather than blocking the binary forever.
+  reclaimed once that id is seen to be gone, rather than blocking the binary forever. An id that now
+  belongs to another program, as Windows reuses ids, reads as gone too: the holder is a copy of this
+  executable or nothing, so a reused id neither blocks the run mode nor is ever ended in its place.
+  Only a process this user cannot read at all is left holding the lock.
 
 ## Leaving
 
