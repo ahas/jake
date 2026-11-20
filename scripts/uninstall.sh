@@ -73,7 +73,8 @@ remove_keep_alive() {
     return 0
   fi
   name="$(ps_quote "$(wsl_task_name "$distribution")")"
-  script="\$name = $name
+  script="\$ProgressPreference = 'SilentlyContinue'
+\$name = $name
 if (Get-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue) {
   Stop-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName \$name -Confirm:\$false

@@ -331,8 +331,9 @@ describe("install.ps1 -Update", () => {
 });
 
 // The Windows side a WSL install reaches through interop, stood in for: powershell.exe runs the script
-// it is handed under pwsh behind stand-ins that record each task registered and started, refusing an
-// S4U task where JAKE_TEST_REFUSE_S4U is set; wslpath turns a Windows path's backslashes into slashes,
+// it is handed under pwsh behind stand-ins that record each task registered and started, writing to
+// standard error as Windows PowerShell does when its streams are redirected, and refusing an S4U task
+// where JAKE_TEST_REFUSE is set, or every task where it is all; wslpath turns a Windows path's backslashes into slashes,
 // which PowerShell on Linux also reads as separators.
 const WSL_STAND_INS = `
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn, $User, [switch]$Once, $At, $RepetitionInterval) }
@@ -341,7 +342,8 @@ function New-ScheduledTaskAction { param($Execute, $Argument) "$Execute $Argumen
 function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) "$LogonType" }
 function Register-ScheduledTask {
   param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force)
-  if ($Principal -eq 'S4U' -and $env:JAKE_TEST_REFUSE_S4U) { throw 'Access is denied.' }
+  [Console]::Error.WriteLine('#< CLIXML')
+  if ($env:JAKE_TEST_REFUSE -eq 'all' -or ($Principal -eq 'S4U' -and $env:JAKE_TEST_REFUSE)) { throw 'Access is denied.' }
   Add-Content -LiteralPath $env:JAKE_TEST_TASKS -Value "registered $TaskName as $Principal running $Action"
 }
 function Get-ScheduledTask { [CmdletBinding()] param($TaskName) $TaskName }
@@ -378,7 +380,7 @@ function wslMachine(interop: boolean): ReturnType<typeof machine> & { localAppDa
 async function runOnWsl(
   at: ReturnType<typeof wslMachine>,
   script: string[],
-  refuseS4u = false,
+  refuse = "",
 ): Promise<{ code: number; output: string }> {
   const proc = Bun.spawn(["bash", ...script], {
     env: {
@@ -389,7 +391,7 @@ async function runOnWsl(
       WSL_DISTRO_NAME: "Ubuntu-24.04",
       LOCALAPPDATA: at.localAppData,
       JAKE_TEST_TASKS: at.tasks,
-      JAKE_TEST_REFUSE_S4U: refuseS4u ? "1" : "",
+      JAKE_TEST_REFUSE: refuse,
     },
     stdin: "ignore",
     stdout: "pipe",
@@ -399,8 +401,8 @@ async function runOnWsl(
   return { code: await proc.exited, output: output + errors };
 }
 
-const install = (at: ReturnType<typeof wslMachine>, refuseS4u = false) =>
-  runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive"], refuseS4u);
+const install = (at: ReturnType<typeof wslMachine>, refuse = "") =>
+  runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive"], refuse);
 
 // Each case that reaches Windows starts PowerShell, which takes seconds on a loaded machine.
 describe("install.sh on WSL", () => {
@@ -410,20 +412,28 @@ describe("install.sh on WSL", () => {
     expect(output).toContain("registered: it holds Ubuntu-24.04 from boot, whether or not you are logged on");
     expect(code).toBe(0);
     expect(readFileSync(at.tasks, "utf8")).toBe(
-      'registered JakeWsl-Ubuntu-24.04 as S4U running wsl.exe -d "Ubuntu-24.04" --exec sleep infinity\nstarted JakeWsl-Ubuntu-24.04\n',
+      'registered JakeWsl-Ubuntu-24.04 as S4U running wsl.exe -d Ubuntu-24.04 --exec sleep infinity\nstarted JakeWsl-Ubuntu-24.04\n',
     );
   }, 30_000);
 
   test("where Windows refuses that task, places the Windows executable and has it hold the distribution from logon", async () => {
     const at = wslMachine(true);
-    const { code, output } = await install(at, true);
+    const { code, output } = await install(at, "s4u");
     expect(output).toContain("from your logon only, since Windows refused a task that runs without it: Access is denied.");
     expect(code).toBe(0);
     const launcher = join(at.localAppData, "Programs", "jake-wsl", "JakeWsl-Ubuntu-24.04", "jake.exe");
     expect(readFileSync(launcher, "utf8")).toBe("the windows build");
     const registered = readFileSync(at.tasks, "utf8").split("\n")[0];
     expect(registered).toStartWith("registered JakeWsl-Ubuntu-24.04 as Interactive running ");
-    expect(registered).toEndWith('jake.exe --hold-wsl "Ubuntu-24.04"');
+    expect(registered).toEndWith("jake.exe --hold-wsl Ubuntu-24.04");
+  }, 30_000);
+
+  test("where Windows refuses every task, says why and still installs", async () => {
+    const at = wslMachine(true);
+    const { code, output } = await install(at, "all");
+    expect(output).toContain("the task could not be registered: Access is denied.");
+    expect(code).toBe(0);
+    expect(readFileSync(at.tasks, "utf8")).toBe("");
   }, 30_000);
 
   test("without interop, leaves the task as it is and still installs", async () => {

@@ -1,4 +1,4 @@
-// The jake executable: the agent, the Windows guard, a leave notice or a WSL hold, by its argument.
+// The jake executable: the agent, the Windows guard or a one-shot mode, by its arguments.
 
 // On Windows it opens no console, so no console's close or key can end it.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -15,11 +15,41 @@ use serde_json::json;
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
 const LEAVE_FLAG: &str = "--leave";
+/// The argument that has the executable print the build it is, and exit.
+const VERSION_FLAG: &str = "--version";
 
+/// What one start of the executable does, by its arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+  Version,
+  HoldWsl(String),
+  Configured(Mode),
+}
+
+/// A run mode that reads the agent's config and log.
+#[derive(Debug, PartialEq, Eq)]
 enum Mode {
   Agent,
   Guard,
   Leave,
+}
+
+/// The invocation the arguments name. Anything else is refused rather than run as the agent, since a
+/// second agent under the installed one's name would displace its connection.
+fn invocation(arguments: &[String]) -> Result<Invocation, String> {
+  match arguments {
+    [] => Ok(Invocation::Configured(Mode::Agent)),
+    [flag] if flag == GUARD_MODE_FLAG => Ok(Invocation::Configured(Mode::Guard)),
+    [flag] if flag == LEAVE_FLAG => Ok(Invocation::Configured(Mode::Leave)),
+    [flag] if flag == VERSION_FLAG => Ok(Invocation::Version),
+    [flag, distribution] if flag == HOLD_WSL_FLAG && !distribution.is_empty() => {
+      Ok(Invocation::HoldWsl(distribution.clone()))
+    }
+    _ => Err(format!(
+      "unknown arguments {arguments:?}; run with none for the agent, or with {GUARD_MODE_FLAG}, {LEAVE_FLAG}, \
+       {VERSION_FLAG} or {HOLD_WSL_FLAG} <distribution>"
+    )),
+  }
 }
 
 /// Everything a run mode starts from: where it was installed, its environment, its config and log.
@@ -179,10 +209,6 @@ fn hold_wsl(distribution: &str) -> ExitCode {
     eprintln!("jake: {HOLD_WSL_FLAG} holds a WSL distribution from Windows, and this is not Windows");
     return ExitCode::FAILURE;
   }
-  if distribution.is_empty() {
-    eprintln!("jake: {HOLD_WSL_FLAG} takes the name of the distribution to hold");
-    return ExitCode::FAILURE;
-  }
   match runtime() {
     Ok(runtime) => {
       runtime.block_on(wsl::hold(distribution));
@@ -194,16 +220,21 @@ fn hold_wsl(distribution: &str) -> ExitCode {
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
-  if let Some(at) = arguments.iter().position(|argument| argument == HOLD_WSL_FLAG) {
-    return hold_wsl(arguments.get(at + 1).map_or("", String::as_str));
+  match invocation(&arguments) {
+    Ok(Invocation::Version) => {
+      println!("{VERSION}");
+      ExitCode::SUCCESS
+    }
+    Ok(Invocation::HoldWsl(distribution)) => hold_wsl(&distribution),
+    Ok(Invocation::Configured(mode)) => run_configured(mode),
+    Err(message) => {
+      eprintln!("jake: {message}");
+      ExitCode::from(2)
+    }
   }
-  let mode = if arguments.iter().any(|argument| argument == GUARD_MODE_FLAG) {
-    Mode::Guard
-  } else if arguments.iter().any(|argument| argument == LEAVE_FLAG) {
-    Mode::Leave
-  } else {
-    Mode::Agent
-  };
+}
+
+fn run_configured(mode: Mode) -> ExitCode {
   let start = match start() {
     Ok(start) => start,
     Err(message) => {
@@ -222,4 +253,32 @@ fn main() -> ExitCode {
       Mode::Leave => run_leave(start).await,
     }
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn invoked(arguments: &[&str]) -> Result<Invocation, String> {
+    invocation(&arguments.iter().map(|argument| (*argument).to_owned()).collect::<Vec<_>>())
+  }
+
+  #[test]
+  fn each_run_mode_is_named_by_its_own_arguments_alone() {
+    assert_eq!(invoked(&[]), Ok(Invocation::Configured(Mode::Agent)));
+    assert_eq!(invoked(&["--guard"]), Ok(Invocation::Configured(Mode::Guard)));
+    assert_eq!(invoked(&["--leave"]), Ok(Invocation::Configured(Mode::Leave)));
+    assert_eq!(invoked(&["--version"]), Ok(Invocation::Version));
+    assert_eq!(
+      invoked(&["--hold-wsl", "Ubuntu-24.04"]),
+      Ok(Invocation::HoldWsl("Ubuntu-24.04".to_owned()))
+    );
+  }
+
+  #[test]
+  fn anything_else_is_refused_rather_than_run_as_a_second_agent() {
+    for arguments in [&["status"][..], &["--hold-wsl"], &["--hold-wsl", ""], &["--guard", "--leave"]] {
+      assert!(invoked(arguments).is_err(), "{arguments:?}");
+    }
+  }
 }

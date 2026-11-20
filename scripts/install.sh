@@ -378,44 +378,55 @@ windows_powershell() { # → the path of Windows PowerShell reached through inte
   if [ -x "$path" ]; then printf '%s' "$path"; fi
 }
 
-run_powershell() { # powershell script → what the script printed, line ends made plain
+run_powershell() { # powershell script → the last line the script printed, in UTF-8 with plain line ends
   local encoded
   encoded="$(printf '%s' "$2" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
-  "$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" 2>&1 | tr -d '\r'
+  "$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" 2>/dev/null \
+    | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1
 }
 
 # The task's name for one distribution: its name with anything but letters, digits, dots and dashes
 # made a dash. The hold's executable, where one is needed, has a folder of the same name.
 wsl_task_name() { printf 'JakeWsl-%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '-')"; }
 
-keep_alive_script() { # distribution → the script that registers and starts the task, printing the road
+# The script that registers and starts the task for a distribution, ending on one line that names the
+# road taken: unattended, at-logon with Windows' refusal of S4U, needs-launcher with the path the hold's
+# executable is to be placed at, or failed with why. A WSL distribution's name holds no space or quote,
+# so it goes into the task's arguments bare: wsl.exe does not take a quoted name.
+keep_alive_script() {
   local distribution="$1"
   cat <<SCRIPT
+\$ProgressPreference = 'SilentlyContinue'
 \$ErrorActionPreference = 'Stop'
-\$name = $(ps_quote "$(wsl_task_name "$distribution")")
-\$distribution = $(ps_quote "$distribution")
-\$launcher = Join-Path \$env:LOCALAPPDATA ('Programs\\jake-wsl\\' + \$name + '\\jake.exe')
-\$user = "\$env:USERDOMAIN\\\$env:USERNAME"
-\$triggers = @(
-  (New-ScheduledTaskTrigger -AtLogOn -User \$user),
-  (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
-)
-\$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 try {
-  \$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument ('-d "' + \$distribution + '" --exec sleep infinity')
-  \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType S4U -RunLevel Limited
-  Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
-  \$road = 'unattended'
+  \$name = $(ps_quote "$(wsl_task_name "$distribution")")
+  \$distribution = $(ps_quote "$distribution")
+  \$launcher = Join-Path \$env:LOCALAPPDATA ('Programs\\jake-wsl\\' + \$name + '\\jake.exe')
+  \$user = "\$env:USERDOMAIN\\\$env:USERNAME"
+  \$triggers = @(
+    (New-ScheduledTaskTrigger -AtLogOn -User \$user),
+    (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
+  )
+  \$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+  try {
+    \$action = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument ('-d ' + \$distribution + ' --exec sleep infinity')
+    \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType S4U -RunLevel Limited
+    Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
+    \$road = 'unattended'
+  } catch {
+    \$refusal = \$_.Exception.Message
+    if (-not (Test-Path -LiteralPath \$launcher)) { "needs-launcher \$launcher"; exit 0 }
+    \$action = New-ScheduledTaskAction -Execute \$launcher -Argument ('--hold-wsl ' + \$distribution)
+    \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
+    \$road = 'at-logon ' + \$refusal
+  }
+  Start-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue
+  \$road
 } catch {
-  \$refusal = \$_.Exception.Message
-  if (-not (Test-Path -LiteralPath \$launcher)) { "needs-launcher \$launcher"; exit 0 }
-  \$action = New-ScheduledTaskAction -Execute \$launcher -Argument ('--hold-wsl "' + \$distribution + '"')
-  \$principal = New-ScheduledTaskPrincipal -UserId \$user -LogonType Interactive -RunLevel Limited
-  Register-ScheduledTask -TaskName \$name -Action \$action -Trigger \$triggers -Settings \$settings -Principal \$principal -Force | Out-Null
-  \$road = 'at-logon ' + \$refusal
+  'failed ' + \$_.Exception.Message
 }
-Start-ScheduledTask -TaskName \$name -ErrorAction SilentlyContinue
-\$road
 SCRIPT
 }
 
@@ -428,23 +439,18 @@ keep_distribution_running() {
     warn "Windows interop is not reachable from here, so the task is left as it is. Run the install again from a WSL shell to register it."
     return 0
   fi
-  answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || {
-    warn "the task could not be registered: $answer"
-    return 0
-  }
+  answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || true
   if [ "${answer%% *}" = "needs-launcher" ]; then
     launcher="$(wslpath -u "${answer#needs-launcher }")"
     mkdir -p "$(dirname "$launcher")"
     place_from_payload "jake.exe" "$launcher"
-    answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || {
-      warn "the task could not be registered: $answer"
-      return 0
-    }
+    answer="$(run_powershell "$powershell" "$(keep_alive_script "$distribution")")" || true
   fi
   case "$answer" in
     unattended) ok "registered: it holds $distribution from boot, whether or not you are logged on" ;;
-    at-logon*) warn "registered to hold $distribution from your logon only, since Windows refused a task that runs without it: ${answer#at-logon }" ;;
-    *) warn "the task registration answered: $answer" ;;
+    at-logon\ *) warn "registered to hold $distribution from your logon only, since Windows refused a task that runs without it: ${answer#at-logon }" ;;
+    failed\ *) warn "the task could not be registered: ${answer#failed }" ;;
+    *) warn "the task registration did not answer as expected${answer:+: $answer}" ;;
   esac
 }
 

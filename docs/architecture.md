@@ -222,8 +222,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   administrator rights. There the task runs at this user's logon, interactively, and its action is the
   Windows executable in its hold mode: a program of the Windows subsystem, which opens no console,
   starting the session with no window of its own and opening it again a few seconds after it ends.
-  The executable is placed in a folder of its own per distribution, apart from a Windows agent's
+  The hold puts itself in a job that ends every process in it when the hold ends, so stopping its task
+  ends the session too rather than leaving it to hold the distribution. The executable is placed in a folder of its own per distribution, apart from a Windows agent's
   install, whose update or removal therefore leaves it alone.
+- A distribution's name holds no space or quote, and `wsl.exe` reads a quoted name with its quotes as
+  a name no distribution has, so the name goes into the task's arguments bare.
 - The task is registered by the install through Windows interop, which only a WSL session started from
   Windows has; the agent's systemd service has none, so neither an unattended update nor a leave
   reaches it, and the uninstall script, run from a WSL shell, removes it.
@@ -314,6 +317,11 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   belongs to another program, as Windows reuses ids, reads as gone too: the holder is a copy of this
   executable or nothing, so a reused id neither blocks the run mode nor is ever ended in its place.
   Only a process this user cannot read at all is left holding the lock.
+
+- The executable takes only the arguments of its run modes: none for the agent, the guard-mode flag,
+  the leave flag, the version flag, or the hold flag with a distribution's name. It refuses anything
+  else, since a start with a stray argument read as the agent would be a second agent under the
+  installed one's name, displacing its connection.
 
 ## Leaving
 
