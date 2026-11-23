@@ -90,6 +90,8 @@ pub enum Action {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
+  /// The window's title, which the page's own top bar shows since the window draws none.
+  pub title: String,
   pub headline: String,
   pub detail: Vec<String>,
   pub tone: Tone,
@@ -108,6 +110,7 @@ impl Status {
       ConsoleState::Unreachable(_) => (false, Some("콘솔에 연결되지 않습니다.".to_owned())),
     };
     View {
+      title: self.title(),
       headline,
       detail,
       tone,
@@ -137,6 +140,12 @@ impl Status {
 }
 
 impl AgentState {
+  /// Whether the course stopped here for the person to act, which the local page is where they do:
+  /// a state that needs nothing of them, an installed agent serving among them, is not one.
+  pub fn waits_on_person(&self) -> bool {
+    matches!(self, Self::NoStore(_) | Self::PairingFailed(_) | Self::Yielded(_) | Self::Removed)
+  }
+
   fn words(&self) -> (String, Vec<String>, Tone, Option<Action>) {
     let line = |text: &str| vec![text.to_owned()];
     match self {
@@ -236,5 +245,30 @@ mod tests {
     };
     assert_eq!(pairing.title(), "연결 코드 ABCD-EFGH · BMO");
     assert_eq!(Status::default().title(), "BMO");
+    assert_eq!(pairing.view().title, "연결 코드 ABCD-EFGH · BMO");
+  }
+
+  #[test]
+  fn the_states_that_wait_on_the_person_are_those_the_page_offers_to_go_on_from() {
+    let waiting = [
+      AgentState::NoStore("none".to_owned()),
+      AgentState::PairingFailed(PairingFailure::Gone),
+      AgentState::Yielded("agent-a".to_owned()),
+      AgentState::Removed,
+    ];
+    let going = [
+      AgentState::Starting,
+      AgentState::Link(Link::Attached),
+      AgentState::Paused,
+      AgentState::HeldOff("agent-a".to_owned()),
+    ];
+
+    for state in waiting {
+      assert!(state.waits_on_person(), "{state:?}");
+      assert!(state.words().3.is_some(), "{state:?}");
+    }
+    for state in going {
+      assert!(!state.waits_on_person(), "{state:?}");
+    }
   }
 }

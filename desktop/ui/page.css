@@ -1,4 +1,4 @@
-/* The bundled pages: one panel, light and dark, on the shared spacing and type scale. */
+/* The bundled page: its window's top bar over one panel, light and dark, on the shared spacing and type scale. */
 
 :root {
   color-scheme: light dark;
@@ -15,9 +15,9 @@
   --good: #15803d;
   --attention: #b45309;
   --focus: #0f766e;
-  --switch-off: #71717a;
-  --switch-off-hover: #52525b;
-  --switch-off-press: #3f3f46;
+  --close-hover: #c42b1c;
+  --close-press: #a52416;
+  --close-text: #ffffff;
   --radius: 8px;
   /* The shared motion set: a state changing in place, with both ends eased. */
   --quick: 150ms;
@@ -41,9 +41,6 @@
     --good: #4ade80;
     --attention: #fbbf24;
     --focus: #2dd4bf;
-    --switch-off: #71717a;
-    --switch-off-hover: #a1a1aa;
-    --switch-off-press: #d4d4d8;
   }
 }
 
@@ -58,9 +55,9 @@
 
 body {
   margin: 0;
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
   color: var(--text);
   font-size: 16px;
@@ -68,6 +65,73 @@ body {
   /* Korean breaks between words, never inside one. */
   word-break: keep-all;
   overflow-wrap: anywhere;
+}
+
+main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  place-items: center;
+}
+
+/* The window's top bar, which the frameless window draws none of: its title, the drag region, and the
+   controls where the page draws them. */
+.frame {
+  flex: none;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  user-select: none;
+}
+
+/* The system's own buttons stand inset at the top left, so the title leaves them their room. */
+.frame.inset {
+  padding-left: 80px;
+}
+
+.frame-title {
+  flex: 1;
+  min-width: 0;
+  padding: 0 12px;
+  font-size: 14px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.controls {
+  display: flex;
+  align-self: stretch;
+}
+
+.controls button {
+  width: 48px;
+  padding: 0;
+  justify-content: center;
+  border: none;
+  border-radius: 0;
+}
+
+.controls button.close:hover {
+  background: var(--close-hover);
+  color: var(--close-text);
+}
+
+.controls button.close:active {
+  background: var(--close-press);
+  color: var(--close-text);
+}
+
+.controls svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.controls button:focus-visible {
+  outline-offset: -2px;
 }
 
 .panel {
@@ -189,132 +253,6 @@ button[aria-busy="true"]::before {
   animation: spin 1s linear infinite;
 }
 
-/* The settings page reads from the top, a switch to a row. */
-body.sheet {
-  place-items: start center;
-}
-
-.switches {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 16px;
-}
-
-.setting {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.setting-text {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.setting-text label {
-  cursor: pointer;
-}
-
-.hint {
-  margin: 0;
-  color: var(--muted);
-  font-size: 14px;
-}
-
-.error,
-.notice {
-  display: grid;
-  gap: 4px;
-  color: var(--attention);
-  font-size: 14px;
-}
-
-.error p,
-.notice p {
-  margin: 0;
-}
-
-/* What the system said, in its own words. */
-.machine {
-  font-family: "CaskaydiaCove Nerd Font", ui-monospace, monospace;
-  overflow-wrap: anywhere;
-}
-
-button.switch {
-  flex: none;
-  width: 44px;
-  height: 24px;
-  padding: 2px;
-  border: none;
-  border-radius: 999px;
-  background: var(--switch-off);
-}
-
-button.switch::after {
-  content: "";
-  width: 20px;
-  height: 20px;
-  box-sizing: border-box;
-  border-radius: 50%;
-  background: var(--surface);
-  transition: margin-left var(--quick) var(--move);
-}
-
-button.switch:hover {
-  background: var(--switch-off-hover);
-}
-
-button.switch:active {
-  background: var(--switch-off-press);
-}
-
-button.switch[aria-checked="true"] {
-  background: var(--accent);
-}
-
-button.switch[aria-checked="true"]:hover {
-  background: var(--accent-hover);
-}
-
-button.switch[aria-checked="true"]:active {
-  background: var(--accent-press);
-}
-
-button.switch[aria-checked="true"]::after {
-  margin-left: 20px;
-}
-
-button.switch:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-button.switch:disabled:hover,
-button.switch:disabled:active {
-  background: var(--switch-off);
-}
-
-button.switch[aria-checked="true"]:disabled:hover,
-button.switch[aria-checked="true"]:disabled:active {
-  background: var(--accent);
-}
-
-/* A switch at work spins its knob in place of the button's own spinner. */
-button.switch[aria-busy="true"]::before {
-  content: none;
-}
-
-button.switch[aria-busy="true"]::after {
-  border: 3px solid var(--surface);
-  border-top-color: transparent;
-  background: transparent;
-  animation: spin 1s linear infinite;
-}
-
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -322,13 +260,8 @@ button.switch[aria-busy="true"]::after {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  button.switch::after {
-    transition: none;
-  }
-
   .mark.working,
-  button[aria-busy="true"]::before,
-  button.switch[aria-busy="true"]::after {
+  button[aria-busy="true"]::before {
     animation-duration: 3s;
   }
 }

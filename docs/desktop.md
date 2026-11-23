@@ -14,11 +14,13 @@ to it.
 - **A built-in agent while the app runs.** The app runs the agent crate as a library on its own
   runtime, under the person's own machine credential, so the machine is reachable through the hub for
   as long as the app is open, with the same shells, transfers and streams an installed agent offers.
-- **A tray icon.** The tray opens the console again, shows the agent's state, opens the settings,
-  turns starting at sign-in on and off, and quits. Quitting stops the agent.
-- **Settings of its own,** on a screen the tray and the window open: whether control is kept while
-  the PC is locked, what closing the window does, starting at sign-in, starting in the tray, and
-  keeping the PC awake (「Settings」).
+- **A window with no frame of its own.** The window carries no native title bar and no menu bar; the
+  console draws the window's top bar and its controls itself (「The window's frame」).
+- **A tray icon.** The tray opens the console again, shows the agent's state in its tooltip, turns
+  starting at sign-in on and off, and quits. Quitting stops the agent.
+- **Settings of its own,** set in the console's own settings while the console runs in the app:
+  whether control is kept while the PC is locked, what closing the window does, starting at sign-in,
+  starting in the tray, and keeping the PC awake (「Settings」).
 - **One copy at a time.** A second launch brings the running copy's window forward and exits, since two
   copies would hold one name twice.
 
@@ -86,8 +88,10 @@ flowchart TD
   the same code at the head of its main window's title, as `연결 코드 <code> · BMO`, so the person can
   see they are approving this app. Once the console answers, the main window shows the approval page
   itself, so the title bar is the one place the app's copy of the code stays visible; the code leads
-  the title so a title cut short still shows it. The local page shows the code too, but only while the
-  console cannot be reached.
+  the title so a title cut short still shows it. The window has no native title bar, so the console
+  draws that title, read from the window, in the top bar it draws on a page with no shell of its own
+  (「The window's frame」); the operating system's taskbar shows it as well. The local page shows the
+  code too, but only while the console cannot be reached.
 - **The answer is checked before it is kept:** the credential must name the machine the answer names,
   and the hub's URL must be a WebSocket address. An approval page outside the console's origin is
   refused.
@@ -123,6 +127,11 @@ flowchart TD
   failed, no credential store, connecting, attached, refused by the hub, hub unreachable, restarting
   after a fault, paused while the PC is locked, held off for an installed agent, given up to another
   agent of its name, and removed by the hub.
+- **A state that waits on the person shows the local page in the main window,** in place of the
+  console: a pairing that failed, no credential store, the name given up to another agent, and the
+  machine removed by the hub. Each stops the app's course until the person asks it to go on, and the
+  local page is where that ask is made, beside the way back to the console. A state that needs nothing
+  of the person, held off for an installed agent among them, leaves the console where it is.
 
 ## One agent per name
 
@@ -159,8 +168,8 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
 
 - **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON or
   a value of the wrong type, leaves the app on its defaults with the reason in its log, and the
-  settings screen then says the file cannot be read and changes nothing, since writing it would
-  overwrite the hand edit it could not read.
+  console's section then says the file cannot be read and the app changes nothing, since writing it
+  would overwrite the hand edit it could not read.
 - **A byte-order mark at the file's start is read past,** since Windows editors and PowerShell write
   one before UTF-8; the app writes none.
 - **A change is written the moment it is made,** the whole file replaced by a rename, so a reader never
@@ -169,7 +178,7 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
 - **Every setting takes effect at once,** with no restart: each is read again where it acts, at the next
   close of the window, the next lock of the session, the next sign-in, or at once where it holds
   something now (starting at sign-in, keeping awake).
-- **The console's address is not on the screen.** Another address is another console, whose pairing
+- **The console's address is not in the console's section.** Another address is another console, whose pairing
   the stored credential does not answer to, so it stays a hand edit read at start.
 
 ### Closing the window
@@ -190,30 +199,33 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   setting changes and at every start of the app, so a registration a reset of the machine wiped is put
   back the next time the app runs. Where the file holds no value, the registration as it stands is
   taken as the setting and written into the file.
-- **The tray's check item and the settings screen show the one value:** a change from either is written
-  to the file and shown on the other at once.
+- **The tray's check item and the console's section show the one value:** a change from either is
+  written to the file; the tray's item follows a change made in the console at once, and the console
+  shows a change made from the tray the next time it reads the settings.
 - **A registration the system refuses leaves the setting as it was,** with the reason shown where the
-  change was made: beside the switch on the screen, and in the log for the tray, whose item springs
+  change was made: beside the switch in the console, and in the log for the tray, whose item springs
   back.
 - **Starting in the tray.** The registration starts the app with an argument that says it was started
   at sign-in. Started so with `startInTray` on, the app opens no window: the tray and the agent start as
   they always do, and the tray opens the window. Started by hand, the app always opens its window. A
   pairing needs the person, so one that opens shows the window however the app was started.
 
-### The settings screen
+### Where the settings are set
 
-- **A window of its own, one at a time,** opened from the tray's settings item, from the main window's
-  menu, and from the local page. Opening it again brings the open one forward.
-- **The main window carries a menu bar of one menu,** holding the settings, the status page and quit,
-  since the console fills the rest of the window and the console's own pages get no command of the
-  app's (「The window and what the console may call」).
-- **A page of standing switches.** Each switch takes effect and is written the moment it is turned;
-  there is no save button and nothing is held unsaved, so the values on the screen never differ from
-  what is saved and closing the window, by its close button, Esc or Back, asks nothing.
-- **A switch whose change fails** returns to the saved value, with the reason beside it.
-- **Only the settings the platform offers are shown.**
-- **It is a bundled page,** as the local page is, and reads and changes the settings through the app's
-  commands alone.
+- **In the console's own settings, in a section of their own that stands only in the app's window.**
+  The console reads the settings and changes one at a time through the app's bridge (「The window and
+  what the console may call」); in a browser no bridge answers and the section is not there. The
+  section's wording and layout are the console's (its `docs/web.md`, 「Settings」).
+- **What the bridge hands the console is what the section draws:** the switches this platform offers,
+  each with its value, and why the file cannot be changed, where it cannot. Only the settings the
+  platform offers are handed over, so only those are drawn.
+- **Each switch takes effect and is written the moment it is turned;** nothing is held unsaved. A
+  change that fails leaves the saved value standing and answers with the reason, which the console
+  shows beside the switch.
+- **The app keeps no settings screen of its own.** Every setting acts while the app runs whether the
+  console is shown or not, and each is reached in the console as soon as it loads; starting at sign-in
+  is also the tray's check item, and quitting the tray's. While the console cannot be reached the local
+  page offers to try it again, not the settings.
 
 ## While the PC is locked
 
@@ -276,17 +288,71 @@ processes and its network stay as they were.
   and when the app quits.
 - **Off, the power plan alone decides,** as it does for any program.
 
+## The window's frame
+
+- **The window has no native title bar and no menu bar, on every platform.** The console fills the
+  window to its top edge and draws the window's top bar itself, as its own title bar, while it knows
+  it runs in the app (its `docs/web.md`, 「The desktop app's window」). Quitting is the tray's, and the
+  operating system's own close and quit.
+- **Who draws the window's controls differs by platform, and the app says which** in what the bridge
+  hands the console (「The window and what the console may call」):
+  - **On Windows and Linux the window is undecorated,** and the console draws minimise, maximise or
+    restore, and close at its top bar's right end, in its own colours and following its light and dark
+    mode. Each asks the window through the bridge. Tauri 2 offers no title bar overlay on these
+    platforms, so no native controls stand over the page.
+  - **On macOS the title bar is an overlay with its title hidden:** the system's own three buttons
+    stand inset at the top left over the console, and the console leaves their room free and draws no
+    controls of its own.
+- **The console's top bar is the window's drag region.** Pressed and dragged where nothing pressable
+  stands, it moves the window, and a double press maximises or restores it, as the system's title bar
+  does; the buttons, links and fields in it stay pressable. On a page with no shell of its own the
+  console draws a thin bar holding the window's title, the drag region and the controls, so every page
+  can be moved and closed.
+- **The window is resized from every edge and corner.** An undecorated window keeps the edges Tauri
+  gives it for resizing on Windows and Linux, and the macOS overlay keeps the system's own.
+- **The local page draws the same bar** for itself, the window's title at its left and the controls
+  at its right where the app says the page draws them, since it fills the same frameless window.
+- **Closing from the drawn close is the window's close,** so it hides the window or quits as
+  `closeToTray` says (「Closing the window」).
+
 ## The window and what the console may call
 
-- **Navigation stays on the console's origin.** The main window goes only to the console's origin and
-  to the app's own bundled page; a link to anywhere else opens in the person's default browser.
+- **Navigation stays under the console's address.** The main window goes only to pages of the
+  console's origin whose path lies under `consoleUrl`'s, and to the app's own bundled page; a link to
+  anywhere else, another path of the console's own host among them, opens in the person's default
+  browser. Another site served beside the console on its host therefore never stands in the window,
+  which is what keeps the bridge, granted to the console's origin, to the console's own pages.
 - **The bundled page** says when the console cannot be reached, shows the agent's state and the
-  pairing code, and offers to try the console again, pair again, look again for an installed agent or
-  a credential store, or open the settings.
-- **The console's origin gets no Tauri command.** Pairing needs no hand-off from the page, because the
-  Rust side polls for the approval itself, so no capability lists a remote origin. The bundled pages
-  alone may call the app's commands, each named in their capability: read the status, try the console
-  again, retry (pair again, or look again), open the settings, and read and change a setting.
+  pairing code, and offers to try the console again, pair again, or look again for an installed agent
+  or a credential store.
+- **The console's pages get a narrow bridge, and nothing else.** The bridge is one capability the app
+  adds as it starts, scoped to the main window and to remote pages of the configured `consoleUrl`'s
+  origin, its scheme, host and port, so another site, another scheme or port and a page in another
+  window are given nothing. The webview names the page asking to the app by its origin alone, so the
+  scope cannot be narrower than the origin; the window's navigation keeps it to the console's own
+  path. The scope follows `consoleUrl` as the app read it at start, since the capability is built from
+  it then.
+- **The bridge holds two of the app's commands and the window's own controls:**
+  - `settings` reads the settings: each switch the platform offers with its value, why the file
+    cannot be changed where it cannot, and `windowControls`, `console` where the page draws the
+    window's controls and `inset` where the system's stand inset at the top left.
+  - `change_setting` changes one setting: its key, one of the switches' camelCase keys, and `on`,
+    true or false. The app checks it before anything is written: an unknown key or a value that is
+    not true or false is refused as the call is read, and a switch this platform does not offer is
+    refused with the reason. It answers with the settings as they now stand.
+  - The window's own commands for its frame: minimise, toggle maximise, close, start dragging, the
+    double press's maximise, whether it is maximised, and its title. Nothing else of the window, and
+    no other plugin's command.
+- **Nothing more is given:** no shell, no file, no process, no opener, no other window, and none of
+  the bundled page's commands (the status, trying the console again, retrying). A newer command the
+  console wants is added to the bridge here and in the console's document together.
+- **The console tells the app apart by the bridge alone:** a page that can call `settings` and is
+  answered runs in the app's window; anywhere else nothing answers, and the console draws nothing of
+  the app. Nothing is guessed from the user agent.
+- **The bundled page has a capability of its own,** scoped to the main window and the app's own
+  origin: read the status, try the console again, retry, read the settings for `windowControls`, and
+  the same window commands for its frame.
+- **Pairing needs no hand-off from the page,** because the Rust side polls for the approval itself.
 - **The console is checked before it is shown:** the app asks the console's address over HTTPS first,
   and shows the bundled page with the reason when it does not answer.
 

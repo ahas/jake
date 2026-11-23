@@ -61,7 +61,13 @@ impl<W: Window> Controller<W> {
         }
       };
       match held {
-        Some(state) => self.set_agent(state),
+        Some(state) => {
+          let waits = state.waits_on_person();
+          self.set_agent(state);
+          if waits {
+            self.window.open_local();
+          }
+        }
         None => return,
       }
       tokio::select! {

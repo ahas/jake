@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod awake;
+mod bridge;
 mod controller;
 mod follow;
 mod navigation;
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 use jake_agent::Log;
 use serde_json::json;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
 use tauri::{App, AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
@@ -37,7 +38,6 @@ use crate::status::{AgentState, Status, View};
 use crate::vault::Vault;
 
 const MAIN_WINDOW: &str = "main";
-const SETTINGS_WINDOW: &str = "settings";
 const TRAY: &str = "tray";
 /// How often a running app asks the update feed.
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -54,7 +54,7 @@ struct Shared {
   switches: watch::Sender<Switches>,
   /// Held so the lock's watch stays open on a platform that reports no lock.
   _locked: watch::Sender<bool>,
-  /// The tray's starting-at-sign-in item, kept in step with the settings screen.
+  /// The tray's starting-at-sign-in item, kept in step with the console's section.
   autostart: CheckMenuItem<Wry>,
   /// The person's sign-in registration, or why it cannot be made.
   registration: Result<Registration, String>,
@@ -94,31 +94,19 @@ fn retry(shared: State<'_, Shared>) {
   let _ = shared.retries.try_send(());
 }
 
-/// The settings as the settings page draws them.
+/// The settings as the console draws them, and who draws the window's controls; the bridge's read.
 #[tauri::command]
 fn settings(shared: State<'_, Shared>) -> SettingsView {
   settings_view(&shared)
 }
 
-/// Turn a setting on or off; it is written and takes effect at once.
+/// Turn one setting on or off; it is written and takes effect at once. The key and the value are read
+/// as a switch and a boolean or the call is refused, and a switch this platform does not offer is
+/// refused before anything is written.
 #[tauri::command]
 async fn change_setting(app: AppHandle, setting: Switch, on: bool) -> Result<SettingsView, String> {
-  change(&app, setting, on)?;
+  change(&app, setting.offered_here()?, on)?;
   Ok(settings_view(&app.state::<Shared>()))
-}
-
-/// Open the settings window, or bring the open one forward.
-#[tauri::command]
-async fn open_settings(app: AppHandle) {
-  show_settings(&app);
-}
-
-/// Close the settings window.
-#[tauri::command]
-async fn close_settings(app: AppHandle) {
-  if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
-    let _ = window.close();
-  }
 }
 
 fn settings_view(shared: &Shared) -> SettingsView {
@@ -186,26 +174,6 @@ fn align_sign_in(
   switches
 }
 
-fn show_settings(app: &AppHandle) {
-  if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
-    return;
-  }
-  let built = WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("settings.html".into()))
-    .title("설정")
-    .inner_size(440.0, 560.0)
-    .min_inner_size(360.0, 400.0)
-    .build();
-  if let Err(error) = built {
-    app
-      .state::<Shared>()
-      .log
-      .warn("settings-not-opened", json!({ "error": error.to_string() }));
-  }
-}
-
 fn reveal(app: &AppHandle) {
   if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
     let _ = window.unminimize();
@@ -234,7 +202,7 @@ fn stop_then(app: &AppHandle, then: impl FnOnce(&AppHandle) + Send + 'static) {
   });
 }
 
-/// Act on an item of the tray's menu or the window's menu bar.
+/// Act on an item of the tray's menu.
 fn on_menu(app: &AppHandle, id: &str) {
   match id {
     "open" => {
@@ -244,14 +212,6 @@ fn on_menu(app: &AppHandle, id: &str) {
         let shared = app.state::<Shared>();
         show_console(&shared.console, &MainWindow(app.clone()), &shared.status, &shared.log).await;
       });
-    }
-    "status" => {
-      reveal(app);
-      controller::Window::open_local(&MainWindow(app.clone()));
-    }
-    "settings" => {
-      let app = app.clone();
-      tauri::async_runtime::spawn(async move { show_settings(&app) });
     }
     "autostart" => {
       let shared = app.state::<Shared>();
@@ -266,28 +226,26 @@ fn on_menu(app: &AppHandle, id: &str) {
   }
 }
 
-/// The main window's menu bar: the settings, the status page and quit.
-fn window_menu(app: &App) -> tauri::Result<Menu<Wry>> {
-  let settings = MenuItem::with_id(app, "settings", "설정", true, None::<&str>)?;
-  let state = MenuItem::with_id(app, "status", "상태 보기", true, None::<&str>)?;
-  let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
-  let bmo = Submenu::with_items(
-    app,
-    "BMO",
-    true,
-    &[&settings, &state, &PredefinedMenuItem::separator(app)?, &quit],
-  )?;
-  Menu::with_items(app, &[&bmo])
+/// The window with no native title bar or menu bar (docs/desktop.md, 「The window's frame」): undecorated,
+/// the page drawing the controls, where Tauri offers no overlay title bar; on macOS an overlay title
+/// bar with its title hidden, the system's buttons inset over the page.
+#[cfg(not(target_os = "macos"))]
+fn frameless<'a>(builder: WebviewWindowBuilder<'a, Wry, App>) -> WebviewWindowBuilder<'a, Wry, App> {
+  builder.decorations(false)
+}
+
+#[cfg(target_os = "macos")]
+fn frameless<'a>(builder: WebviewWindowBuilder<'a, Wry, App>) -> WebviewWindowBuilder<'a, Wry, App> {
+  builder.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true)
 }
 
 fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Result<()> {
   let (navigating, opening) =
     ((console.clone(), log.clone()), (console.clone(), log.clone(), app.handle().clone()));
-  let window = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
+  let window = frameless(WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into())))
     .title("BMO")
     .inner_size(1280.0, 860.0)
     .min_inner_size(360.0, 560.0)
-    .menu(window_menu(app)?)
     .visible(visible)
     .on_navigation(move |url| {
       let (console, log) = &navigating;
@@ -337,8 +295,6 @@ fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Res
 /// The tray icon and its menu; the starting-at-sign-in item is handed back to be kept in step.
 fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
   let open = MenuItem::with_id(app, "open", "콘솔 열기", true, None::<&str>)?;
-  let state = MenuItem::with_id(app, "status", "상태 보기", true, None::<&str>)?;
-  let settings = MenuItem::with_id(app, "settings", "설정", true, None::<&str>)?;
   let autostart =
     CheckMenuItem::with_id(app, "autostart", "로그인할 때 시작", true, starting, None::<&str>)?;
   let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
@@ -346,8 +302,6 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
     app,
     &[
       &open,
-      &state,
-      &settings,
       &PredefinedMenuItem::separator(app)?,
       &autostart,
       &PredefinedMenuItem::separator(app)?,
@@ -363,7 +317,6 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
     .tooltip("BMO")
     .menu(&menu)
     .show_menu_on_left_click(false)
-    // A menu's events reach every menu listener, so this one serves the window's menu bar as well.
     .on_menu_event(|app, event| on_menu(app, event.id().as_ref()))
     .on_tray_icon_event(|tray, event| {
       if let TrayIconEvent::Click {
@@ -420,6 +373,9 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
   let (quit, quitting) = watch::channel(false);
 
   main_window(app, console.base(), &log, sign_in::opens_window(std::env::args(), &switches))?;
+  // The console's pages get the bridge alone, scoped to the address the app opens (docs/desktop.md,
+  // 「The window and what the console may call」).
+  app.add_capability(bridge::capability(console.base(), MAIN_WINDOW))?;
   let autostart = tray(app, switches.on(Switch::StartAtSignIn))?;
 
   let switches = watch::Sender::new(switches);
@@ -501,15 +457,7 @@ fn main() {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }
   let app = builder
-    .invoke_handler(tauri::generate_handler![
-      status,
-      console,
-      retry,
-      settings,
-      change_setting,
-      open_settings,
-      close_settings
-    ])
+    .invoke_handler(tauri::generate_handler![status, console, retry, settings, change_setting])
     .setup(move |app| setup(app, updates))
     .build(context)
     .expect("the app's configuration is valid");

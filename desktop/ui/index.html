@@ -8,18 +8,37 @@
     <script src="page.js" defer></script>
   </head>
   <body>
-    <main class="panel">
-      <header class="head">
-        <span id="mark" class="mark" aria-hidden="true"></span>
-        <h1 id="headline">에이전트 준비 중</h1>
-      </header>
-      <div id="detail" class="detail"></div>
-      <p id="code" class="code" hidden></p>
-      <p id="console-detail" class="detail" hidden></p>
-      <div class="actions">
-        <button id="settings" type="button">설정</button>
-        <button id="console" type="button">콘솔 열기</button>
-        <button id="retry" type="button" hidden></button>
+    <header id="frame" class="frame" data-tauri-drag-region="deep">
+      <span id="frame-title" class="frame-title">BMO</span>
+      <div id="controls" class="controls" hidden>
+        <button id="minimize" type="button" aria-label="최소화" title="최소화">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7.5" width="10" height="1" /></svg>
+        </button>
+        <button id="maximize" type="button" aria-label="최대화" title="최대화">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M3 3h10v10H3zm1 1v8h8V4z" />
+          </svg>
+        </button>
+        <button id="close" class="close" type="button" aria-label="닫기" title="닫기">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M3.7 3 8 7.3 12.3 3l.7.7L8.7 8l4.3 4.3-.7.7L8 8.7 3.7 13l-.7-.7L7.3 8 3 3.7z" />
+          </svg>
+        </button>
+      </div>
+    </header>
+    <main>
+      <div class="panel">
+        <header class="head">
+          <span id="mark" class="mark" aria-hidden="true"></span>
+          <h1 id="headline">에이전트 준비 중</h1>
+        </header>
+        <div id="detail" class="detail"></div>
+        <p id="code" class="code" hidden></p>
+        <p id="console-detail" class="detail" hidden></p>
+        <div class="actions">
+          <button id="console" type="button">콘솔 열기</button>
+          <button id="retry" type="button" hidden></button>
+        </div>
       </div>
     </main>
   </body>

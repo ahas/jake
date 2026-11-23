@@ -16,7 +16,8 @@ const FILE_NAME: &str = "settings.json";
 /// The byte-order mark Windows editors and PowerShell write before UTF-8.
 const BYTE_ORDER_MARK: &[u8] = b"\xEF\xBB\xBF";
 
-/// A setting a person turns on or off on the settings screen, named in the file by its camelCase key.
+/// A setting a person turns on or off in the console's section for the app, named in the file and over
+/// the bridge by its camelCase key; a key no switch has is refused as the call is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Switch {
@@ -54,6 +55,16 @@ impl Switch {
     }
   }
 
+  /// The switch, if this platform offers it; a change to one it does not offer is refused, since
+  /// nothing here would act on it.
+  pub fn offered_here(self) -> Result<Self, String> {
+    if self.offered() {
+      Ok(self)
+    } else {
+      Err(format!("{} is not offered on this platform", self.key()))
+    }
+  }
+
   fn key(self) -> String {
     match serde_json::to_value(self) {
       Ok(Value::String(key)) => key,
@@ -84,16 +95,35 @@ impl Switches {
   }
 }
 
-/// The settings as the settings page draws them: the switches this platform offers, and why the file
-/// cannot be changed, where it cannot.
+/// The settings as the console draws them: the switches this platform offers, why the file cannot be
+/// changed, where it cannot, and who draws the window's controls.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
   pub switches: Vec<SwitchView>,
   pub unreadable: Option<String>,
+  pub window_controls: WindowControls,
 }
 
-/// One switch on the settings page.
+/// Who draws the frameless window's controls (docs/desktop.md, 「The window's frame」).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowControls {
+  /// The page draws minimise, maximise and close at its top bar's right end.
+  Console,
+  /// The system's own buttons stand inset at the top left, and the page leaves their room.
+  Inset,
+}
+
+impl WindowControls {
+  /// This platform's: the macOS overlay title bar keeps the system's buttons, and elsewhere the window
+  /// is undecorated.
+  pub fn here() -> Self {
+    if cfg!(target_os = "macos") { Self::Inset } else { Self::Console }
+  }
+}
+
+/// One switch in the console's section.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchView {
@@ -102,7 +132,7 @@ pub struct SwitchView {
 }
 
 impl Switches {
-  /// The page's view of these switches, with the file's reason where it cannot be read.
+  /// The console's view of these switches, with the file's reason where it cannot be read.
   pub fn view(&self, unreadable: Option<&str>) -> SettingsView {
     let offered = Switch::ALL.into_iter().filter(|switch| switch.offered());
     SettingsView {
@@ -113,6 +143,7 @@ impl Switches {
         })
         .collect(),
       unreadable: unreadable.map(str::to_owned),
+      window_controls: WindowControls::here(),
     }
   }
 }
@@ -365,6 +396,55 @@ mod tests {
     let reopened = SettingsFile::open(&dir.0).settings();
     assert!(!reopened.switches.on(Switch::CloseToTray));
     assert!(!dir.0.join("settings.json.new").exists());
+  }
+
+  #[test]
+  fn the_bridge_reads_a_switch_by_its_key_alone() {
+    let read = |value: Value| serde_json::from_value::<Switch>(value);
+
+    assert_eq!(read(Value::from("keepAwake")).unwrap(), Switch::KeepAwake);
+    assert_eq!(read(Value::from("closeToTray")).unwrap(), Switch::CloseToTray);
+    for refused in [
+      Value::from("consoleUrl"),
+      Value::from("KeepAwake"),
+      Value::from("keep_awake"),
+      Value::from(""),
+      Value::from(1),
+      Value::Null,
+      serde_json::json!({ "keepAwake": true }),
+    ] {
+      assert!(read(refused.clone()).is_err(), "{refused}");
+    }
+  }
+
+  #[test]
+  fn a_switch_this_platform_does_not_offer_is_refused() {
+    for switch in Switch::ALL {
+      assert_eq!(switch.offered_here().is_ok(), switch.offered(), "{switch:?}");
+    }
+    assert!(Switch::CloseToTray.offered_here().is_ok());
+    let windows_only = Switch::KeepAwake.offered_here();
+    if cfg!(windows) {
+      assert!(windows_only.is_ok());
+    } else {
+      assert_eq!(windows_only.unwrap_err(), "keepAwake is not offered on this platform");
+    }
+  }
+
+  #[test]
+  fn the_view_holds_the_offered_switches_and_who_draws_the_controls() {
+    let switches = Switches::default().with(Switch::CloseToTray, false);
+    let view = serde_json::to_value(switches.view(Some("unreadable"))).unwrap();
+    let offered: Vec<Value> = Switch::ALL
+      .into_iter()
+      .filter(|switch| switch.offered())
+      .map(|switch| serde_json::json!({ "switch": switch.key(), "on": switches.on(switch) }))
+      .collect();
+
+    assert_eq!(view["switches"], Value::Array(offered));
+    assert_eq!(view["unreadable"], "unreadable");
+    let controls = if cfg!(target_os = "macos") { "inset" } else { "console" };
+    assert_eq!(view["windowControls"], controls);
   }
 
   #[test]
