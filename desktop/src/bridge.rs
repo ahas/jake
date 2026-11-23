@@ -108,7 +108,7 @@ mod tests {
     assert_eq!(scope(&named), "https://bmo.example:8443/*");
     let pattern: RemoteUrlPattern = scope(&named).parse().unwrap();
     assert!(matches(&pattern, "https://bmo.example:8443/console/rooms/7"));
-    assert!(!matches(&pattern, "https://ai.example.org/bmo/"));
+    assert!(!matches(&pattern, "https://elsewhere.example/console/"));
     assert!(!matches(&pattern, "https://bmo.example/console/"));
     assert!(for_server(Some(&named), "main").is_some());
     assert!(for_server(None, "main").is_none());

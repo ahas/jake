@@ -6,7 +6,6 @@ mod bridge;
 mod channel;
 mod controller;
 mod follow;
-mod migration;
 mod navigation;
 mod pairing;
 mod pause;
@@ -34,7 +33,6 @@ use url::Url;
 use crate::channel::{Channel, Feeds};
 use crate::controller::{Controller, show_console};
 use crate::follow::follow;
-use crate::migration::Migrated;
 use crate::navigation::Navigation;
 use crate::pairing::Console;
 use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch, Switches};
@@ -467,13 +465,6 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
   let mut file = SettingsFile::open(&app.path().app_config_dir()?);
   if let Some(reason) = file.unreadable() {
     log.warn("settings-unreadable", json!({ "reason": reason }));
-  }
-  // An installation an earlier build paired keeps the console that build carried (docs/desktop.md, 「The
-  // server」); the store is asked only where the file names no server.
-  match migration::migrate(&mut file, |legacy| matches!(Vault::for_console(legacy).load(), Ok(Some(_)))) {
-    Migrated::Untouched => {}
-    Migrated::Legacy(console) => log.info("server-migrated", json!({ "console": console.as_str() })),
-    Migrated::NotWritten(reason) => log.warn("server-not-migrated", json!({ "reason": reason })),
   }
   let settings = file.settings();
   let registration = Registration::new(&app.package_info().name);

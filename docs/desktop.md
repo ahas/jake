@@ -91,22 +91,6 @@ hub its machines attach to. The app reaches all three through the console's addr
   runtime grants capabilities but withdraws none, so the old server's grant would stand beside the new
   one for as long as the app ran. A new start grants the new origin alone.
 
-### Installations of builds that carried an address
-
-- **Builds up to 0.2.1 carry the owner's own deployment's address,** `https://ai.example.org/bmo/`, and open
-  it whatever the settings say. An installation of one is kept on that console: at a start
-  whose settings file names no server, the app asks the credential store whether a credential is kept
-  for that console's origin, and where one is, writes that address into the file, once. Only such a
-  build could have kept that credential without the person naming the server, so a fresh installation
-  is never sent there.
-- **Such an installation that holds no credential,** one never paired or whose machine was removed,
-  is asked for the server like a fresh one.
-- **That address stands in one migration constant in the app,** named as those builds' address, and
-  nowhere else in the app or its configuration.
-- **Those builds update from the owner's own server's feed,** which their configuration names, so they
-  reach a build that asks for its server only through a release that also publishes to that folder
-  (「Making a release」, `--mirror`).
-
 ## Pairing
 
 The app never asks for the shared secret and never shows a credential. It obtains the person's own
