@@ -30,8 +30,9 @@ the canonical statement of the all-in-one; the `desktop` crate built with its `a
 
 - **The same `desktop` crate, built with the `all-in-one` feature,** and with the Tauri configuration
   `tauri.all-in-one.conf.json` laid over the crate's own, which names the product `BMO All-in-One`, its own
-  identifier `io.ahas.bmo.all-in-one` and its own updater feed (「Updates」). The two apps install side by side,
-  each with its own settings and its own registration at sign-in.
+  identifier `io.ahas.bmo.all-in-one`, its own binary `bmo-all-in-one` and its own updater feed (「Updates」). The
+  two apps install side by side, each with its own settings and its own registration at sign-in, and their
+  packages share no file.
 - **What they share** stands in the crate once: the settings file and its switches, where the window may
   navigate, starting at sign-in and the update channel. Each builds its own frameless window, tray and console
   bridge from them, the all-in-one's bridge giving the console the same window commands and settings' read.
