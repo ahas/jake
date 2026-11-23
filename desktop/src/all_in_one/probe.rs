@@ -2,6 +2,8 @@
 // app's own prints one `name=value` line for each fact, and the facts are weighed into what refuses the machine
 // and what the person is asked to accept.
 
+use crate::all_in_one::installer::Missing;
+
 /// The probe, run with `sh` on the machine or in the distribution the set runs in. Its lines are this app's own
 /// shape, `name=value`, read by `facts`.
 pub const SCRIPT: &str = include_str!("scripts/probe.sh");
@@ -24,6 +26,8 @@ pub struct Facts {
   pub systemd: bool,
   pub git: bool,
   pub cargo: bool,
+  /// Whether a C compiler stands, which building the installer links with.
+  pub cc: bool,
 }
 
 /// The facts of the probe's output; a line the probe did not write is passed over.
@@ -43,6 +47,7 @@ pub fn facts(output: &str) -> Facts {
       "systemd" => facts.systemd = value == "yes",
       "git" => facts.git = value == "yes",
       "cargo" => facts.cargo = value == "yes",
+      "cc" => facts.cc = value == "yes",
       _ => {}
     }
   }
@@ -91,6 +96,28 @@ pub fn verdict(facts: &Facts) -> Verdict {
     ));
   }
   verdict
+}
+
+/// The programs the first run's preparing needs before any installer stands to name what else is missing: git for
+/// the index's clone, and Rust with a C compiler for the installer's build. The prerequisites bring each.
+pub fn unprepared(facts: &Facts) -> Vec<Missing> {
+  [
+    (facts.git, "git", "색인과 각 저장소를 내려받는 데 필요합니다."),
+    (
+      facts.cargo,
+      "cargo",
+      "Rust 도구입니다. 설치 프로그램과 각 서비스를 소스에서 빌드합니다.",
+    ),
+    (facts.cc, "cc", "C 컴파일러입니다. 빌드가 링크하는 데 필요합니다."),
+  ]
+  .into_iter()
+  .filter(|(stands, ..)| !stands)
+  .map(|(_, program, detail)| Missing {
+    program: program.to_owned(),
+    detail: detail.to_owned(),
+    next: String::new(),
+  })
+  .collect()
 }
 
 fn or_unknown(value: &str) -> &str {

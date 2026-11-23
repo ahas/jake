@@ -71,7 +71,9 @@ flowchart TD
   C --> P[Preparing: the index cloned, the installer built]
   P --> M[The manager: systemd, or the supervisor started]
   M --> D[The plan: a dry run of the install]
-  D -->|programs missing| R[Prerequisites]
+  C -->|git, Rust or a C compiler missing| R[Prerequisites]
+  R -->|not prepared yet| P
+  D -->|programs missing| R
   R --> D
   D -->|values only the person has| I[Inputs]
   I --> D
@@ -87,25 +89,42 @@ flowchart TD
   person consents, and the consent is written into the app's record.
 - **Machine check.** The machine is read once, by a probe run where the set will run: Linux, an x86-64 or ARM
   processor, an ordinary account rather than root, the memory and the free disk, whether a systemd user manager
-  runs, and whether git and Rust stand. A machine that is not Linux, not 64-bit or is root's is refused with the
-  reason; too little memory or disk is said and asked to be accepted.
+  runs, and whether git, Rust and a C compiler stand. The memory is the machine's, or the ceiling of the container
+  the set runs in where that is lower. A machine that is not Linux, not 64-bit or is root's is refused with the
+  reason; too little memory or disk is said and asked to be accepted. Where git, Rust or a C compiler is missing,
+  as on a fresh system, the prerequisites (「Prerequisites」) come first, since preparing clones with git and builds
+  the installer with Rust, and preparing follows them.
 - **Preparing.** The index is cloned from its public repository, or brought up to its main branch where it
   stands, and the installer is built from source as `INSTALL.md` 「Lay down the index and build the installer」
-  states: the base libraries and the testbed cloned into the index, then the testbed's binary built. Each command's
+  states: the base libraries and the testbed cloned into the index, or brought up to their main branches where
+  they stand, then the testbed's binary built, so a retry builds the installer the testbed holds now. Each command's
   last lines are shown as it runs.
 - **The manager.** With a systemd user manager the set runs under it and nothing more is started. Without one the
   app starts `bmo-testbed supervise serve` as its child and hands every installer command the lines
   `bmo-testbed supervise env` prints.
+- **The PATH.** The supervisor, `supervise env` and, under systemd, every installer command run with the account's
+  own tool folders, `~/.cargo/bin`, `~/.local/bin` and `~/.bun/bin`, before the PATH the app started with, since a
+  session that began before the prerequisites installed them does not hold them, and the installer's `needs:`, every
+  build and every unit under the supervisor read the PATH.
 - **The plan.** The installer runs with `--dry-run`, `--preset personal` and `--with` naming the chat service, and
   its lines are read as they come:
   - a `needs:` line that failed is a missing program, listed with its `detail`, which says what it is for and
     where it comes from (「Prerequisites」);
   - a `needs-input` line is a value only the person has (「Inputs」);
   - with neither, the plan is shown as the steps it names, and the install goes on.
-- **Prerequisites.** The system's packages of `INSTALL.md` 「Install the prerequisites」 are installed on one press,
-  with root asked through the system's own prompt (`pkexec` on Linux), never through the app; Rust and Bun are
-  installed for the account by their own installers. What only the person can do, Claude Code's sign-in in a
-  browser among it, is said as such. The plan is then read again.
+
+  A dry run clones nothing, so on a fresh index it reads the declarations of the repositories preparing cloned
+  alone; the first real run clones the rest and stops, before any settings or deployment, at the programs and
+  values they need, which go to the same screens and back to the plan.
+- **Prerequisites.** Everything the preset's `needs:` lines name that a script can install is installed on one
+  press. As root, asked through the system's own prompt (`pkexec` on Linux) and never through the app: the
+  system's packages of `INSTALL.md` 「Install the prerequisites」 with tmux, ffmpeg, rsync, Xvfb, Poppler's
+  utilities and gnome-remote-desktop, Google Chrome from Google's package where neither it nor an opened Firefox
+  snap stands, and PostgreSQL and Valkey started where no systemd starts them. For the account, in its own folders:
+  Rust and Bun by their own installers, Zig at the version herdr's build names, checked against Zig's download
+  index, uv with LiteLLM's proxy, and Claude Code. What only the person can do, Claude Code's sign-in in a browser
+  among it, is said as such. Preparing then goes on where the machine check held it back, or else the plan
+  is read again.
 - **Inputs.** Each value the installer asks for is a field, under the line's `detail`: the console's name and
   password, what BMO calls the person, their chat service's bot token and their own id on it, and the remote
   desktop's password. Each value is handed to `install --set <name>` on its standard input alone; a value never

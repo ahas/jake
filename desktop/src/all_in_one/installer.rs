@@ -150,6 +150,14 @@ impl Layout {
     format!("{}/services/testbed/target/release/bmo-testbed", self.index())
   }
 
+  /// The PATH every installer command and the supervisor run with: the account's own tool folders, Rust's, the set's
+  /// linked commands and Bun's, laid before `rest`, since a session that began before the prerequisites installed
+  /// them does not hold them, and the installer's `needs:` and every build read the PATH.
+  pub fn tool_path(&self, rest: &str) -> String {
+    let home = &self.home;
+    format!("{home}/.cargo/bin:{home}/.local/bin:{home}/.bun/bin:{rest}")
+  }
+
   /// The testbed's binary the deployment links, once the set is installed.
   pub fn linked_installer(&self) -> String {
     format!("{}/.local/bin/bmo-testbed", self.home)
@@ -295,5 +303,16 @@ mod tests {
       ["/bin/bmo-testbed", "install", "--set", "web.owner-name", "--index", "/home/someone/bmo"]
     );
     assert_eq!(layout.data_root(), "/home/someone/.local/share/bmo/data");
+  }
+
+  #[test]
+  fn the_account_s_tool_folders_stand_first_on_the_installer_s_path() {
+    let layout = Layout {
+      home: "/home/someone".into(),
+    };
+    assert_eq!(
+      layout.tool_path("/usr/bin:/bin"),
+      "/home/someone/.cargo/bin:/home/someone/.local/bin:/home/someone/.bun/bin:/usr/bin:/bin"
+    );
   }
 }

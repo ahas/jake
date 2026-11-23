@@ -77,8 +77,21 @@ impl Shared {
     self.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
   }
 
+  /// The environment every installer command is laid under: the lines `supervise env` printed where the set runs
+  /// under the supervisor, whose PATH holds the account's tool folders since it was started with them; else that
+  /// PATH alone.
   fn env(&self) -> Vec<(String, String)> {
-    self.supervisor_env.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    let kept = self.supervisor_env.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if !kept.is_empty() {
+      return kept;
+    }
+    self
+      .layout()
+      .map_or_else(Vec::new, |layout| vec![("PATH".to_owned(), self.tool_path(&layout))])
+  }
+
+  fn tool_path(&self, layout: &Layout) -> String {
+    layout.tool_path(&self.host.base_path())
   }
 }
 
@@ -385,6 +398,9 @@ async fn start_supervisor(shared: &Shared, layout: &Layout) -> Result<(), String
     layout,
     testbed,
   };
+  // The supervisor, and every unit and deployment it runs, keep the PATH it starts with; `supervise env` prints the
+  // PATH it is itself run with.
+  let path = vec![("PATH".to_owned(), shared.tool_path(layout))];
   let running = shared
     .supervisor
     .lock()
@@ -392,7 +408,7 @@ async fn start_supervisor(shared: &Shared, layout: &Layout) -> Result<(), String
     .as_mut()
     .is_some_and(|child| child.try_wait().ok().flatten().is_none());
   if !running {
-    let line = shared.host.line(&words.serve(), &[], As::Account);
+    let line = shared.host.line(&words.serve(), &path, As::Account);
     let mut command = tokio::process::Command::new(&line[0]);
     command
       .args(&line[1..])
@@ -404,7 +420,7 @@ async fn start_supervisor(shared: &Shared, layout: &Layout) -> Result<(), String
     let child = command.spawn().map_err(|error| error.to_string())?;
     *shared.supervisor.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
   }
-  let env = run(&shared.host.line(&words.supervisor_env(), &[], As::Account), None, |_| {}).await;
+  let env = run(&shared.host.line(&words.supervisor_env(), &path, As::Account), None, |_| {}).await;
   *shared.supervisor_env.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
     set::env_lines(&env.out);
   // The supervisor answers once its socket listens.

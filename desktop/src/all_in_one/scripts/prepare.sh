@@ -1,5 +1,7 @@
 # The index laid down and the installer built, as the index's INSTALL.md 「Lay down the index and build the
-# installer」 states (docs/all-in-one.md, 「The first run」). The index is the first word; every step is idempotent.
+# installer」 states (docs/all-in-one.md, 「The first run」), each checkout brought up to its main branch where it
+# stands, so a retry builds the installer its repository holds now. The index is the first word; every step is
+# idempotent.
 set -eu
 index="$1"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
@@ -10,5 +12,6 @@ for pair in base/text:bmo-text base/chat:bmo-chat base/ui:bmo-ui services/testbe
   folder=${pair%%:*}
   name=${pair##*:}
   test -d "$folder/.git" || git clone "https://github.com/ahas/$name.git" "$folder"
+  git -C "$folder" pull --ff-only --quiet
 done
 cargo build --release --manifest-path services/testbed/Cargo.toml -p bmo-testbed-cli

@@ -5,7 +5,7 @@
 use serde::Serialize;
 
 use crate::all_in_one::installer::{Asked, Missing, Outcome};
-use crate::all_in_one::probe::{Facts, verdict};
+use crate::all_in_one::probe::{Facts, unprepared, verdict};
 
 /// The chat service BMO talks through besides the console, the preset's one choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -122,6 +122,8 @@ pub struct Flow {
   pub facts: Option<Facts>,
   /// The console's address, once an install reported it.
   pub console: Option<String>,
+  /// Whether the index is laid down and the installer built.
+  pub prepared: bool,
   /// The work a retry takes again.
   last: Work,
 }
@@ -134,6 +136,7 @@ impl Default for Flow {
       manager: None,
       facts: None,
       console: None,
+      prepared: false,
       last: Work::Wait,
     }
   }
@@ -182,15 +185,21 @@ impl Flow {
           };
           Work::Wait
         } else {
-          self.screen = Screen::Preparing;
-          Work::Prepare(manager)
+          self.prepare(manager)
         }
       }
-      Event::Accepted => {
+      Event::Accepted => self.prepare(self.manager.unwrap_or(Manager::Supervisor)),
+      Event::Prepared(Ok(())) => {
+        self.prepared = true;
+        self.screen = Screen::Planning;
+        Work::Plan
+      }
+      // The prerequisites a bare machine lacked are in place: the preparing they held back goes on.
+      Event::PrerequisitesDone(Ok(())) if !self.prepared => {
         self.screen = Screen::Preparing;
         Work::Prepare(self.manager.unwrap_or(Manager::Supervisor))
       }
-      Event::Prepared(Ok(())) | Event::PrerequisitesDone(Ok(())) | Event::InputsKept => {
+      Event::PrerequisitesDone(Ok(())) | Event::InputsKept => {
         self.screen = Screen::Planning;
         Work::Plan
       }
@@ -264,6 +273,19 @@ impl Flow {
     self.remember(work)
   }
 
+  /// The index laid down and the installer built, or first the prerequisites a bare machine lacks for that: the
+  /// clone needs git and the build Rust and a C compiler, which the plan's own `needs:` lines come too late to name.
+  fn prepare(&mut self, manager: Manager) -> Work {
+    let missing = self.facts.as_ref().map(unprepared).unwrap_or_default();
+    if missing.is_empty() {
+      self.screen = Screen::Preparing;
+      Work::Prepare(manager)
+    } else {
+      self.screen = Screen::Prerequisites { missing };
+      Work::Wait
+    }
+  }
+
   fn remember(&mut self, work: Work) -> Work {
     if !matches!(work, Work::Wait | Work::Open(_)) {
       self.last = work.clone();
@@ -297,6 +319,7 @@ mod tests {
       systemd,
       git: true,
       cargo: true,
+      cc: true,
     }
   }
 
@@ -378,6 +401,29 @@ mod tests {
     }];
     assert_eq!(flow.on(Event::Planned(Outcome::Missing(missing))), Work::Wait);
     assert_eq!(flow.on(Event::InstallPrerequisites), Work::Prerequisites);
+    assert_eq!(flow.on(Event::PrerequisitesDone(Ok(()))), Work::Plan);
+  }
+
+  #[test]
+  fn a_bare_machine_gets_its_prerequisites_before_the_index_is_laid_down() {
+    let mut flow = Flow::default();
+    flow.on(Event::Consented(Chat::Telegram));
+    let bare = Facts {
+      git: false,
+      cargo: false,
+      cc: false,
+      ..facts(false, 32)
+    };
+    assert_eq!(flow.on(Event::Probed(bare)), Work::Wait);
+    let Screen::Prerequisites { missing } = &flow.screen else { panic!("prerequisites") };
+    let programs: Vec<&str> = missing.iter().map(|missing| missing.program.as_str()).collect();
+    assert_eq!(programs, ["git", "cargo", "cc"]);
+    assert_eq!(flow.on(Event::InstallPrerequisites), Work::Prerequisites);
+    assert_eq!(flow.on(Event::PrerequisitesDone(Ok(()))), Work::Prepare(Manager::Supervisor));
+    assert_eq!(flow.screen, Screen::Preparing);
+    assert_eq!(flow.on(Event::Prepared(Ok(()))), Work::Plan);
+    flow.on(Event::Planned(Outcome::Missing(Vec::new())));
+    flow.on(Event::InstallPrerequisites);
     assert_eq!(flow.on(Event::PrerequisitesDone(Ok(()))), Work::Plan);
   }
 

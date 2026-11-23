@@ -23,7 +23,19 @@ pub enum As {
   Root,
 }
 
+/// The system's own folders, the PATH a command in the distribution starts from.
+const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 impl Host {
+  /// The PATH a command here starts from: the app's own on this machine, the system's in the distribution, whose
+  /// commands are run with no shell to read one.
+  pub fn base_path(&self) -> String {
+    match self {
+      Host::Local => std::env::var("PATH").unwrap_or_else(|_| SYSTEM_PATH.to_owned()),
+      Host::Wsl { .. } => SYSTEM_PATH.to_owned(),
+    }
+  }
+
   /// The words that run `words` here as `who`, with `env` laid over the environment.
   pub fn line(&self, words: &[String], env: &[(String, String)], who: As) -> Vec<String> {
     let overlay: Vec<String> = env.iter().map(|(key, value)| format!("{key}={value}")).collect();
@@ -175,6 +187,7 @@ mod tests {
       words(&["wsl.exe", "-d", "BMO", "-u", "someone", "--exec", "sh", "-s", "--", "/home/someone/bmo"])
     );
     assert_eq!(host.line(&words(&["service", "postgresql", "start"]), &[], As::Root)[4], "root");
+    assert_eq!(host.base_path(), SYSTEM_PATH);
   }
 
   #[tokio::test]
