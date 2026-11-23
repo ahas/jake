@@ -12,6 +12,11 @@ publish = false
 name = "jake-desktop"
 path = "src/main.rs"
 
+[features]
+# The all-in-one app (docs/all-in-one.md): the whole BMO set installed and run on this machine, built with the
+# configuration `tauri.all-in-one.conf.json` laid over the crate's own.
+all-in-one = ["dep:sha2"]
+
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }
 
@@ -24,11 +29,13 @@ keyring = "4.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The WSL image the all-in-one imports, checked against its folder's checksums.
+sha2 = { version = "0.10", optional = true }
 tauri = { version = "2.12", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2.5"
 tauri-plugin-updater = "2.14"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 url = "2.5"
 
 [target.'cfg(windows)'.dependencies]

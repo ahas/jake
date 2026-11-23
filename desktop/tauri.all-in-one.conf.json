@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BMO All-in-One",
+  "identifier": "io.ahas.bmo.all-in-one",
+  "bundle": {
+    "shortDescription": "BMO installed and run on this computer, with its console"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json"]
+    }
+  }
+}

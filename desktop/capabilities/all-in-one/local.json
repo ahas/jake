@@ -1,0 +1,22 @@
+{
+  "$schema": "../../gen/schemas/desktop-schema.json",
+  "identifier": "all-in-one-local",
+  "description": "The all-in-one's bundled page in the main window may read the first run's screen, answer it (consent, acceptance, prerequisites, a value asked, a retry), read the settings for who draws the window's controls, and drive its frameless window's frame; the console's pages are given the bridge the app adds once the set runs (docs/all-in-one.md).",
+  "windows": ["main"],
+  "permissions": [
+    "allow-aio-view",
+    "allow-aio-consent",
+    "allow-aio-accept",
+    "allow-aio-prerequisites",
+    "allow-aio-retry",
+    "allow-aio-input",
+    "allow-aio-inputs-done",
+    "allow-settings",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-is-maximized"
+  ]
+}

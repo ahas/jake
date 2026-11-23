@@ -14,8 +14,10 @@ jake 是一个 **bmo agent proxy**:BMO 管理其所有者远程机器时所经�
   - Windows: `powershell -c "irm <下载地址>/install.ps1 | iex"`
 - **桌面应用**:把 BMO 的 Web 控制台做成一个独立应用,并在其中内置代理;加入方式是在控制台中批准,而不是在安装时
   输入密钥。
+- **一体化应用**:把整套 BMO 安装并运行在用户自己的电脑上,控制台显示在应用窗口中;在 Linux 上直接运行,
+  在 Windows 上运行于专用的 WSL 2 发行版中。
 
 各部分如何配合见 docs/architecture.md,隧道帧见 docs/protocol.md,安装见 docs/install.md,桌面应用见
-docs/desktop.md,如何部署 hub 见 docs/deploy.md,shell 用法示例见 docs/recipes.md。
+docs/desktop.md,一体化应用见 docs/all-in-one.md,如何部署 hub 见 docs/deploy.md,shell 用法示例见 docs/recipes.md。
 
 hub 由智能体按照索引的 INSTALL.md(`bmo install`,https://bmo.ahas.io/install.md)安装到 BMO 机器上。

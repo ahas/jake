@@ -15,8 +15,10 @@ BMO는 자기 네트워크에서 안쪽으로 접속할 수 없는 머신에도 
   - Windows: `powershell -c "irm <다운로드 주소>/install.ps1 | iex"`
 - **데스크톱 앱**: BMO의 웹 콘솔을 별도 앱으로 만든 것으로, 에이전트를 앱 안에 품고 있습니다. 설치할 때 비밀값을
   입력하는 대신 콘솔에서 승인하는 방식으로 합류합니다.
+- **올인원 앱**: BMO 전체를 사용자의 컴퓨터에 설치하고 실행하며, 콘솔을 앱 창에 띄웁니다. Linux에서는 바로,
+  Windows에서는 전용 WSL 2 배포판 안에서 실행됩니다.
 
 구성 요소가 어떻게 맞물리는지는 docs/architecture.md, 터널 프레임은 docs/protocol.md, 설치는 docs/install.md,
-데스크톱 앱은 docs/desktop.md, 허브를 띄우는 방법은 docs/deploy.md, 셸 활용 예시는 docs/recipes.md를 참고하십시오.
+데스크톱 앱은 docs/desktop.md, 올인원 앱은 docs/all-in-one.md, 허브를 띄우는 방법은 docs/deploy.md, 셸 활용 예시는 docs/recipes.md를 참고하십시오.
 
 허브는 에이전트가 인덱스의 INSTALL.md(`bmo install`, https://bmo.ahas.io/install.md)로 BMO 머신에 설치합니다.

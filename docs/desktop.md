@@ -2,8 +2,9 @@
 
 The desktop app is BMO's web console in a window of its own that carries a jake agent inside it. It is
 the second way a person's machine is joined to the hub, beside the one-line install (docs/install.md),
-which stays as it is. This document is the canonical statement of the app; the `desktop` crate answers
-to it.
+which stays as it is. This document is the canonical statement of the app, the remote controller; the
+`desktop` crate built without features answers to it. The same crate built with its `all-in-one` feature is
+the all-in-one app, which installs and runs the whole BMO set on the person's own machine (docs/all-in-one.md).
 
 ## What it is
 
@@ -35,8 +36,9 @@ to it.
   hub's deployment builds and lints in full, every package of it, and that build must need no webview
   system libraries and pay no webview build time. And the root's release build aborts on a panic,
   while the app is built with unwinding so that a panic in the agent ends only the agent's task.
-- **Its checks are run apart:** `bun run check:desktop` lints, formats and tests it, on a machine that
-  has the webview libraries (on Linux, WebKitGTK 4.1 and its development files). `bun run check`
+- **Its checks are run apart:** `bun run check:desktop` lints, formats and tests it, the remote controller's
+  build and the all-in-one's, on a machine that has the webview libraries (on Linux, WebKitGTK 4.1 and its
+  development files). `bun run check`
   stays the whole check of the root workspace and the console.
 
 ## The agent as a library

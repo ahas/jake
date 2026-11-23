@@ -1,0 +1,29 @@
+/* The all-in-one's first run, on the bundled page's own styles. */
+.choice {
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 0;
+}
+
+.choice legend {
+  margin-bottom: 8px;
+}
+
+.choice label {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.lines {
+  font-size: 12px;
+  margin-top: 16px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

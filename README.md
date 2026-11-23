@@ -18,9 +18,11 @@ to.
   - Windows: `powershell -c "irm <download address>/install.ps1 | iex"`
 - **Desktop app** — BMO's web console as an app of its own that carries the agent inside it, joined
   by approving it in the console rather than by a secret typed at install.
+- **All-in-one app** — the whole BMO set installed and run on the person's own computer, its console in
+  the app's window: Linux directly, Windows inside a WSL 2 distribution of its own.
 
 See docs/architecture.md for how the pieces fit, docs/protocol.md for the tunnel frames,
-docs/install.md to install it, docs/desktop.md for the desktop app, docs/deploy.md to bring up the
+docs/install.md to install it, docs/desktop.md for the desktop app, docs/all-in-one.md for the all-in-one app, docs/deploy.md to bring up the
 hub, and docs/recipes.md for shell recipes.
 
 The hub is installed on a BMO machine by an agent with the index's INSTALL.md (`bmo install`,
