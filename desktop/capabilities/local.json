@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "local",
-  "description": "The bundled page in the main window may read the state, try the console again, retry, read the settings for who draws the window's controls, and drive its frameless window's frame; the console's pages are given the bridge the app adds at start instead (docs/desktop.md, 「The window and what the console may call」).",
+  "description": "The bundled page in the main window may read the state, try the console again, retry, read the settings for who draws the window's controls and the server's address, name the server, and drive its frameless window's frame; the console's pages are given the bridge the app adds at start instead (docs/desktop.md, 「The window and what the console may call」).",
   "windows": ["main"],
   "permissions": [
     "allow-status",
     "allow-console",
     "allow-retry",
     "allow-settings",
+    "allow-set-console",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-internal-toggle-maximize",

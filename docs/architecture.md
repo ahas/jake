@@ -567,8 +567,9 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   available. It verifies by reading the agent's own local log for a record that it reached the hub,
   because the installer runs on 하스's machine and cannot reach the hub's loopback control API.
 - The desktop app is the other way a machine is joined, and is built and distributed apart: an
-  installer for the current user alone, with updates through Tauri's updater (docs/desktop.md,
-  「Distribution and updates」). The one-line install stays as it is beside it, and the two never run
+  installer for the current user alone, published as releases of the public repository, which
+  connects to the server its person names and learns that server's hub as it pairs, with updates
+  through Tauri's updater (docs/desktop.md, 「The server」 and 「Distribution and updates」). The one-line install stays as it is beside it, and the two never run
   under one name together (docs/desktop.md, 「One agent per name」).
 - The install is re-runnable over an existing one without duplicating its registrations: on Windows
   each anchor is overwritten in place and a running pair is stopped before its executable is replaced

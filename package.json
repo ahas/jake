@@ -16,6 +16,6 @@
     "check": "bun run check:types && bun run check:rust && bun run test:rust && bun run test",
     "check:desktop": "cd desktop && cargo clippy --all-targets -- -D warnings && cargo fmt --check && cargo test",
     "build": "bun scripts/build.ts",
-    "release:desktop": "systemd-run --user --scope --quiet -p MemoryMax=8G bun scripts/desktop-release.ts --publish /var/www/ahas-ai/bmo/jake/desktop --keys \"$HOME/.local/share/bmo/data/env\""
+    "release:desktop": "systemd-run --user --scope --quiet -p MemoryMax=8G bun scripts/desktop-release.ts --keys \"$HOME/.local/share/bmo/data/env\""
   }
 }

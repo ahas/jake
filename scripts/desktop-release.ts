@@ -5,6 +5,7 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -12,6 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -22,19 +24,29 @@ import {
   type Channel,
   type ConsoleRead,
   DEB,
+  type GhCall,
+  type GitHubPublication,
   type Installer,
   type InstallerFormat,
+  NIGHTLY_TAG,
   NSIS,
   PLATFORM_TIME_ZONE,
+  type Repository,
   assertNewerVersion,
   assertNightlyVersion,
+  assetBaseUrl,
   channelBaseUrl,
+  channelTag,
   dayOf,
+  githubCalls,
   isChannel,
+  latestAssetUrl,
   nightliesPastKept,
   nightlyVersion,
-  releaseBaseUrl,
   releaseReads,
+  repositoryOf,
+  stableTag,
+  versionBaseUrl,
   withChannelRelease,
 } from "./desktop-manifest";
 
@@ -77,13 +89,74 @@ function readAppConfig(): AppConfig {
   return { product: conf.productName, version: conf.version, endpoint };
 }
 
-/** The release folder's console read, or null before the first release. */
-function publishedRead(publishDir: string): ConsoleRead | null {
-  const path = join(publishDir, "release.json");
-  if (!existsSync(path)) {
-    return null;
+/** One `gh` call, its output kept; `gh` is found on the PATH. */
+function gh(args: readonly string[]): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (result.error) {
+    throw new Error(`gh could not be run: ${result.error.message}`);
   }
-  return JSON.parse(readFileSync(path, "utf8")) as ConsoleRead;
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+const notFound = (stderr: string): boolean => /not found/i.test(stderr);
+
+/** The console's read the latest stable release carries, or null before the first release. */
+function publishedRead(repository: Repository): ConsoleRead | null {
+  const latest = gh(["release", "view", "--repo", repository.slug, "--json", "tagName"]);
+  if (latest.status !== 0) {
+    if (notFound(latest.stderr)) {
+      return null;
+    }
+    throw new Error(`gh could not read ${repository.slug}'s latest release: ${latest.stderr.trim()}`);
+  }
+  const { tagName } = JSON.parse(latest.stdout) as { tagName: string };
+  if (!tagName.startsWith(stableTag(""))) {
+    throw new Error(`${repository.slug}'s latest release ${tagName} is not the desktop app's`);
+  }
+  const read = gh(["release", "download", tagName, "--repo", repository.slug, "--pattern", "release.json", "--output", "-"]);
+  if (read.status !== 0) {
+    throw new Error(`the latest release ${tagName} holds no release.json: ${read.stderr.trim()}`);
+  }
+  return JSON.parse(read.stdout) as ConsoleRead;
+}
+
+/** The names of the assets the nightly pre-release holds, or null where it does not stand yet. */
+function nightlyAssets(repository: Repository): string[] | null {
+  const nightly = gh(["release", "view", NIGHTLY_TAG, "--repo", repository.slug, "--json", "assets"]);
+  if (nightly.status !== 0) {
+    if (notFound(nightly.stderr)) {
+      return null;
+    }
+    throw new Error(`gh could not read ${repository.slug}'s ${NIGHTLY_TAG}: ${nightly.stderr.trim()}`);
+  }
+  return (JSON.parse(nightly.stdout) as { assets: { name: string }[] }).assets.map((asset) => asset.name);
+}
+
+/** The commit the checkout stands on, which a new release's tag points at. */
+function headCommit(): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: desktopDir, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git rev-parse failed: ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
+/** A folder the release is also published to, served at its own address: the reads and the installers kept there. */
+interface Mirror {
+  readonly dir: string;
+  readonly base: URL;
+  readonly channelDir: string;
+  readonly published: ConsoleRead | null;
+}
+
+function openMirror(dir: string, served: string, channel: Channel): Mirror {
+  const base = new URL(served.endsWith("/") ? served : `${served}/`);
+  const path = join(dir, "release.json");
+  const published = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as ConsoleRead) : null;
+  if (channel === "nightly" && published === null) {
+    throw new Error(`the mirror ${dir} holds no stable release; a nightly follows a release`);
+  }
+  return { dir, base, channelDir: channel === "stable" ? dir : join(dir, "nightly"), published };
 }
 
 /** The version folders standing in a channel's folder, a partial one left by a failed run passed over. */
@@ -193,38 +266,97 @@ function replaceFile(path: string, content: string): void {
 
 const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 
+/** A `gh` call as a shell would read it, for the dry run's print. */
+const shown = (call: GhCall): string => ["gh", ...call].map((arg) => (/^[\w./:=@-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`)).join(" ");
+
+/** Publishes the version into a mirror folder, its reads naming the mirror's own copies. */
+function publishMirror(mirror: Mirror, channel: Channel, version: string, date: Date, installers: readonly BuiltInstaller[]): void {
+  const channelBase = channelBaseUrl(mirror.base, channel);
+  const { release: read, feed } = releaseReads(version, date, versionBaseUrl(channelBase, version), installers);
+  mkdirSync(mirror.channelDir, { recursive: true });
+  const partialDir = join(mirror.channelDir, `.${version}.partial`);
+  rmSync(partialDir, { recursive: true, force: true });
+  mkdirSync(partialDir, { recursive: true });
+  for (const { path, file } of installers) {
+    copyFileSync(path, join(partialDir, file));
+    copyFileSync(`${path}.sig`, join(partialDir, `${file}.sig`));
+  }
+  writeFileSync(join(partialDir, "release.json"), json(read));
+  renameSync(partialDir, join(mirror.channelDir, version));
+  replaceFile(join(mirror.dir, "release.json"), json(withChannelRelease(mirror.published, channel, read)));
+  replaceFile(join(mirror.channelDir, "latest.json"), json(feed));
+  if (channel === "nightly") {
+    for (const old of nightliesPastKept(versionFolders(mirror.channelDir))) {
+      rmSync(join(mirror.channelDir, old), { recursive: true, force: true });
+      console.log(`removed the mirror's older nightly ${old}`);
+    }
+  }
+  console.log(`mirrored ${version} on ${channel} into ${mirror.channelDir}, served at ${channelBase.href}`);
+}
+
 function main(): void {
   const { values } = parseArgs({
     options: {
-      publish: { type: "string" },
-      keys: { type: "string" },
       channel: { type: "string" },
+      keys: { type: "string" },
+      mirror: { type: "string" },
+      "mirror-url": { type: "string" },
       "dry-run": { type: "boolean", default: false },
     },
     strict: true,
   });
   const channel = values.channel;
-  if (!values.publish || !values.keys || !isChannel(channel)) {
+  if (!values.keys || !isChannel(channel) || (values.mirror === undefined) !== (values["mirror-url"] === undefined)) {
     throw new Error(
-      `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> --publish <release folder> ` +
-        "--keys <secret store folder> [--dry-run]",
+      `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> --keys <secret store folder> ` +
+        "[--mirror <folder> --mirror-url <its served address>] [--dry-run]",
     );
   }
-  const publishDir = values.publish;
 
   const app = readAppConfig();
-  const base = channelBaseUrl(releaseBaseUrl(app.endpoint), channel);
-  const channelDir = channel === "stable" ? publishDir : join(publishDir, "nightly");
-  const published = publishedRead(publishDir);
-  const version = channelVersion(channel, app.version, published, channelDir);
-  const versionDir = join(channelDir, version);
-  if (existsSync(versionDir)) {
-    throw new Error(`${versionDir} already exists; a published version is never written again`);
+  const repository = repositoryOf(app.endpoint);
+  const commit = headCommit();
+  const published = publishedRead(repository);
+  const assetsNow = channel === "nightly" ? nightlyAssets(repository) : null;
+  const mirror =
+    values.mirror === undefined ? null : openMirror(values.mirror, values["mirror-url"] ?? "", channel);
+  const version = channelVersion(channel, app.version, published, mirror === null ? [] : versionFolders(mirror.channelDir));
+  if (mirror !== null && existsSync(join(mirror.channelDir, version))) {
+    throw new Error(`${join(mirror.channelDir, version)} already exists; a published version is never written again`);
   }
   keyFiles(values.keys);
-  console.log(`desktop release ${version} on ${channel} → ${channelDir}, served at ${base.href}`);
+
+  const tag = channelTag(channel, version);
+  const files = BUILDS.flatMap((build) => build.formats.map((kind) => kind.fileName(app.product, version)));
+  const staging = values["dry-run"] ? "<staging>" : mkdtempSync(join(tmpdir(), "jake-desktop-release-"));
+  const publication: GitHubPublication = {
+    repository,
+    channel,
+    version,
+    commit,
+    assets: files.flatMap((file) => [file, `${file}.sig`]).map((file) => join(staging, file)),
+    ownRead: join(staging, "release.json"),
+    feed: join(staging, "latest.json"),
+    consoleRead: join(staging, "console", "release.json"),
+    stableVersion: published?.version ?? null,
+    nightlyAssets: assetsNow,
+  };
+  const calls = githubCalls(publication);
+  const feedUrl = channel === "stable" ? latestAssetUrl(repository, "latest.json") : new URL("latest.json", assetBaseUrl(repository, tag));
+  console.log(`desktop release ${version} on ${channel} → ${repository.slug}, tag ${tag}, from ${commit}`);
+  console.log(`  updater feed   ${feedUrl.href}`);
+  console.log(`  console read   ${latestAssetUrl(repository, "release.json").href}`);
+  for (const file of files) {
+    console.log(`  installer      ${new URL(encodeURIComponent(file), assetBaseUrl(repository, tag)).href}`);
+  }
+  if (mirror !== null) {
+    console.log(`  mirror         ${mirror.channelDir}, served at ${channelBaseUrl(mirror.base, channel).href}`);
+  }
   if (values["dry-run"]) {
-    console.log("dry run: nothing built or written");
+    for (const call of calls) {
+      console.log(`  would run      ${shown(call)}`);
+    }
+    console.log("dry run: nothing built, uploaded or written");
     return;
   }
   const env = signingEnv(values.keys);
@@ -237,25 +369,27 @@ function main(): void {
   const targetDir = cargoTargetDir();
   const installers = BUILDS.flatMap((build) => runBuild(build, release, env, targetDir));
 
-  const { release: read, feed } = releaseReads(version, new Date(), base, installers);
-  mkdirSync(channelDir, { recursive: true });
-  const partialDir = join(channelDir, `.${version}.partial`);
-  rmSync(partialDir, { recursive: true, force: true });
-  mkdirSync(partialDir, { recursive: true });
+  const date = new Date();
+  const { release: read, feed } = releaseReads(version, date, assetBaseUrl(repository, tag), installers);
   for (const { path, file } of installers) {
-    copyFileSync(path, join(partialDir, file));
-    copyFileSync(`${path}.sig`, join(partialDir, `${file}.sig`));
+    copyFileSync(path, join(staging, file));
+    copyFileSync(`${path}.sig`, join(staging, `${file}.sig`));
   }
-  writeFileSync(join(partialDir, "release.json"), json(read));
-  renameSync(partialDir, versionDir);
-  replaceFile(join(publishDir, "release.json"), json(withChannelRelease(published, channel, read)));
-  replaceFile(join(channelDir, "latest.json"), json(feed));
-  if (channel === "nightly") {
-    for (const old of nightliesPastKept(versionFolders(channelDir))) {
-      rmSync(join(channelDir, old), { recursive: true, force: true });
-      console.log(`removed the older nightly ${old}`);
+  writeFileSync(publication.ownRead, json(read));
+  writeFileSync(publication.feed, json(feed));
+  mkdirSync(dirname(publication.consoleRead), { recursive: true });
+  writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
+  for (const call of calls) {
+    console.log(shown(call));
+    const result = spawnSync("gh", call, { stdio: "inherit" });
+    if (result.status !== 0) {
+      throw new Error(`gh failed (exit ${result.status ?? "signal"}); the release stands as far as the calls above it went`);
     }
   }
+  if (mirror !== null) {
+    publishMirror(mirror, channel, version, date, installers);
+  }
+  rmSync(staging, { recursive: true, force: true });
 
   console.log(`\npublished ${read.version} on ${channel} at ${read.date}`);
   for (const { file, size, sha256, url } of read.files) {
@@ -264,12 +398,12 @@ function main(): void {
 }
 
 /** The version a channel's release takes, refused where the updater would not take it over what is published. */
-function channelVersion(channel: Channel, configured: string, published: ConsoleRead | null, channelDir: string): string {
+function channelVersion(channel: Channel, configured: string, published: ConsoleRead | null, mirrored: readonly string[]): string {
   if (channel === "stable") {
     assertNewerVersion(configured, published?.version ?? null);
     return configured;
   }
-  const taken = [...(published?.nightly === undefined ? [] : [published.nightly.version]), ...versionFolders(channelDir)];
+  const taken = [...(published?.nightly === undefined ? [] : [published.nightly.version]), ...mirrored];
   const version = nightlyVersion(configured, dayOf(new Date(), PLATFORM_TIME_ZONE), taken);
   assertNightlyVersion(version, published);
   return version;

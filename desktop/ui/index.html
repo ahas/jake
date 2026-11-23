@@ -35,10 +35,30 @@
         <div id="detail" class="detail"></div>
         <p id="code" class="code" hidden></p>
         <p id="console-detail" class="detail" hidden></p>
-        <div class="actions">
+        <div id="status-actions" class="actions">
           <button id="console" type="button">콘솔 열기</button>
           <button id="retry" type="button" hidden></button>
         </div>
+        <form id="server" class="server" novalidate hidden>
+          <label for="server-address">BMO 서버 주소</label>
+          <input
+            id="server-address"
+            name="address"
+            type="text"
+            inputmode="url"
+            autocomplete="url"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="https://bmo.example.com"
+            aria-describedby="server-hint server-error"
+          />
+          <p id="server-hint" class="hint">https 주소를 입력합니다. http는 localhost에서만 쓸 수 있습니다.</p>
+          <p id="server-error" class="error" role="alert" hidden></p>
+          <div class="actions">
+            <button id="server-cancel" type="button" hidden>취소</button>
+            <button id="server-save" class="primary" type="submit">연결</button>
+          </div>
+        </form>
       </div>
     </main>
   </body>

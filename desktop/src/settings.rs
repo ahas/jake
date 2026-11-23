@@ -11,8 +11,6 @@ use url::Url;
 
 use crate::channel::Channel;
 
-/// The console the deployment serves, which the window opens unless the settings name another.
-pub const DEFAULT_CONSOLE_URL: &str = "https://ai.example.org/bmo/";
 const CONSOLE_KEY: &str = "consoleUrl";
 const CHANNEL_KEY: &str = "updateChannel";
 const FILE_NAME: &str = "settings.json";
@@ -76,38 +74,52 @@ impl Switch {
   }
 }
 
-/// A setting's key over the bridge: a switch's, or the update channel's; any other is refused as the call
-/// is read.
+/// A setting's key over the bridge: a switch's, the update channel's or the server's; any other is refused
+/// as the call is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum Key {
   Switch(Switch),
-  Channel(ChannelKey),
+  Value(ValueKey),
 }
 
-/// The update channel's one key.
+/// A setting that takes a value rather than on or off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ChannelKey {
+pub enum ValueKey {
+  /// The update channel, `stable` or `nightly`.
   UpdateChannel,
+  /// The server the app connects to, the console's address.
+  ConsoleUrl,
 }
 
 /// One change the console asks for, checked before anything is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
   Switch(Switch, bool),
   Channel(Channel),
+  /// The server's address as it was entered, checked in full before it is written.
+  Console(String),
 }
 
 impl Change {
-  /// The change a call names: a switch this platform offers with `on`, or the channel with `value`;
-  /// either given the other's value, or none, is refused.
-  pub fn read(key: Key, on: Option<bool>, value: Option<Channel>) -> Result<Self, String> {
+  /// The change a call names: a switch this platform offers with `on`, the channel with a `value` that
+  /// is a channel, or the server with a `value` that is a text; a key given the other kind's value, or
+  /// none, is refused.
+  pub fn read(key: Key, on: Option<bool>, value: Option<Value>) -> Result<Self, String> {
     match (key, on, value) {
       (Key::Switch(switch), Some(on), None) => Ok(Self::Switch(switch.offered_here()?, on)),
       (Key::Switch(switch), _, _) => Err(format!("{} takes on, true or false, and no value", switch.key())),
-      (Key::Channel(_), None, Some(channel)) => Ok(Self::Channel(channel)),
-      (Key::Channel(_), _, _) => Err(format!("{CHANNEL_KEY} takes a value, stable or nightly, and no on")),
+      (Key::Value(ValueKey::UpdateChannel), None, Some(value)) => serde_json::from_value(value)
+        .map(Self::Channel)
+        .map_err(|_| format!("{CHANNEL_KEY} takes a value, stable or nightly")),
+      (Key::Value(ValueKey::UpdateChannel), _, _) => {
+        Err(format!("{CHANNEL_KEY} takes a value, stable or nightly, and no on"))
+      }
+      (Key::Value(ValueKey::ConsoleUrl), None, Some(Value::String(address))) => Ok(Self::Console(address)),
+      (Key::Value(ValueKey::ConsoleUrl), _, _) => {
+        Err(format!("{CONSOLE_KEY} takes a value, an address, and no on"))
+      }
     }
   }
 }
@@ -134,13 +146,16 @@ impl Switches {
   }
 }
 
-/// The settings as the console draws them: the switches this platform offers, the update channel, why
-/// the file cannot be changed, where it cannot, and who draws the window's controls.
+/// The settings as the console draws them: the switches this platform offers, the update channel, the
+/// server the app connects to, why the file cannot be changed, where it cannot, and who draws the window's
+/// controls.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
   pub switches: Vec<SwitchView>,
   pub update_channel: Channel,
+  /// The console's address the app runs on, none while it has none.
+  pub console_url: Option<String>,
   pub unreadable: Option<String>,
   pub window_controls: WindowControls,
 }
@@ -172,8 +187,9 @@ pub struct SwitchView {
 }
 
 impl Switches {
-  /// The console's view of these switches and the channel, with the file's reason where it cannot be read.
-  pub fn view(&self, channel: Channel, unreadable: Option<&str>) -> SettingsView {
+  /// The console's view of these switches, the channel and the server, with the file's reason where it
+  /// cannot be read.
+  pub fn view(&self, channel: Channel, console: Option<&Url>, unreadable: Option<&str>) -> SettingsView {
     let offered = Switch::ALL.into_iter().filter(|switch| switch.offered());
     SettingsView {
       switches: offered
@@ -183,6 +199,7 @@ impl Switches {
         })
         .collect(),
       update_channel: channel,
+      console_url: console.map(|url| url.as_str().to_owned()),
       unreadable: unreadable.map(str::to_owned),
       window_controls: WindowControls::here(),
     }
@@ -190,28 +207,20 @@ impl Switches {
 }
 
 /// What the app runs with.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Settings {
-  /// The console's address, ending in a slash so its API paths join onto it.
-  pub console: Url,
+  /// The console's address, ending in a slash so its API paths join onto it; none until the person
+  /// names their server, since a build carries no deployment's address.
+  pub console: Option<Url>,
   pub switches: Switches,
   pub channel: Channel,
 }
 
 impl Settings {
-  /// The settings a fresh install runs with.
-  pub fn defaults() -> Self {
-    Self {
-      console: console_url(DEFAULT_CONSOLE_URL).expect("the default console address is well-formed"),
-      switches: Switches::default(),
-      channel: Channel::default(),
-    }
-  }
-
   fn from_document(document: &Map<String, Value>) -> Result<Self, String> {
     let console = match document.get(CONSOLE_KEY) {
-      None => DEFAULT_CONSOLE_URL,
-      Some(Value::String(raw)) => raw,
+      None => None,
+      Some(Value::String(raw)) => Some(console_url(raw)?),
       Some(_) => return Err(format!("{CONSOLE_KEY} is not a string")),
     };
     let mut switches = Switches::default();
@@ -229,7 +238,7 @@ impl Settings {
         .map_err(|_| format!("{CHANNEL_KEY} is neither stable nor nightly"))?,
     };
     Ok(Self {
-      console: console_url(console)?,
+      console,
       switches,
       channel,
     })
@@ -255,7 +264,7 @@ impl SettingsFile {
   pub fn settings(&self) -> Settings {
     match &self.kept {
       Ok((_, settings)) => settings.clone(),
-      Err(_) => Settings::defaults(),
+      Err(_) => Settings::default(),
     }
   }
 
@@ -276,6 +285,14 @@ impl SettingsFile {
   pub fn set_channel(&mut self, channel: Channel) -> Result<(), String> {
     let value = serde_json::to_value(channel).map_err(|error| error.to_string())?;
     self.write_key(CHANNEL_KEY.to_owned(), value)?.channel = channel;
+    Ok(())
+  }
+
+  /// State the server's address and write the whole file at once, keeping every other key as it was read.
+  pub fn set_console(&mut self, console: &Url) -> Result<(), String> {
+    self
+      .write_key(CONSOLE_KEY.to_owned(), Value::String(console.as_str().to_owned()))?
+      .console = Some(console.clone());
     Ok(())
   }
 
@@ -317,15 +334,15 @@ fn write(path: &Path, document: &Map<String, Value>) -> std::io::Result<()> {
   std::fs::rename(&staged, path)
 }
 
-/// A console address as the base its API paths join onto: HTTPS, or plain HTTP on the loopback alone,
-/// with no query or fragment, and ending in a slash.
+/// A console address as the base its API paths join onto: HTTPS, or plain HTTP on this machine alone
+/// (`localhost` or a loopback address), with no query or fragment, and ending in a slash.
 pub fn console_url(raw: &str) -> Result<Url, String> {
   let mut url =
     Url::parse(raw).map_err(|error| format!("the console address {raw} is not a URL: {error}"))?;
-  let loopback = url
-    .host_str()
-    .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
-    .is_some_and(|ip| ip.is_loopback());
+  let loopback = url.host_str().is_some_and(|host| {
+    host.eq_ignore_ascii_case("localhost")
+      || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+  });
   if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
     return Err(format!("the console address {raw} must be an https address"));
   }
@@ -378,18 +395,39 @@ mod tests {
       base.join("api/desktop/pairings").unwrap().as_str(),
       "https://console.example/bmo/api/desktop/pairings"
     );
-    assert_eq!(console_url("http://127.0.0.1:4000").unwrap().as_str(), "http://127.0.0.1:4000/");
-    assert!(console_url("http://console.example/").is_err());
   }
 
   #[test]
-  fn a_missing_file_runs_on_the_defaults() {
+  fn a_console_address_is_https_or_plain_http_on_this_machine_alone() {
+    for local in [
+      "http://127.0.0.1:4000",
+      "http://localhost:3000/bmo",
+      "http://LOCALHOST/",
+      "http://[::1]:8080/",
+    ] {
+      assert!(console_url(local).is_ok(), "{local}");
+    }
+    assert_eq!(console_url("http://localhost:3000/bmo").unwrap().as_str(), "http://localhost:3000/bmo/");
+    for refused in [
+      "http://console.example/",
+      "http://localhost.example/",
+      "http://10.0.0.7/",
+      "ftp://console.example/",
+      "console.example",
+      "",
+    ] {
+      assert!(console_url(refused).is_err(), "{refused}");
+    }
+  }
+
+  #[test]
+  fn a_missing_file_names_no_server_and_runs_on_the_defaults() {
     let dir = Dir::new("settings-missing");
     let file = SettingsFile::open(&dir.0);
 
     assert_eq!(file.unreadable(), None);
     let settings = file.settings();
-    assert_eq!(settings.console.as_str(), DEFAULT_CONSOLE_URL);
+    assert_eq!(settings.console, None);
     let on: Vec<bool> = Switch::ALL.iter().map(|switch| settings.switches.on(*switch)).collect();
     assert_eq!(on, [true, true, false, false, false]);
     assert_eq!(settings.switches.stated(Switch::StartAtSignIn), None);
@@ -404,7 +442,7 @@ mod tests {
     );
     let settings = SettingsFile::open(&dir.0).settings();
 
-    assert_eq!(settings.console.as_str(), "https://console.example/");
+    assert_eq!(settings.console.unwrap().as_str(), "https://console.example/");
     assert!(!settings.switches.on(Switch::CloseToTray));
     assert!(settings.switches.on(Switch::KeepAwake));
     assert!(settings.switches.on(Switch::KeepControlWhileLocked));
@@ -429,14 +467,17 @@ mod tests {
       ("settings-wrong-type", r#"{"consoleUrl":"https://console.example/","closeToTray":"no"}"#),
       ("settings-no-channel", r#"{"updateChannel":"beta"}"#),
       ("settings-channel-type", r#"{"updateChannel":true}"#),
+      ("settings-console-type", r#"{"consoleUrl":7}"#),
+      ("settings-console-http", r#"{"consoleUrl":"http://console.example/"}"#),
     ] {
       let dir = Dir::holding(name, text);
       let mut file = SettingsFile::open(&dir.0);
 
       assert!(file.unreadable().unwrap().contains(FILE_NAME), "{name}");
-      assert_eq!(file.settings().console.as_str(), DEFAULT_CONSOLE_URL, "{name}");
+      assert_eq!(file.settings().console, None, "{name}");
       assert!(file.set(Switch::KeepAwake, true).is_err(), "{name}");
       assert!(file.set_channel(Channel::Nightly).is_err(), "{name}");
+      assert!(file.set_console(&console_url("https://console.example/").unwrap()).is_err(), "{name}");
       assert_eq!(std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap(), text, "{name}");
     }
   }
@@ -482,9 +523,11 @@ mod tests {
     let read = |value: Value| serde_json::from_value::<Key>(value);
 
     assert_eq!(read(Value::from("keepAwake")).unwrap(), Key::Switch(Switch::KeepAwake));
-    assert_eq!(read(Value::from("updateChannel")).unwrap(), Key::Channel(ChannelKey::UpdateChannel));
+    assert_eq!(read(Value::from("updateChannel")).unwrap(), Key::Value(ValueKey::UpdateChannel));
+    assert_eq!(read(Value::from("consoleUrl")).unwrap(), Key::Value(ValueKey::ConsoleUrl));
     for refused in [
-      Value::from("consoleUrl"),
+      Value::from("ConsoleUrl"),
+      Value::from("console_url"),
       Value::from("UpdateChannel"),
       Value::from("update_channel"),
       Value::from(""),
@@ -496,27 +539,39 @@ mod tests {
   }
 
   #[test]
-  fn a_change_takes_on_for_a_switch_and_a_value_for_the_channel() {
-    let channel = Key::Channel(ChannelKey::UpdateChannel);
+  fn a_change_takes_on_for_a_switch_and_a_value_for_the_channel_and_the_server() {
+    let channel = Key::Value(ValueKey::UpdateChannel);
+    let console = Key::Value(ValueKey::ConsoleUrl);
     let switch = Key::Switch(Switch::CloseToTray);
+    let address = || Some(Value::from("https://console.example/"));
 
     assert_eq!(
-      Change::read(channel, None, Some(Channel::Nightly)).unwrap(),
+      Change::read(channel, None, Some(Value::from("nightly"))).unwrap(),
       Change::Channel(Channel::Nightly)
     );
     assert_eq!(
       Change::read(switch, Some(false), None).unwrap(),
       Change::Switch(Switch::CloseToTray, false)
     );
+    assert_eq!(
+      Change::read(console, None, address()).unwrap(),
+      Change::Console("https://console.example/".to_owned())
+    );
     for (key, on, value) in [
       (channel, None, None),
       (channel, Some(true), None),
-      (channel, Some(true), Some(Channel::Stable)),
+      (channel, Some(true), Some(Value::from("stable"))),
+      (channel, None, Some(Value::from("beta"))),
+      (channel, None, address()),
+      (console, None, None),
+      (console, Some(true), None),
+      (console, Some(true), address()),
+      (console, None, Some(Value::from(7))),
       (switch, None, None),
-      (switch, None, Some(Channel::Stable)),
-      (switch, Some(true), Some(Channel::Stable)),
+      (switch, None, Some(Value::from("stable"))),
+      (switch, Some(true), Some(Value::from("stable"))),
     ] {
-      assert!(Change::read(key, on, value).is_err(), "{key:?} {on:?} {value:?}");
+      assert!(Change::read(key, on, value.clone()).is_err(), "{key:?} {on:?} {value:?}");
     }
     let windows_only = Change::read(Key::Switch(Switch::KeepAwake), Some(true), None);
     assert_eq!(windows_only.is_ok(), cfg!(windows));
@@ -558,7 +613,9 @@ mod tests {
   #[test]
   fn the_view_holds_the_offered_switches_and_who_draws_the_controls() {
     let switches = Switches::default().with(Switch::CloseToTray, false);
-    let view = serde_json::to_value(switches.view(Channel::Nightly, Some("unreadable"))).unwrap();
+    let console = console_url("https://console.example/bmo").unwrap();
+    let view =
+      serde_json::to_value(switches.view(Channel::Nightly, Some(&console), Some("unreadable"))).unwrap();
     let offered: Vec<Value> = Switch::ALL
       .into_iter()
       .filter(|switch| switch.offered())
@@ -567,9 +624,28 @@ mod tests {
 
     assert_eq!(view["switches"], Value::Array(offered));
     assert_eq!(view["updateChannel"], "nightly");
+    assert_eq!(view["consoleUrl"], "https://console.example/bmo/");
     assert_eq!(view["unreadable"], "unreadable");
+    let serverless = serde_json::to_value(switches.view(Channel::Stable, None, None)).unwrap();
+    assert_eq!(serverless["consoleUrl"], Value::Null);
     let controls = if cfg!(target_os = "macos") { "inset" } else { "console" };
     assert_eq!(view["windowControls"], controls);
+  }
+
+  #[test]
+  fn the_server_is_written_at_once_keeping_every_other_key_and_read_back() {
+    let dir = Dir::holding("settings-console", r#"{"closeToTray":false,"laterSetting":1}"#);
+    let mut file = SettingsFile::open(&dir.0);
+    file.set_console(&console_url("https://bmo.example/console").unwrap()).unwrap();
+
+    assert_eq!(file.settings().console.unwrap().as_str(), "https://bmo.example/console/");
+    assert_eq!(
+      dir.file(),
+      serde_json::json!({ "closeToTray": false, "laterSetting": 1, "consoleUrl": "https://bmo.example/console/" })
+    );
+    let reopened = SettingsFile::open(&dir.0).settings();
+    assert_eq!(reopened.console.unwrap().as_str(), "https://bmo.example/console/");
+    assert!(!reopened.switches.on(Switch::CloseToTray));
   }
 
   #[test]

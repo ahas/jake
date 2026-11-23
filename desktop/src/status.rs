@@ -18,6 +18,8 @@ pub enum ConsoleState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentState {
   Starting,
+  /// The app names no server yet, so nothing runs until the person names one.
+  NoServer,
   /// No credential store stands on this machine, for the reason given.
   NoStore(String),
   /// A pairing is open under this code, approved on this page of the console.
@@ -99,6 +101,8 @@ pub struct View {
   pub action: Option<Action>,
   pub console_shown: bool,
   pub console_detail: Option<String>,
+  /// Whether the page asks for the server's address, which it does while the app names none.
+  pub asks_server: bool,
 }
 
 impl Status {
@@ -121,6 +125,7 @@ impl Status {
       action,
       console_shown,
       console_detail,
+      asks_server: self.agent == AgentState::NoServer,
     }
   }
 
@@ -150,6 +155,12 @@ impl AgentState {
     let line = |text: &str| vec![text.to_owned()];
     match self {
       Self::Starting => ("에이전트 준비 중".into(), vec![], Tone::Working, None),
+      Self::NoServer => (
+        "BMO 서버 연결".into(),
+        line("이 앱이 연결할 BMO 서버의 주소를 입력합니다."),
+        Tone::Idle,
+        None,
+      ),
       Self::NoStore(_) => (
         "자격 증명을 저장할 수 없습니다".into(),
         vec![
@@ -249,6 +260,16 @@ mod tests {
   }
 
   #[test]
+  fn the_page_asks_for_the_server_while_the_app_names_none() {
+    let serverless = Status {
+      console: ConsoleState::Checking,
+      agent: AgentState::NoServer,
+    };
+    assert!(serverless.view().asks_server);
+    assert!(!Status::default().view().asks_server);
+  }
+
+  #[test]
   fn the_states_that_wait_on_the_person_are_those_the_page_offers_to_go_on_from() {
     let waiting = [
       AgentState::NoStore("none".to_owned()),
@@ -258,6 +279,7 @@ mod tests {
     ];
     let going = [
       AgentState::Starting,
+      AgentState::NoServer,
       AgentState::Link(Link::Attached),
       AgentState::Paused,
       AgentState::HeldOff("agent-a".to_owned()),

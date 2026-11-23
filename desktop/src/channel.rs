@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-/// The nightly feed's address, relative to the stable one.
-const NIGHTLY_FEED: &str = "nightly/latest.json";
+/// The tag of the one pre-release whose assets each nightly replaces (docs/desktop.md, 「Releases」).
+const NIGHTLY_TAG: &str = "desktop-nightly";
 
 /// The channel the app's updates come from (docs/desktop.md, 「The update channel」): the set's releases
 /// alone, or the day's build between them as well. A file that names none runs on stable.
@@ -17,7 +17,8 @@ pub enum Channel {
   Nightly,
 }
 
-/// Each channel's updater feed: the configuration's own endpoint for stable, and the nightly feed beside it.
+/// Each channel's updater feed: the configuration's own endpoint for stable, the feed of the repository's
+/// latest release, and the same file of the nightly pre-release for nightly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feeds {
   stable: Url,
@@ -25,11 +26,19 @@ pub struct Feeds {
 }
 
 impl Feeds {
-  /// The feeds beside the stable one.
+  /// The feeds of the repository whose latest release's asset `stable` names, as
+  /// `https://github.com/<owner>/<repository>/releases/latest/download/<file>`; the nightly feed is that
+  /// file of the nightly pre-release.
   pub fn beside(stable: Url) -> Result<Self, String> {
-    let nightly = stable
-      .join(NIGHTLY_FEED)
-      .map_err(|error| format!("no nightly feed beside {stable}: {error}"))?;
+    let segments: Vec<&str> = stable.path_segments().map(Iterator::collect).unwrap_or_default();
+    let [owner, repository, "releases", "latest", "download", file] = segments[..] else {
+      return Err(format!("the stable feed {stable} is not a latest release's asset"));
+    };
+    if file.is_empty() {
+      return Err(format!("the stable feed {stable} names no file"));
+    }
+    let mut nightly = stable.clone();
+    nightly.set_path(&format!("{owner}/{repository}/releases/download/{NIGHTLY_TAG}/{file}"));
     Ok(Self { stable, nightly })
   }
 
@@ -59,17 +68,31 @@ mod tests {
   use super::*;
 
   #[test]
-  fn the_nightly_feed_stands_beside_the_stable_one() {
-    let feeds = Feeds::from_updater_config(
-      &serde_json::json!({ "endpoints": ["https://ai.example/bmo/desktop/latest.json"] }),
-    )
+  fn the_nightly_feed_is_the_nightly_pre_releases_copy_of_the_stable_one() {
+    let feeds = Feeds::from_updater_config(&serde_json::json!({
+      "endpoints": ["https://github.com/owner/app/releases/latest/download/latest.json"]
+    }))
     .unwrap();
 
-    assert_eq!(feeds.of(Channel::Stable).as_str(), "https://ai.example/bmo/desktop/latest.json");
+    assert_eq!(
+      feeds.of(Channel::Stable).as_str(),
+      "https://github.com/owner/app/releases/latest/download/latest.json"
+    );
     assert_eq!(
       feeds.of(Channel::Nightly).as_str(),
-      "https://ai.example/bmo/desktop/nightly/latest.json"
+      "https://github.com/owner/app/releases/download/desktop-nightly/latest.json"
     );
+  }
+
+  #[test]
+  fn a_stable_feed_that_is_no_latest_releases_asset_names_no_feeds() {
+    for endpoint in [
+      "https://ai.example/bmo/desktop/latest.json",
+      "https://github.com/owner/app/releases/download/desktop-v1.0.0/latest.json",
+      "https://github.com/owner/app/releases/latest/download/",
+    ] {
+      assert!(Feeds::beside(Url::parse(endpoint).unwrap()).is_err(), "{endpoint}");
+    }
   }
 
   #[test]
@@ -89,10 +112,14 @@ mod tests {
     let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
     let feeds = Feeds::from_updater_config(&config["plugins"]["updater"]).unwrap();
 
-    let stable = feeds.of(Channel::Stable).as_str();
-    let folder = stable.strip_suffix("latest.json").expect("the stable feed is a latest.json");
-
-    assert_eq!(feeds.of(Channel::Nightly).as_str(), format!("{folder}nightly/latest.json"));
+    assert_eq!(
+      feeds.of(Channel::Stable).as_str(),
+      "https://github.com/ahas/jake/releases/latest/download/latest.json"
+    );
+    assert_eq!(
+      feeds.of(Channel::Nightly).as_str(),
+      "https://github.com/ahas/jake/releases/download/desktop-nightly/latest.json"
+    );
   }
 
   #[test]

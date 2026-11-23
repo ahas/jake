@@ -29,6 +29,12 @@ pub fn capability(console: &Url, window: &str) -> CapabilityBuilder {
   )
 }
 
+/// The capability for the server the settings name, none while they name none: with no server, no
+/// remote page is given anything.
+pub fn for_server(console: Option<&Url>, window: &str) -> Option<CapabilityBuilder> {
+  console.map(|console| capability(console, window))
+}
+
 /// The address pattern of the console's pages: its scheme, host and port, every path of them. The
 /// webview names the page asking to the app by its origin alone, so a narrower path would match no
 /// page; the window itself keeps to the console's own path (`navigation`).
@@ -87,6 +93,25 @@ mod tests {
     assert!(matches(&local, "http://127.0.0.1:4000/"));
     assert!(!matches(&local, "http://127.0.0.1:4001/"));
     assert!(!matches(&local, "http://localhost:4000/"));
+  }
+
+  #[test]
+  fn the_scope_follows_the_server_the_settings_name() {
+    let dir = std::env::temp_dir().join(format!("jake-desktop-bridge-scope-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.json"), r#"{"consoleUrl":"https://bmo.example:8443/console"}"#)
+      .unwrap();
+    let named = crate::settings::SettingsFile::open(&dir).settings().console;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let named = named.unwrap();
+    assert_eq!(scope(&named), "https://bmo.example:8443/*");
+    let pattern: RemoteUrlPattern = scope(&named).parse().unwrap();
+    assert!(matches(&pattern, "https://bmo.example:8443/console/rooms/7"));
+    assert!(!matches(&pattern, "https://ai.example.org/bmo/"));
+    assert!(!matches(&pattern, "https://bmo.example/console/"));
+    assert!(for_server(Some(&named), "main").is_some());
+    assert!(for_server(None, "main").is_none());
   }
 
   #[test]

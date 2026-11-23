@@ -120,6 +120,31 @@ impl Console {
     }
   }
 
+  /// Whether the address is a BMO console, told by the read every console answers with no sign-in: the
+  /// desktop app's release, a JSON object holding `release`, the release or null. Anything else, an
+  /// answer that is not that read or no answer, is refused with the reason in the person's words.
+  pub async fn answers_as_bmo(&self) -> Result<(), String> {
+    let url = self
+      .base
+      .join("api/desktop/release")
+      .expect("a relative path joins onto the console's address");
+    let response = self
+      .http
+      .get(url)
+      .send()
+      .await
+      .map_err(|error| format!("서버에 연결할 수 없습니다. {error}"))?;
+    let status = response.status();
+    let read = if status.is_success() { response.json::<serde_json::Value>().await.ok() } else { None };
+    match read {
+      Some(serde_json::Value::Object(read)) if read.contains_key("release") => Ok(()),
+      _ => Err(format!(
+        "BMO 서버가 아닙니다. BMO 콘솔의 주소인지 확인해 주세요. (HTTP {})",
+        status.as_u16()
+      )),
+    }
+  }
+
   /// Ask for a pairing, hand it to `shown` once it is open, and poll it until it is approved, refused
   /// or expired.
   pub async fn pair(&self, shown: impl FnOnce(&Pairing)) -> Result<Machine, PairingError> {
@@ -224,6 +249,7 @@ mod tests {
       let routes = Router::new()
         .route("/bmo/api/desktop/pairings", post(open))
         .route("/bmo/api/desktop/pairings/{pairing}", get(poll))
+        .route("/bmo/api/desktop/release", get(|| async { Json(json!({ "release": null })) }))
         .with_state(self);
       let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
       let address = listener.local_addr().unwrap();
@@ -297,6 +323,48 @@ mod tests {
     let mut shown = false;
     assert!(matches!(console.pair(|_| shown = true).await, Err(PairingError::Invalid(_))));
     assert!(!shown);
+  }
+
+  #[tokio::test]
+  async fn a_console_answers_as_bmo_by_its_release_read() {
+    let console = StandIn::approving(&[Status::OK]).serve().await;
+    assert_eq!(console.answers_as_bmo().await, Ok(()));
+  }
+
+  /// A server at `base` on the loopback answering every path with `answer`.
+  async fn other_server(answer: Response) -> Console {
+    let answer = Arc::new(std::sync::Mutex::new(Some(answer)));
+    let routes = Router::new().fallback(move || {
+      let answer = answer.clone();
+      async move { answer.lock().unwrap().take().unwrap_or_else(|| Status::NOT_FOUND.into_response()) }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, routes).await });
+    Console::new(crate::settings::console_url(&format!("http://{address}/bmo/")).unwrap())
+  }
+
+  #[tokio::test]
+  async fn a_server_that_is_no_bmo_console_is_refused_with_the_reason() {
+    for answer in [
+      Status::NOT_FOUND.into_response(),
+      "<html>a web page</html>".into_response(),
+      Json(json!({ "version": "1.0.0" })).into_response(),
+      Json(json!(["release"])).into_response(),
+    ] {
+      let refused = other_server(answer).await.answers_as_bmo().await.unwrap_err();
+      assert!(refused.starts_with("BMO 서버가 아닙니다."), "{refused}");
+    }
+  }
+
+  #[tokio::test]
+  async fn a_server_that_does_not_answer_is_refused_as_unreachable() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let console = Console::new(crate::settings::console_url(&format!("http://{address}/")).unwrap());
+    let refused = console.answers_as_bmo().await.unwrap_err();
+    assert!(refused.starts_with("서버에 연결할 수 없습니다."), "{refused}");
   }
 
   #[test]

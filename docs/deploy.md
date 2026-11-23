@@ -252,7 +252,8 @@ The declaration says the rest:
 
 The one-line install reads `https://ai.example.org/bmo/jake/`, which main-host's own nginx serves from
 `/var/www/ahas-ai/bmo/jake/`. A deployment writes there itself, so the folder belongs to the account
-the testbed runs as, with the web server's group, the same as the desktop releases folder inside it.
+the testbed runs as, with the web server's group, the same as the desktop app's mirror folder inside it
+(docs/desktop.md, 「Making a release」).
 Hand it over once, before the first deployment that publishes:
 
 ```sh

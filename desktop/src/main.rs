@@ -6,9 +6,11 @@ mod bridge;
 mod channel;
 mod controller;
 mod follow;
+mod migration;
 mod navigation;
 mod pairing;
 mod pause;
+mod server;
 mod session;
 mod settings;
 mod sign_in;
@@ -20,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jake_agent::Log;
-use serde_json::json;
+use serde_json::{Value, json};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
@@ -32,6 +34,7 @@ use url::Url;
 use crate::channel::{Channel, Feeds};
 use crate::controller::{Controller, show_console};
 use crate::follow::follow;
+use crate::migration::Migrated;
 use crate::navigation::Navigation;
 use crate::pairing::Console;
 use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch, Switches};
@@ -46,7 +49,8 @@ const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What the commands, the tray and the quit share.
 struct Shared {
-  console: Arc<Console>,
+  /// The console the app runs on, none while the settings name no server.
+  console: Option<Arc<Console>>,
   log: Log,
   status: watch::Sender<Status>,
   retries: mpsc::Sender<()>,
@@ -85,11 +89,20 @@ fn status(shared: State<'_, Shared>) -> View {
   shared.status.borrow().view()
 }
 
-/// Try the console again, and show it if it answers.
+/// Try the console again, and show it if it answers; with no server named there is none to try.
 #[tauri::command]
 async fn console(app: AppHandle, shared: State<'_, Shared>) -> Result<(), ()> {
-  show_console(&shared.console, &MainWindow(app), &shared.status, &shared.log).await;
+  if let Some(console) = &shared.console {
+    show_console(console, &MainWindow(app), &shared.status, &shared.log).await;
+  }
   Ok(())
+}
+
+/// Name the server the app connects to, from the bundled page: true where the app now starts again on
+/// it, false where it is the server the app runs on. A refusal says why in the person's words.
+#[tauri::command]
+async fn set_console(app: AppHandle, address: String) -> Result<bool, String> {
+  change_console(&app, &address).await
 }
 
 /// Pair again, or look again for an installed agent or a credential store.
@@ -104,27 +117,70 @@ fn settings(shared: State<'_, Shared>) -> SettingsView {
   settings_view(&shared)
 }
 
-/// Change one setting, a switch turned on or off or the update channel chosen; it is written and takes
-/// effect at once. The key is read as a switch's or the channel's, `on` as a boolean and `value` as a
-/// channel, or the call is refused; a key given the other's value, or none, and a switch this platform
-/// does not offer are refused before anything is written.
+/// Change one setting, a switch turned on or off, the update channel chosen or the server named; it is
+/// written and takes effect at once, the server by the app starting again on it. The key is read as a
+/// switch's, the channel's or the server's and `on` as a boolean, or the call is refused; a key given
+/// the other kind's value, or none, a value of the wrong kind and a switch this platform does not offer
+/// are refused before anything is written.
 #[tauri::command]
 async fn change_setting(
   app: AppHandle,
   setting: Key,
   on: Option<bool>,
-  value: Option<Channel>,
+  value: Option<Value>,
 ) -> Result<SettingsView, String> {
   match Change::read(setting, on, value)? {
     Change::Switch(switch, on) => change(&app, switch, on)?,
     Change::Channel(channel) => change_channel(&app, channel)?,
+    Change::Console(address) => {
+      change_console(&app, &address).await?;
+    }
   }
   Ok(settings_view(&app.state::<Shared>()))
 }
 
 fn settings_view(shared: &Shared) -> SettingsView {
   let file = shared.settings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-  shared.switches.borrow().view(*shared.channel.borrow(), file.unreadable())
+  // The server the file names, which is the one the app runs on until a change starts it again on another.
+  let console = file.settings().console;
+  shared
+    .switches
+    .borrow()
+    .view(*shared.channel.borrow(), console.as_ref(), file.unreadable())
+}
+
+/// Name the server the app connects to: the address is read, asked whether it is a BMO console and
+/// written; the credential paired with the server before it is forgotten, and the app starts again on
+/// the new one, which pairs anew. The app starts again because the bridge granted to the old server's
+/// origin cannot be withdrawn while it runs. The same address changes nothing; whether the app starts
+/// again is the answer.
+async fn change_console(app: &AppHandle, address: &str) -> Result<bool, String> {
+  let console = server::entered(address)?;
+  let shared = app.state::<Shared>();
+  let before = shared.console.as_ref().map(|before| before.base().clone());
+  if before.as_ref() == Some(&console) {
+    return Ok(false);
+  }
+  Console::new(console.clone()).answers_as_bmo().await?;
+  {
+    let mut file = shared.settings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(reason) = file.unreadable() {
+      return Err(format!("설정 파일을 읽을 수 없어 변경할 수 없습니다. {reason}"));
+    }
+    file.set_console(&console)?;
+  }
+  shared.log.info(
+    "server-changed",
+    json!({ "from": before.as_ref().map(Url::as_str), "to": console.as_str() }),
+  );
+  if let Some(before) = before {
+    let forgotten = tokio::task::spawn_blocking(move || Vault::for_console(&before).forget()).await;
+    if let Ok(Err(vault::NoStore(reason))) = forgotten {
+      shared.log.warn("credential-not-forgotten", json!({ "reason": reason }));
+    }
+  }
+  stop_then(app, |app| app.restart());
+  Ok(true)
 }
 
 /// Write the update channel and hand it to the updates, which ask its feed at once.
@@ -236,8 +292,14 @@ fn on_menu(app: &AppHandle, id: &str) {
       let app = app.clone();
       tauri::async_runtime::spawn(async move {
         let shared = app.state::<Shared>();
-        show_console(&shared.console, &MainWindow(app.clone()), &shared.status, &shared.log).await;
+        if let Some(console) = &shared.console {
+          show_console(console, &MainWindow(app.clone()), &shared.status, &shared.log).await;
+        }
       });
+    }
+    "server" => {
+      reveal(app);
+      controller::Window::open(&MainWindow(app.clone()), &navigation::server_page());
     }
     "autostart" => {
       let shared = app.state::<Shared>();
@@ -265,9 +327,10 @@ fn frameless<'a>(builder: WebviewWindowBuilder<'a, Wry, App>) -> WebviewWindowBu
   builder.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true)
 }
 
-fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Result<()> {
+fn main_window(app: &App, console: Option<&Url>, log: &Log, visible: bool) -> tauri::Result<()> {
+  let console = console.cloned();
   let (navigating, opening) =
-    ((console.clone(), log.clone()), (console.clone(), log.clone(), app.handle().clone()));
+    ((console.clone(), log.clone()), (console, log.clone(), app.handle().clone()));
   let window = frameless(WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into())))
     .title("BMO")
     .inner_size(1280.0, 860.0)
@@ -275,7 +338,7 @@ fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Res
     .visible(visible)
     .on_navigation(move |url| {
       let (console, log) = &navigating;
-      match navigation::decide(url, console) {
+      match navigation::decide(url, console.as_ref()) {
         Navigation::Stay => true,
         Navigation::Browser => {
           open_in_browser(url, log);
@@ -286,7 +349,7 @@ fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Res
     })
     .on_new_window(move |url, _| {
       let (console, log, app) = &opening;
-      match navigation::decide(&url, console) {
+      match navigation::decide(&url, console.as_ref()) {
         Navigation::Stay => {
           if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
             let _ = window.navigate(url);
@@ -321,6 +384,7 @@ fn main_window(app: &App, console: &Url, log: &Log, visible: bool) -> tauri::Res
 /// The tray icon and its menu; the starting-at-sign-in item is handed back to be kept in step.
 fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
   let open = MenuItem::with_id(app, "open", "콘솔 열기", true, None::<&str>)?;
+  let server = MenuItem::with_id(app, "server", "서버 변경", true, None::<&str>)?;
   let autostart =
     CheckMenuItem::with_id(app, "autostart", "로그인할 때 시작", true, starting, None::<&str>)?;
   let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
@@ -328,6 +392,7 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
     app,
     &[
       &open,
+      &server,
       &PredefinedMenuItem::separator(app)?,
       &autostart,
       &PredefinedMenuItem::separator(app)?,
@@ -403,18 +468,33 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
   if let Some(reason) = file.unreadable() {
     log.warn("settings-unreadable", json!({ "reason": reason }));
   }
+  // An installation an earlier build paired keeps the console that build carried (docs/desktop.md, 「The
+  // server」); the store is asked only where the file names no server.
+  match migration::migrate(&mut file, |legacy| matches!(Vault::for_console(legacy).load(), Ok(Some(_)))) {
+    Migrated::Untouched => {}
+    Migrated::Legacy(console) => log.info("server-migrated", json!({ "console": console.as_str() })),
+    Migrated::NotWritten(reason) => log.warn("server-not-migrated", json!({ "reason": reason })),
+  }
   let settings = file.settings();
   let registration = Registration::new(&app.package_info().name);
   let switches = align_sign_in(&registration, &mut file, &log);
-  let console = Arc::new(Console::new(settings.console.clone()));
+  let console = settings.console.clone().map(|base| Arc::new(Console::new(base)));
+  let base = console.as_ref().map(|console| console.base().clone());
   let status = watch::Sender::new(Status::default());
+  if console.is_none() {
+    status.send_modify(|status| status.agent = AgentState::NoServer);
+  }
   let (retries, retried) = mpsc::channel(1);
   let (quit, quitting) = watch::channel(false);
 
-  main_window(app, console.base(), &log, sign_in::opens_window(std::env::args(), &switches))?;
-  // The console's pages get the bridge alone, scoped to the address the app opens (docs/desktop.md,
-  // 「The window and what the console may call」).
-  app.add_capability(bridge::capability(console.base(), MAIN_WINDOW))?;
+  // With no server named the window always opens, since only the person can name one.
+  let visible = console.is_none() || sign_in::opens_window(std::env::args(), &switches);
+  main_window(app, base.as_ref(), &log, visible)?;
+  // The console's pages get the bridge alone, scoped to the address the app opens, and no page any
+  // while it names none (docs/desktop.md, 「The window and what the console may call」).
+  if let Some(capability) = bridge::for_server(base.as_ref(), MAIN_WINDOW) {
+    app.add_capability(capability)?;
+  }
   let autostart = tray(app, switches.on(Switch::StartAtSignIn))?;
 
   let switches = watch::Sender::new(switches);
@@ -454,20 +534,24 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     }
   });
 
-  let window = Arc::new(MainWindow(app.handle().clone()));
-  let course = tauri::async_runtime::spawn(
-    Controller {
-      console: console.clone(),
-      vault: Arc::new(Vault::for_console(console.base())),
-      log: log.clone(),
-      window,
-      status: status.clone(),
-      quit: quitting,
-      paused: pausing,
-      retries: retried,
-    }
-    .run(),
-  );
+  // The course runs on a named server alone; with none, the bundled page asks for one and the app starts
+  // again on it.
+  let course = console.clone().map(|console| {
+    let vault = Arc::new(Vault::for_console(console.base()));
+    tauri::async_runtime::spawn(
+      Controller {
+        console,
+        vault,
+        log: log.clone(),
+        window: Arc::new(MainWindow(app.handle().clone())),
+        status: status.clone(),
+        quit: quitting,
+        paused: pausing,
+        retries: retried,
+      }
+      .run(),
+    )
+  });
   match updates {
     Some(Ok(feeds)) => {
       tauri::async_runtime::spawn(keep_updated(
@@ -486,7 +570,7 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     status,
     retries,
     quit,
-    course: Mutex::new(Some(course)),
+    course: Mutex::new(course),
     settings: Mutex::new(file),
     switches,
     channel,
@@ -509,7 +593,7 @@ fn main() {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }
   let app = builder
-    .invoke_handler(tauri::generate_handler![status, console, retry, settings, change_setting])
+    .invoke_handler(tauri::generate_handler![status, console, retry, settings, change_setting, set_console])
     .setup(move |app| setup(app, updates))
     .build(context)
     .expect("the app's configuration is valid");

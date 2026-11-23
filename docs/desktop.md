@@ -7,20 +7,23 @@ to it.
 
 ## What it is
 
-- **The hosted console in a window.** The main window loads the console the deployment serves, not a
-  copy bundled into the app: the console is rendered on its server and relays through that server, so
-  only the hosted one works. Its address is a setting, `consoleUrl` in the app's `settings.json` under
-  the app's per-user config directory, and defaults to `https://ai.example.org/bmo/`.
+- **The hosted console in a window, of the person's own server.** The main window loads the console a
+  deployment serves, not a copy bundled into the app: the console is rendered on its server and relays
+  through that server, so only the hosted one works. Which deployment is the person's to say: its
+  address is a setting, `consoleUrl` in the app's `settings.json` under the app's per-user config
+  directory, and a build carries no deployment's address, so the app asks for it on its first run
+  (「The server」).
 - **A built-in agent while the app runs.** The app runs the agent crate as a library on its own
   runtime, under the person's own machine credential, so the machine is reachable through the hub for
   as long as the app is open, with the same shells, transfers and streams an installed agent offers.
 - **A window with no frame of its own.** The window carries no native title bar and no menu bar; the
   console draws the window's top bar and its controls itself (「The window's frame」).
-- **A tray icon.** The tray opens the console again, shows the agent's state in its tooltip, turns
-  starting at sign-in on and off, and quits. Quitting stops the agent.
+- **A tray icon.** The tray opens the console again, changes the server, shows the agent's state in its
+  tooltip, turns starting at sign-in on and off, and quits. Quitting stops the agent.
 - **Settings of its own,** set in the console's own settings while the console runs in the app:
   whether control is kept while the PC is locked, what closing the window does, starting at sign-in,
-  starting in the tray, keeping the PC awake, and which channel its updates come from (「Settings」).
+  starting in the tray, keeping the PC awake, which channel its updates come from, and the server it
+  connects to (「Settings」).
 - **One copy at a time.** A second launch brings the running copy's window forward and exits, since two
   copies would hold one name twice.
 
@@ -55,6 +58,54 @@ to it.
 - **A leave asks nothing of the machine.** The library does not uninstall anything; the executable
   runs its departure after the entry answers that the hub sent a leave, and the app forgets its
   credential instead (「Keeping the agent running」).
+
+## The server
+
+The server is the BMO deployment the person uses: its console, the account service behind it and the
+hub its machines attach to. The app reaches all three through the console's address alone.
+
+- **A build carries no deployment's address.** The address is `consoleUrl` in the app's settings, and an
+  app whose settings name none shows the bundled page, which asks for it before anything else runs: no
+  console is shown, no pairing is asked for and no agent starts.
+- **The page asks for 「BMO 서버 주소」** in one field, with what it accepts said under it, and 연결. An
+  address with no scheme is read as `https://`. It must be HTTPS, or plain HTTP on this machine alone,
+  `localhost` or a loopback address; it is kept as the base its paths join onto, ending in a slash, with
+  no query or fragment.
+- **The address is checked to be a BMO console before it is kept.** The app reads the console's
+  `api/desktop/release` under it, the desktop app's release read every console answers with no sign-in
+  (bmo-web's `docs/web.md`, 「Access」), and takes the address only where the answer is a JSON object
+  holding `release`. No answer, or any other answer, is refused with the reason under the field, in the
+  person's words: that the server cannot be reached, or that it is no BMO server, with the status it
+  answered.
+- **A kept address is written into the settings, and the app starts again on it,** so the console, the
+  window's navigation and the console's bridge are all made from the one address as the app starts
+  (「The window and what the console may call」). The new start finds no credential for that server and
+  pairs, as on any first run (「Pairing」).
+- **The server is changed in two places:** 서버 변경 in the tray, which opens the same page with the
+  current address filled and 취소 back to the console, and the server's row in the console's own
+  settings section, through the bridge (「Where the settings are set」). Both go the same way: the
+  address is read and checked as above, written, the credential paired with the server before is
+  forgotten (a credential is per server, 「The credential's storage」), and the app starts again on the new
+  one and pairs. The address the app already runs on changes nothing.
+- **Why it starts again:** the bridge is a capability granted to the console's origin, and the webview
+  runtime grants capabilities but withdraws none, so the old server's grant would stand beside the new
+  one for as long as the app ran. A new start grants the new origin alone.
+
+### Installations of builds that carried an address
+
+- **Builds up to 0.2.1 carry the owner's own deployment's address,** `https://ai.example.org/bmo/`, and open
+  it whatever the settings say. An installation of one is kept on that console: at a start
+  whose settings file names no server, the app asks the credential store whether a credential is kept
+  for that console's origin, and where one is, writes that address into the file, once. Only such a
+  build could have kept that credential without the person naming the server, so a fresh installation
+  is never sent there.
+- **Such an installation that holds no credential,** one never paired or whose machine was removed,
+  is asked for the server like a fresh one.
+- **That address stands in one migration constant in the app,** named as those builds' address, and
+  nowhere else in the app or its configuration.
+- **Those builds update from the owner's own server's feed,** which their configuration names, so they
+  reach a build that asks for its server only through a release that also publishes to that folder
+  (「Making a release」, `--mirror`).
 
 ## Pairing
 
@@ -95,6 +146,10 @@ flowchart TD
 - **The answer is checked before it is kept:** the credential must name the machine the answer names,
   and the hub's URL must be a WebSocket address. An approval page outside the console's origin is
   refused.
+- **The hub's address comes from the server, at pairing.** The approved answer carries the hub's URL,
+  which the account service names from its own setting for the hub its machines attach to (bmo-web's
+  `docs/boundary.md`, 「Desktop pairing」); the app keeps it with the credential and dials it. The build
+  carries no hub address, so each person's app reaches the hub of the server it paired with.
 - **The built-in agent announces itself as the app's.** The version in its hello is always
   `desktop-<version>`, the app's own version behind the prefix `desktop-`. The prefix is a contract:
   the account service reads it to list the machine's kind as desktop, and it is what tells the
@@ -106,8 +161,9 @@ flowchart TD
 ## The credential's storage
 
 - **The credential is kept in the operating system's credential store**, through the `keyring` crate:
-  Windows Credential Manager, the Secret Service on Linux, the Keychain on macOS. One entry, under the
-  service `io.ahas.jake.desktop`, holds the machine's name, its credential and the hub's URL.
+  Windows Credential Manager, the Secret Service on Linux, the Keychain on macOS. One entry per server,
+  under the service `io.ahas.jake.desktop` and the console's origin as its account, holds the machine's
+  name, its credential and the hub's URL. Changing the server forgets the entry of the one before it.
 - **Where no store stands, nothing is kept.** On a Linux machine with no Secret Service, a headless one
   or a WSL distribution without a desktop session, the app says the credential cannot be kept, starts
   no pairing and runs no agent. It never writes the credential to a file.
@@ -127,6 +183,8 @@ flowchart TD
   failed, no credential store, connecting, attached, refused by the hub, hub unreachable, restarting
   after a fault, paused while the PC is locked, held off for an installed agent, given up to another
   agent of its name, and removed by the hub.
+- **With no server named** the tooltip and the local page read as connecting to a BMO server, and the
+  local page asks for its address (「The server」).
 - **A state that waits on the person shows the local page in the main window,** in place of the
   console: a pairing that failed, no credential store, the name given up to another agent, and the
   machine removed by the hub. Each stops the app's course until the person asks it to go on, and the
@@ -153,7 +211,7 @@ end, so the built-in agent gives way, twice over.
 
 ## Settings
 
-The app's settings are kept in its `settings.json`, the file that holds the console's address.
+The app's settings are kept in its `settings.json`.
 
 | Key | Setting | Default | Offered on |
 |---|---|---|---|
@@ -163,25 +221,24 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
 | `startInTray` | Start in the tray, with no window, when started at sign-in | off | every platform |
 | `keepAwake` | Keep the PC from sleeping while the built-in agent serves | off | Windows |
 | `updateChannel` | The channel updates come from, `stable` or `nightly` (「The update channel」) | `stable` | every platform |
-| `consoleUrl` | The console's address | `https://ai.example.org/bmo/` | the file alone |
+| `consoleUrl` | The server the app connects to, its console's address (「The server」) | none: the app asks for it | every platform |
 
 ### Reading and writing
 
 - **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON, a
-  value of the wrong type or a channel that is neither `stable` nor `nightly`, leaves the app on its
-  defaults with the reason in its log, and the console's section then says the file cannot be read and
+  value of the wrong type, a channel that is neither `stable` nor `nightly` or a `consoleUrl` that is no
+  HTTPS address (plain HTTP on this machine aside), leaves the app on its defaults, with no server, and
+  the reason in its log, and the console's section then says the file cannot be read and
   the app changes nothing, since writing it would overwrite the hand edit it could not read.
 - **A byte-order mark at the file's start is read past,** since Windows editors and PowerShell write
   one before UTF-8; the app writes none.
 - **A change is written the moment it is made,** the whole file replaced by a rename, so a reader never
   sees half of it. Every key the app does not know is written back as it was read, so a key a newer
   version wrote survives an older one.
-- **Every setting takes effect at once,** with no restart: each is read again where it acts, at the next
-  close of the window, the next lock of the session, the next sign-in, or at once where it holds
-  something now (starting at sign-in, keeping awake, and the update channel, whose change asks its feed
-  at once).
-- **The console's address is not in the console's section.** Another address is another console, whose pairing
-  the stored credential does not answer to, so it stays a hand edit read at start.
+- **Every setting takes effect at once,** with no restart but the server's: each is read again where it
+  acts, at the next close of the window, the next lock of the session, the next sign-in, or at once where
+  it holds something now (starting at sign-in, keeping awake, and the update channel, whose change asks
+  its feed at once). A change of server starts the app again on the new one (「The server」).
 
 ### Closing the window
 
@@ -236,15 +293,19 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   what the console may call」); in a browser no bridge answers and the section is not there. The
   section's wording and layout are the console's (its `docs/web.md`, 「Settings」).
 - **What the bridge hands the console is what the section draws:** the switches this platform offers,
-  each with its value, the update channel, and why the file cannot be changed, where it cannot. Only the
-  settings the platform offers are handed over, so only those are drawn.
+  each with its value, the update channel, the server's address, and why the file cannot be changed,
+  where it cannot. Only the settings the platform offers are handed over, so only those are drawn.
 - **Each switch and the channel take effect and are written the moment they are changed;** nothing is
   held unsaved. A change that fails leaves the saved value standing and answers with the reason, which
   the console shows beside the setting.
+- **The server is changed as an address entered and sent whole,** checked as the bundled page's is; an
+  address refused leaves the server standing and answers with the reason in the person's words, and one
+  taken answers with the new address before the app starts again on it (「The server」).
 - **The app keeps no settings screen of its own.** Every setting acts while the app runs whether the
   console is shown or not, and each is reached in the console as soon as it loads; starting at sign-in
-  is also the tray's check item, and quitting the tray's. While the console cannot be reached the local
-  page offers to try it again, not the settings.
+  is also the tray's check item, the server the tray's 서버 변경 as well, and quitting the tray's. While
+  the console cannot be reached the local page offers to try it again, not the settings; the tray's
+  서버 변경 still reaches the server.
 
 ## While the PC is locked
 
@@ -339,29 +400,32 @@ processes and its network stay as they were.
 - **Navigation stays under the console's address.** The main window goes only to pages of the
   console's origin whose path lies under `consoleUrl`'s, and to the app's own bundled page; a link to
   anywhere else, another path of the console's own host among them, opens in the person's default
-  browser. Another site served beside the console on its host therefore never stands in the window,
+  browser. With no server named, the bundled page is the one page the window holds. Another site served beside the console on its host therefore never stands in the window,
   which is what keeps the bridge, granted to the console's origin, to the console's own pages.
-- **The bundled page** says when the console cannot be reached, shows the agent's state and the
-  pairing code, and offers to try the console again, pair again, or look again for an installed agent
-  or a credential store.
+- **The bundled page** asks for the server's address (「The server」), says when the console cannot be
+  reached, shows the agent's state and the pairing code, and offers to try the console again, pair
+  again, or look again for an installed agent or a credential store.
 - **The console's pages get a narrow bridge, and nothing else.** The bridge is one capability the app
   adds as it starts, scoped to the main window and to remote pages of the configured `consoleUrl`'s
   origin, its scheme, host and port, so another site, another scheme or port and a page in another
   window are given nothing. The webview names the page asking to the app by its origin alone, so the
   scope cannot be narrower than the origin; the window's navigation keeps it to the console's own
-  path. The scope follows `consoleUrl` as the app read it at start, since the capability is built from
-  it then.
+  path. The scope follows the server the settings name, as the app read them at start: the capability
+  is built from that address then, a change of server starts the app again so the new scope stands
+  alone, and with no server named no remote page is given the bridge at all.
 - **The bridge holds two of the app's commands and the window's own controls:**
   - `settings` reads the settings: each switch the platform offers with its value, `updateChannel`,
-    `stable` or `nightly`, why the file cannot be changed where it cannot, and `windowControls`,
-    `console` where the page draws the window's controls and `inset` where the system's stand inset at
-    the top left.
+    `stable` or `nightly`, `consoleUrl`, the server the settings name (null while they name none), why
+    the file cannot be changed where it cannot, and `windowControls`, `console` where the page draws the
+    window's controls and `inset` where the system's stand inset at the top left.
   - `change_setting` changes one setting by its key, `setting`: a switch's camelCase key with `on`,
-    true or false, or `updateChannel` with `value`, `stable` or `nightly`. The app checks it before
-    anything is written: an unknown key, an `on` that is not true or false and a `value` that is no
-    channel are refused as the call is read; a switch given no `on` or a `value`, the channel given no
-    `value` or an `on`, and a switch this platform does not offer are refused with the reason. It
-    answers with the settings as they now stand.
+    true or false, `updateChannel` with `value`, `stable` or `nightly`, or `consoleUrl` with `value`, the
+    address as entered. The app checks it before anything is written: an unknown key and an `on` that
+    is not true or false are refused as the call is read; a switch given no `on` or a `value`, the
+    channel or the server given no `value` or an `on`, a channel's `value` that is no channel, a server's
+    `value` that is no text, and a switch this platform does not offer are refused with the reason; a
+    server's address is then read and checked as 「The server」 says. It answers with the settings as
+    they now stand, a server taken among them before the app starts again on it.
   - The window's own commands for its frame: minimise, toggle maximise, close, start dragging, the
     double press's maximise, whether it is maximised, and its title. Nothing else of the window, and
     no other plugin's command.
@@ -372,11 +436,15 @@ processes and its network stay as they were.
   answered runs in the app's window; anywhere else nothing answers, and the console draws nothing of
   the app. Nothing is guessed from the user agent.
 - **The bundled page has a capability of its own,** scoped to the main window and the app's own
-  origin: read the status, try the console again, retry, read the settings for `windowControls`, and
-  the same window commands for its frame.
+  origin: read the status, try the console again, retry, read the settings for `windowControls` and
+  `consoleUrl`, name the server (`set_console`, the address as entered, answered with whether the app
+  now starts again on it), and the same window commands for its frame. Naming the server is the bundled
+  page's alone among its commands that the console's bridge holds too, through `change_setting`.
 - **Pairing needs no hand-off from the page,** because the Rust side polls for the approval itself.
 - **The console is checked before it is shown:** the app asks the console's address over HTTPS first,
   and shows the bundled page with the reason when it does not answer.
+- **Pages the console shows of the app's own are opened in the app's frame:** the tray's 서버 변경
+  opens the bundled page with `?server=change`, which shows the server's form with the address filled.
 
 ## Distribution and updates
 
@@ -397,10 +465,13 @@ processes and its network stay as they were.
   with the private key; a release build without the two variables fails rather than ship an unsigned
   update. The app checks the feed and installs an update in Windows's passive mode, showing its progress
   and asking nothing. An app built from a configuration with no updater entry checks for none.
-- **The feeds are served beside the agent's builds,** the stable one at
-  `https://ai.example.org/bmo/jake/desktop/latest.json` and the nightly one at
-  `https://ai.example.org/bmo/jake/desktop/nightly/latest.json`, with the installers and their signatures
-  they name (「Releases」).
+- **The feeds are assets of the public repository's GitHub releases,** with the installers they name
+  (「Releases」): the stable one is the latest release's `latest.json`,
+  `https://github.com/ahas/jake/releases/latest/download/latest.json`, the configuration's updater
+  endpoint, and the nightly one is the nightly pre-release's,
+  `https://github.com/ahas/jake/releases/download/desktop-nightly/latest.json`, which the app makes from
+  the stable one by its tag. The feeds and the installers are the same for every person; only the
+  server each app connects to differs.
 - **A build** runs `cargo tauri build` inside the `desktop` folder. The NSIS installer is built on
   main-host as well as on a Windows machine: cross-compiled for `x86_64-pc-windows-gnu` with
   `cargo-zigbuild` as the CLI's runner and `--bundles nsis`, which needs `nsis` and the mingw-w64
@@ -410,7 +481,8 @@ processes and its network stay as they were.
 ## Releases
 
 A release is one version of the app, built for every platform at once, signed for the updater and
-published where both the updater and the console read it. It goes out on one of two channels, as bmo-chat's
+published as a GitHub release of the public repository `ahas/jake`, where every installed app's updater
+and every reader of the release read it. It goes out on one of two channels, as bmo-chat's
 `docs/conventions.md` 「Versions」 states the set's versions:
 
 - **`stable`** carries the set's releases, the versions the owner declares, and is what the app takes
@@ -422,23 +494,21 @@ published where both the updater and the console read it. It goes out on one of 
 
 ### Where releases are kept
 
-- **The release folder is the `desktop` folder of the agent's served layout:** on main-host the
-  directory `/var/www/ahas-ai/bmo/jake/desktop/`, which the `ai.example.org` site serves statically as
-  `https://ai.example.org/bmo/jake/desktop/`. The folder belongs to the user that runs releases, so a
-  release writes it without root; serving the path is host infrastructure BMO owns.
-- **Each stable version has a folder of its own at the top,** named by the bare version (`1.0.0`),
-  and each nightly one under `nightly/` (`nightly/1.1.0-nightly.20261124/`). A version's folder holds
-  the Windows installer, the AppImage and the deb, each beside its updater signature, and that
-  version's release read. A published version is never written again: the updater installs only a
-  version higher than the running one, so a fix ships as a new version.
-- **Only the seven newest nightlies are kept.** Once a nightly is published, the folders of older
-  nightlies past the seventh are removed, since a feed only ever names the newest. A stable version's
-  folder is never removed.
-- **Each channel has its updater feed,** in the form Tauri's updater reads, naming that channel's
-  newest version: `latest.json` at the folder's top for `stable`, where installed apps have always
-  read it, and `nightly/latest.json` for `nightly`. Beside them `release.json` at the top is the read the
-  console uses, holding both channels. Each is replaced whole, by a rename, and only once the version's
-  folder is complete, so none ever names a file that is not yet there.
+- **Each stable version is a release of its own,** tagged `desktop-v<version>` (`desktop-v1.0.0`) at the
+  commit it was built from and marked the repository's latest release. Its assets are the Windows
+  installer, the AppImage and the deb, each beside its updater signature (`<file>.sig`), the stable feed
+  `latest.json` and the read `release.json`. A published version is never written again but for its
+  `release.json` (below): the updater installs only a version higher than the running one, so a fix
+  ships as a new version.
+- **Every nightly is the one pre-release tagged `desktop-nightly`,** whose assets each nightly replaces:
+  its installers and their signatures, the nightly feed `latest.json` and the nightly's own read
+  `release.json`, holding the nightly alone. Its title names the version and its notes the commit it was
+  built from; the tag stays where the first nightly put it.
+- **The repository's latest release is always the desktop app's newest stable one,** since a pre-release
+  is never the latest and a stable release is published as the latest. The repository makes no other
+  release that is not a pre-release, so `releases/latest` names the desktop app's.
+- **Each channel has its updater feed,** in the form Tauri's updater reads, naming that channel's newest
+  version: the latest release's `latest.json` for `stable` and the nightly pre-release's for `nightly`.
 - **A feed names every installer the updater may take,** each with its signature and its address:
   the NSIS installer under `windows-x86_64-nsis` and `windows-x86_64`, the AppImage under
   `linux-x86_64-appimage` and `linux-x86_64`, and the deb under `linux-x86_64-deb`. An app installed
@@ -449,21 +519,24 @@ published where both the updater and the console read it. It goes out on one of 
 The console builds its download page against this contract alone, and the project's site its download
 section.
 
-- **It reads `https://ai.example.org/bmo/jake/desktop/release.json`,** a JSON object whose top level always
-  describes the current stable version. The same top level is kept in that version's own folder, at
-  `https://ai.example.org/bmo/jake/desktop/<version>/release.json`, and never changes there.
+- **It reads `https://github.com/ahas/jake/releases/latest/download/release.json`,** the latest stable
+  release's `release.json`: a JSON object whose top level always describes the current stable version.
+  GitHub answers the address with a redirect to the file, and sends no CORS header, so it is read by a
+  server or a build, never by a page in a browser.
 - **The object holds:** `version`, the bare semantic version; `date`, when it was published, as an
   RFC 3339 UTC timestamp; `files`, one entry per installer; and `nightly`, the newest nightly as an
   object of the same `version`, `date` and `files`, absent until the first nightly is published. A
-  nightly's own folder keeps its object at `nightly/<version>/release.json`.
+  nightly replaces the `nightly` of the latest stable release's read, so that read always names both
+  channels' newest; the nightly pre-release's own `release.json` holds its object alone.
 - **Each entry of `files` holds:** `platform`, `windows` or `linux`; `arch`, `x86_64`; `format`,
   `nsis`, `appimage` or `deb`; `file`, the file's name; `size`, its length in bytes; `sha256`, its
   SHA-256 digest in lowercase hex; and `url`, the absolute address it downloads from.
-- **The download route is each entry's `url`,** a file in the version's folder served as it is, so
-  a link to it downloads the installer and a stable version's link never changes once published.
+- **The download route is each entry's `url`,** the asset of its version's release,
+  `https://github.com/ahas/jake/releases/download/<tag>/<file>`, so a link to it downloads the installer
+  and a stable version's link never changes once published.
 - **No release yet reads as not found:** until the first release is published the address answers
-  404, and the console shows that the app is not yet available. A nightly is published only after a
-  stable release, so the top level is always there once the read is.
+  404, and the console and the site show that the app is not yet available. A nightly is published only
+  after a stable release, so the top level is always there once the read is.
 - **A field may be added and none is removed or renamed,** so a console built against this contract
   reads every later release.
 
@@ -471,11 +544,18 @@ section.
 
 - **A release is one command run on main-host from the repository's root, naming its channel:**
   `bun run release:desktop --channel stable` or `bun run release:desktop --channel nightly`. It runs
-  `scripts/desktop-release.ts` under a memory cap of its own, and that builds the app for Windows and
-  then for Linux, one after the other, finds the installers and their signatures, and publishes them.
-  A channel that is not named, or neither of the two, stops it before anything else.
-- **`--dry-run` builds and writes nothing:** it reads the published reads, works out the version and
-  checks it, and prints the channel, the version and where it would be published.
+  `scripts/desktop-release.ts` under a memory cap of its own, and that reads what is published, builds
+  the app for Windows and then for Linux, one after the other, finds the installers and their
+  signatures, and publishes them with the GitHub CLI, `gh`, signed in as an account that may write the
+  repository's releases. A channel that is not named, or neither of the two, stops it before anything
+  else.
+- **The repository is the one the configuration's updater endpoint names,** so no address is stated
+  twice; an endpoint that is not a GitHub repository's latest release feed stops the release.
+- **What is published is read with `gh` first:** the latest release's `release.json`, and for a nightly
+  the nightly pre-release's assets. A latest release that is not the desktop app's stops the release.
+- **`--dry-run` builds, uploads and writes nothing:** it reads what is published, works out the version
+  and checks it, and prints the channel, the version, the tag, the feed's, the read's and each
+  installer's address, and every `gh` call it would make.
 - **The stable version is the one in the app's Tauri configuration,** the set's release version,
   moved only in the commit that releases the set. A version not higher than the stable one already
   published is refused before anything is built.
@@ -484,17 +564,28 @@ section.
   command line; nothing is written into the repository, and no commit carries it. A nightly is refused
   before anything is built where no stable release is published yet, and where its version is not higher
   than both the published nightly and the published stable, which is a checkout behind the release.
-- **The address it is published under** is the folder holding the configuration's updater endpoint,
-  and the nightly's the `nightly/` folder in it, so no address is stated twice.
 - **The update key is read from the deployment's secret store by its path:** the env folder holds
   `jake-desktop-updater.key` and `jake-desktop-updater.password`, and the release hands the key to the
   build as its path and the password through its variable, printing neither. Where either file is
   missing the release stops before building.
 - **Every installer and every signature must come from this run:** a file the build did not write
   afresh stops the release, so a stale build is never published under a new version.
-- **A release rewrites only its own channel:** a stable release replaces `latest.json` and the top
-  level of `release.json`, keeping its `nightly`; a nightly replaces `nightly/latest.json` and the
-  `nightly` of `release.json`, keeping the top level.
+- **A stable release is published whole at once:** it is made a draft at the checkout's commit holding
+  its installers, their signatures, its feed and the read with the published `nightly` kept, and then
+  published as the latest, so its feed never names a file that is not yet there. The commit must be on
+  the repository's GitHub copy.
+- **A nightly replaces only its own channel:** the nightly pre-release is made at the first nightly and
+  its assets replaced at every later one, the installers, signatures and its own read first, the feed
+  after them and the files the feed no longer names last; then the latest stable release's
+  `release.json` is replaced with the new `nightly` and its top level kept.
+- **`--mirror <folder> --mirror-url <address>` also publishes into a served folder,** off unless both
+  are given: the folder keeps the layout the owner's own server serves, `release.json` and `latest.json` at its top, each stable version in a folder of its own named by
+  the bare version, each nightly under `nightly/` with its feed at `nightly/latest.json`, the seven newest
+  nightlies kept, each version's installers and signatures copied in and its reads naming them at the
+  folder's served address. A version folder already there stops the release before building. It is
+  what an installation of a build up to 0.2.1, whose updater reads the owner's server's feed, updates
+  from: on main-host `--mirror /var/www/ahas-ai/bmo/jake/desktop --mirror-url
+  https://ai.example.org/bmo/jake/desktop/`.
 - **The release ends by printing** the channel, the version and, for each installer, its name, its
   size, its SHA-256 and its address.
 - **The Authenticode signature is not part of it:** the installer stays unsigned for Windows until
