@@ -73,7 +73,7 @@ file = "env/jake-download-address"
 # The hub's one file, outside the git tree; the hub listens for agents on every interface and for control on its
 # loopback.
 [[settings]]
-file = "~/.local/share/jake/hub.env"
+file = "prefix:jake/hub.env"
 text = """
 JAKE_HUB_PORT={{port.jake.agents}}
 JAKE_SECRET={{token.jake.secret}}
@@ -90,9 +90,9 @@ id = "command-link"
 run = '''
 set -eu
 mkdir -p "$HOME/.local/bin"
-ln -sfn "$HOME/.local/share/jake-hub/deploy/bin/jake-hub" "$HOME/.local/bin/jake-hub"
+ln -sfn "$BMO_INSTALL_PREFIX/jake-hub/deploy/bin/jake-hub" "$HOME/.local/bin/jake-hub"
 '''
-done = 'test "$(readlink "$HOME/.local/bin/jake-hub")" = "$HOME/.local/share/jake-hub/deploy/bin/jake-hub"'
+done = 'test "$(readlink "$HOME/.local/bin/jake-hub")" = "$BMO_INSTALL_PREFIX/jake-hub/deploy/bin/jake-hub"'
 
 # The public road whole: the agent server answers 401 to a request without the secret through the public name.
 [[verify]]
