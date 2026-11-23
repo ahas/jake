@@ -157,12 +157,15 @@ impl Words<'_> {
   }
 }
 
-/// The variables `supervise env` prints, `NAME=value` a line.
+/// The variables `supervise env` prints, `NAME=value` a line, every one of them: which lines put a command under
+/// the supervisor is the supervisor's to say (bmo-testbed's docs/supervise.md, 「The words」).
 pub fn env_lines(output: &str) -> Vec<(String, String)> {
   output
     .lines()
     .filter_map(|line| line.split_once('='))
-    .filter(|(name, _)| matches!(*name, "PATH" | "BMO_SUPERVISOR"))
+    .filter(|(name, _)| {
+      !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
     .map(|(name, value)| (name.to_owned(), value.to_owned()))
     .collect()
 }
@@ -223,8 +226,12 @@ mod tests {
 
   #[test]
   fn the_supervisors_lines_are_read_into_the_installers_environment() {
-    let read = env_lines("PATH=/d/supervise/bin:/usr/bin\nBMO_SUPERVISOR=/d/supervise/control.sock\n");
+    let read = env_lines(
+      "PATH=/d/supervise/bin:/usr/bin\nBMO_SUPERVISOR=/d/supervise/control.sock\nXDG_RUNTIME_DIR=/d/supervise/run\nnot a line\n",
+    );
     assert_eq!(read[1], ("BMO_SUPERVISOR".to_owned(), "/d/supervise/control.sock".to_owned()));
+    assert_eq!(read[2], ("XDG_RUNTIME_DIR".to_owned(), "/d/supervise/run".to_owned()));
+    assert_eq!(read.len(), 3);
     let layout = Layout {
       home: "/home/someone".into(),
     };
