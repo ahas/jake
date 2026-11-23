@@ -79,11 +79,55 @@ export interface ReleaseFile {
   url: string;
 }
 
-/** The console's read of one release. */
+/** The console's read of one release: the remote controller's installers under `files`, the all-in-one's under
+ * `allInOne`, which a reader of the remote controller alone passes over. */
 export interface ReleaseRead {
   version: string;
   date: string;
   files: ReleaseFile[];
+  allInOne?: { files: ReleaseFile[] };
+}
+
+/** One of the desktop apps a release carries, every one built from the same commit at the same version
+ * (docs/desktop.md, 「Releases」; docs/all-in-one.md, 「Updates」). */
+export interface DesktopApp {
+  /** How the release's lines name it. */
+  readonly name: string;
+  /** The Tauri configuration laid over the crate's own, a file of the `desktop` folder, or null for none. */
+  readonly overlay: string | null;
+  /** The crate's features it is built with. */
+  readonly features: readonly string[];
+  /** Its installers' entries put into the console's read of one release. */
+  place(read: ReleaseRead, files: ReleaseFile[]): void;
+}
+
+export const REMOTE_CONTROLLER: DesktopApp = {
+  name: "remote controller",
+  overlay: null,
+  features: [],
+  place: (read, files) => {
+    read.files = files;
+  },
+};
+
+export const ALL_IN_ONE: DesktopApp = {
+  name: "all-in-one",
+  overlay: "tauri.all-in-one.conf.json",
+  features: ["all-in-one"],
+  place: (read, files) => {
+    read.allInOne = { files };
+  },
+};
+
+/** Every app a release builds, the remote controller first. */
+export const APPS: readonly DesktopApp[] = [REMOTE_CONTROLLER, ALL_IN_ONE];
+
+/**
+ * The name an installer is published under: Tauri names it after the product, and GitHub rewrites the spaces of
+ * an asset's name, so a product's spaces are dashes in what is uploaded and in every read that names it.
+ */
+export function assetName(built: string): string {
+  return built.replaceAll(" ", "-");
 }
 
 /** The console's read of the release folder: the stable release at its top level, and the newest nightly. */
@@ -116,17 +160,37 @@ export interface Repository {
   readonly slug: string;
 }
 
+/** A feed the updater reads: the repository whose releases carry it, and its file's name. */
+export interface Feed {
+  readonly repository: Repository;
+  readonly file: string;
+}
+
 /**
- * The repository the updater's endpoint names: the stable feed is the latest release's `latest.json`,
- * `https://github.com/<owner>/<repository>/releases/latest/download/latest.json`, so no address is stated twice.
+ * The feed an app's updater endpoint names: the stable feed is an asset of the latest release,
+ * `https://github.com/<owner>/<repository>/releases/latest/download/<file>`, the file `latest.json` or
+ * `<app>-latest.json`, so no address is stated twice.
  */
-export function repositoryOf(endpoint: string): Repository {
+export function feedOf(endpoint: string): Feed {
   const url = new URL(endpoint);
-  const match = /^\/([^/]+)\/([^/]+)\/releases\/latest\/download\/latest\.json$/.exec(url.pathname);
+  const match = /^\/([^/]+)\/([^/]+)\/releases\/latest\/download\/((?:[a-z0-9-]+-)?latest\.json)$/.exec(url.pathname);
   if (url.origin !== "https://github.com" || match === null) {
     throw new Error(`the updater endpoint ${endpoint} is not a GitHub repository's latest release feed`);
   }
-  return { slug: `${match[1]}/${match[2]}` };
+  return { repository: { slug: `${match[1]}/${match[2]}` }, file: match[3] ?? "latest.json" };
+}
+
+/** The repository every app's feed names; apps whose feeds name different repositories, or one file, are refused. */
+export function repositoryOf(feeds: readonly Feed[]): Repository {
+  const slugs = new Set(feeds.map((feed) => feed.repository.slug));
+  const [slug] = slugs;
+  if (slug === undefined || slugs.size !== 1) {
+    throw new Error(`the apps' updater feeds name ${slugs.size === 0 ? "no repository" : "different repositories"}`);
+  }
+  if (new Set(feeds.map((feed) => feed.file)).size !== feeds.length) {
+    throw new Error("two apps' updater feeds name one file");
+  }
+  return { slug };
 }
 
 /** The address a release's assets download from: the folder of its tag's assets. */
@@ -219,37 +283,49 @@ export function nightliesPastKept(folders: readonly string[], kept: number = NIG
     .slice(kept);
 }
 
-/** The two reads of one release: the console's and the updater's, both naming each installer under `assetBase`. */
+/** One app's installers in a release, with the file its feed is published as. */
+export interface AppInstallers {
+  readonly app: DesktopApp;
+  readonly feedFile: string;
+  readonly installers: readonly Installer[];
+}
+
+/** The reads of one release: the console's, naming every app's installers, and each app's updater feed, every one
+ * naming its installers under `assetBase`. */
 export function releaseReads(
   version: string,
   date: Date,
   assetBase: URL,
-  installers: readonly Installer[],
-): { release: ReleaseRead; feed: UpdaterFeed } {
+  apps: readonly AppInstallers[],
+): { release: ReleaseRead; feeds: { file: string; feed: UpdaterFeed }[] } {
   const urlOf = (file: string): string => new URL(encodeURIComponent(file), assetBase).href;
   const stamp = date.toISOString();
-
-  const files = installers.map(({ kind, file, size, sha256 }) => ({
-    platform: kind.platform,
-    arch: kind.arch,
-    format: kind.format,
-    file,
-    size,
-    sha256,
-    url: urlOf(file),
-  }));
-
-  const platforms: UpdaterFeed["platforms"] = {};
-  for (const { kind, file, signature } of installers) {
-    for (const key of kind.feedKeys) {
-      if (key in platforms) {
-        throw new Error(`two installers answer the feed key ${key}`);
+  const release: ReleaseRead = { version, date: stamp, files: [] };
+  const feeds = apps.map(({ app, feedFile, installers }) => {
+    app.place(
+      release,
+      installers.map(({ kind, file, size, sha256 }) => ({
+        platform: kind.platform,
+        arch: kind.arch,
+        format: kind.format,
+        file,
+        size,
+        sha256,
+        url: urlOf(file),
+      })),
+    );
+    const platforms: UpdaterFeed["platforms"] = {};
+    for (const { kind, file, signature } of installers) {
+      for (const key of kind.feedKeys) {
+        if (key in platforms) {
+          throw new Error(`two installers of the ${app.name} answer the feed key ${key}`);
+        }
+        platforms[key] = { signature, url: urlOf(file) };
       }
-      platforms[key] = { signature, url: urlOf(file) };
     }
-  }
-
-  return { release: { version, date: stamp, files }, feed: { version, pub_date: stamp, platforms } };
+    return { file: feedFile, feed: { version, pub_date: stamp, platforms } };
+  });
+  return { release, feeds };
 }
 
 /** One `gh` call of a publication, its arguments after `gh`. */
@@ -266,8 +342,8 @@ export interface GitHubPublication {
   readonly assets: readonly string[];
   /** The version's own read, `release.json`, which the nightly pre-release carries for its nightly. */
   readonly ownRead: string;
-  /** The channel's updater feed, `latest.json`. */
-  readonly feed: string;
+  /** The channel's updater feeds, every app's: `latest.json` and `all-in-one-latest.json`. */
+  readonly feeds: readonly string[];
   /** The console's read of both channels, `release.json`, which the latest stable release carries. */
   readonly consoleRead: string;
   /** For a nightly, the latest stable version, whose release carries the console's read. */
@@ -280,18 +356,19 @@ const baseName = (path: string): string => path.slice(path.lastIndexOf("/") + 1)
 
 /**
  * The `gh` calls that publish a release (docs/desktop.md, 「Making a release」). A stable release is made a draft
- * holding its installers, its feed and the console's read, and then published as the latest at once, so its feed
- * never names a file that is not yet there. A nightly replaces the assets of the one pre-release: the installers and the read first, the feed after
- * them, and the files the feed no longer names last; the latest stable release's console read is then replaced.
+ * holding its installers, its feeds and the console's read, and then published as the latest at once, so a feed
+ * never names a file that is not yet there. A nightly replaces the assets of the one pre-release: the installers and
+ * the read first, the feeds after them, and the files no feed names any more last; the latest stable release's
+ * console read is then replaced.
  */
 export function githubCalls(publication: GitHubPublication): GhCall[] {
-  const { repository, channel, version, commit, feed, consoleRead } = publication;
+  const { repository, channel, version, commit, feeds, consoleRead } = publication;
   const repo = ["--repo", repository.slug];
   const notes = ["--notes", `BMO desktop app ${version}, built from ${commit}.`];
   if (channel === "stable") {
     const tag = stableTag(version);
     return [
-      ["release", "create", tag, ...repo, "--target", commit, "--title", `BMO desktop ${version}`, ...notes, "--draft", ...publication.assets, feed, consoleRead],
+      ["release", "create", tag, ...repo, "--target", commit, "--title", `BMO desktop ${version}`, ...notes, "--draft", ...publication.assets, ...feeds, consoleRead],
       ["release", "edit", tag, ...repo, "--draft=false", "--latest"],
     ];
   }
@@ -302,12 +379,12 @@ export function githubCalls(publication: GitHubPublication): GhCall[] {
   const assets = [...publication.assets, publication.ownRead];
   const calls: GhCall[] =
     publication.nightlyAssets === null
-      ? [["release", "create", NIGHTLY_TAG, ...repo, "--target", commit, "--prerelease", ...title, ...notes, ...assets, feed]]
+      ? [["release", "create", NIGHTLY_TAG, ...repo, "--target", commit, "--prerelease", ...title, ...notes, ...assets, ...feeds]]
       : [
           ["release", "upload", NIGHTLY_TAG, ...repo, "--clobber", ...assets],
-          ["release", "upload", NIGHTLY_TAG, ...repo, "--clobber", feed],
+          ["release", "upload", NIGHTLY_TAG, ...repo, "--clobber", ...feeds],
           ...publication.nightlyAssets
-            .filter((name) => ![...assets, feed].map(baseName).includes(name))
+            .filter((name) => ![...assets, ...feeds].map(baseName).includes(name))
             .map((name): GhCall => ["release", "delete-asset", NIGHTLY_TAG, name, ...repo, "--yes"]),
           ["release", "edit", NIGHTLY_TAG, ...repo, "--prerelease", ...title, ...notes],
         ];

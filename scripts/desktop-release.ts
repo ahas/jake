@@ -1,4 +1,5 @@
-// Builds the desktop app's signed installers and publishes them as a release (docs/desktop.md, 「Releases」).
+// Builds the desktop apps' signed installers, the remote controller's and the all-in-one's, and publishes them as one
+// release (docs/desktop.md, 「Releases」).
 
 import { spawnSync } from "node:child_process";
 import {
@@ -20,10 +21,14 @@ import { parseArgs } from "node:util";
 
 import {
   APPIMAGE,
+  APPS,
+  type AppInstallers,
   CHANNELS,
   type Channel,
   type ConsoleRead,
   DEB,
+  type DesktopApp,
+  type Feed,
   type GhCall,
   type GitHubPublication,
   type Installer,
@@ -35,9 +40,11 @@ import {
   assertNewerVersion,
   assertNightlyVersion,
   assetBaseUrl,
+  assetName,
   channelBaseUrl,
   channelTag,
   dayOf,
+  feedOf,
   githubCalls,
   isChannel,
   latestAssetUrl,
@@ -69,24 +76,45 @@ const BUILDS: readonly Build[] = [
   { name: "Linux", cross: null, formats: [APPIMAGE, DEB] },
 ];
 
-/** What the release reads of the app's Tauri configuration. */
+/** What the release reads of an app's Tauri configuration: the crate's own with the app's overlay laid over it. */
 interface AppConfig {
-  product: string;
-  version: string;
-  endpoint: string;
+  readonly app: DesktopApp;
+  readonly product: string;
+  readonly version: string;
+  readonly feed: Feed;
 }
 
-function readAppConfig(): AppConfig {
-  const conf = JSON.parse(readFileSync(join(desktopDir, "tauri.conf.json"), "utf8")) as {
-    productName?: string;
-    version?: string;
-    plugins?: { updater?: { endpoints?: string[] } };
-  };
-  const endpoint = conf.plugins?.updater?.endpoints?.[0];
-  if (!conf.productName || !conf.version || !endpoint) {
-    throw new Error("tauri.conf.json names no product, version or updater endpoint");
+interface TauriConf {
+  productName?: string;
+  version?: string;
+  plugins?: { updater?: { endpoints?: string[] } };
+}
+
+function readConf(file: string): TauriConf {
+  return JSON.parse(readFileSync(join(desktopDir, file), "utf8")) as TauriConf;
+}
+
+function readAppConfig(app: DesktopApp): AppConfig {
+  const own = readConf("tauri.conf.json");
+  const overlay = app.overlay === null ? {} : readConf(app.overlay);
+  const product = overlay.productName ?? own.productName;
+  const version = overlay.version ?? own.version;
+  const endpoint = (overlay.plugins?.updater?.endpoints ?? own.plugins?.updater?.endpoints)?.[0];
+  if (!product || !version || !endpoint) {
+    throw new Error(`the ${app.name}'s configuration names no product, version or updater endpoint`);
   }
-  return { product: conf.productName, version: conf.version, endpoint };
+  return { app, product, version, feed: feedOf(endpoint) };
+}
+
+/** Every app's configuration, all of one version and their feeds in one repository. */
+function readAppConfigs(): { configs: AppConfig[]; version: string; repository: Repository } {
+  const configs = APPS.map(readAppConfig);
+  const versions = new Set(configs.map((config) => config.version));
+  const [version] = versions;
+  if (version === undefined || versions.size !== 1) {
+    throw new Error(`the apps' configurations name different versions: ${[...versions].join(", ")}`);
+  }
+  return { configs, version, repository: repositoryOf(configs.map((config) => config.feed)) };
 }
 
 /** One `gh` call, its output kept; `gh` is found on the PATH. */
@@ -208,41 +236,47 @@ function cargoTargetDir(): string {
 /** An installer as the build left it, with where it stands. */
 type BuiltInstaller = Installer & { readonly path: string };
 
-/** What one release builds: the product, the version and the configuration the CLI merges over the app's own. */
+/** What one release builds: the version and the configuration the CLI merges over each app's. */
 interface Release {
-  readonly product: string;
   readonly version: string;
   /** The CLI's configuration arguments: a nightly's version, handed to its build alone and never written. */
   readonly override: readonly string[];
 }
 
-/** Runs one build and returns its installers, each written by this run and signed. */
-function runBuild(build: Build, release: Release, env: NodeJS.ProcessEnv, targetDir: string): BuiltInstaller[] {
-  console.log(`· building for ${build.name}`);
+/** Runs one build of one app and returns its installers, each written by this run and signed. */
+function runBuild(
+  config: AppConfig,
+  build: Build,
+  release: Release,
+  env: NodeJS.ProcessEnv,
+  targetDir: string,
+): BuiltInstaller[] {
+  console.log(`· building the ${config.app.name} for ${build.name}`);
   const startedAt = Date.now();
   const cross = build.cross === null ? [] : ["--runner", build.cross.runner, "--target", build.cross.target];
   const bundles = build.formats.map((kind) => kind.format).join(",");
-  const args = ["tauri", "build", "--ci", ...release.override, ...cross, "--bundles", bundles];
+  const overlay = config.app.overlay === null ? [] : ["--config", config.app.overlay];
+  const features = config.app.features.length === 0 ? [] : ["--features", config.app.features.join(",")];
+  const args = ["tauri", "build", "--ci", ...overlay, ...release.override, ...features, ...cross, "--bundles", bundles];
   const result = spawnSync("cargo", args, {
     cwd: desktopDir,
     stdio: "inherit",
     env,
   });
   if (result.status !== 0) {
-    throw new Error(`the ${build.name} build failed (exit ${result.status ?? "signal"})`);
+    throw new Error(`the ${config.app.name}'s ${build.name} build failed (exit ${result.status ?? "signal"})`);
   }
   const bundleRoot = join(targetDir, ...(build.cross === null ? [] : [build.cross.target]), "release", "bundle");
   return build.formats.map((kind) => {
-    const file = kind.fileName(release.product, release.version);
-    const path = join(bundleRoot, kind.bundleDir, file);
+    const path = join(bundleRoot, kind.bundleDir, kind.fileName(config.product, release.version));
     for (const written of [path, `${path}.sig`]) {
       if (!existsSync(written) || statSync(written).mtimeMs < startedAt) {
-        throw new Error(`the ${build.name} build did not write ${written}`);
+        throw new Error(`the ${config.app.name}'s ${build.name} build did not write ${written}`);
       }
     }
     return {
       kind,
-      file,
+      file: assetName(kind.fileName(config.product, release.version)),
       size: statSync(path).size,
       sha256: sha256Of(path),
       signature: readFileSync(`${path}.sig`, "utf8").trim(),
@@ -269,22 +303,30 @@ const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
 /** A `gh` call as a shell would read it, for the dry run's print. */
 const shown = (call: GhCall): string => ["gh", ...call].map((arg) => (/^[\w./:=@-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`)).join(" ");
 
+/** One app's installers as this run built them. */
+type AppBuilt = AppInstallers & { readonly installers: readonly BuiltInstaller[] };
+
+/** Every installer of every app, as one list. */
+const everyInstaller = (built: readonly AppBuilt[]): BuiltInstaller[] => built.flatMap((app) => app.installers);
+
 /** Publishes the version into a mirror folder, its reads naming the mirror's own copies. */
-function publishMirror(mirror: Mirror, channel: Channel, version: string, date: Date, installers: readonly BuiltInstaller[]): void {
+function publishMirror(mirror: Mirror, channel: Channel, version: string, date: Date, built: readonly AppBuilt[]): void {
   const channelBase = channelBaseUrl(mirror.base, channel);
-  const { release: read, feed } = releaseReads(version, date, versionBaseUrl(channelBase, version), installers);
+  const { release: read, feeds } = releaseReads(version, date, versionBaseUrl(channelBase, version), built);
   mkdirSync(mirror.channelDir, { recursive: true });
   const partialDir = join(mirror.channelDir, `.${version}.partial`);
   rmSync(partialDir, { recursive: true, force: true });
   mkdirSync(partialDir, { recursive: true });
-  for (const { path, file } of installers) {
+  for (const { path, file } of everyInstaller(built)) {
     copyFileSync(path, join(partialDir, file));
     copyFileSync(`${path}.sig`, join(partialDir, `${file}.sig`));
   }
   writeFileSync(join(partialDir, "release.json"), json(read));
   renameSync(partialDir, join(mirror.channelDir, version));
   replaceFile(join(mirror.dir, "release.json"), json(withChannelRelease(mirror.published, channel, read)));
-  replaceFile(join(mirror.channelDir, "latest.json"), json(feed));
+  for (const { file, feed } of feeds) {
+    replaceFile(join(mirror.channelDir, file), json(feed));
+  }
   if (channel === "nightly") {
     for (const old of nightliesPastKept(versionFolders(mirror.channelDir))) {
       rmSync(join(mirror.channelDir, old), { recursive: true, force: true });
@@ -302,33 +344,41 @@ function main(): void {
       mirror: { type: "string" },
       "mirror-url": { type: "string" },
       "dry-run": { type: "boolean", default: false },
+      "no-publish": { type: "string" },
     },
     strict: true,
   });
   const channel = values.channel;
-  if (!values.keys || !isChannel(channel) || (values.mirror === undefined) !== (values["mirror-url"] === undefined)) {
+  const keep = values["no-publish"];
+  if (
+    !values.keys ||
+    !isChannel(channel) ||
+    (values.mirror === undefined) !== (values["mirror-url"] === undefined) ||
+    (keep !== undefined && (values["dry-run"] || values.mirror !== undefined))
+  ) {
     throw new Error(
       `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> --keys <secret store folder> ` +
-        "[--mirror <folder> --mirror-url <its served address>] [--dry-run]",
+        "[--mirror <folder> --mirror-url <its served address>] [--dry-run | --no-publish <folder>]",
     );
   }
 
-  const app = readAppConfig();
-  const repository = repositoryOf(app.endpoint);
+  const { configs, version: configured, repository } = readAppConfigs();
   const commit = headCommit();
   const published = publishedRead(repository);
   const assetsNow = channel === "nightly" ? nightlyAssets(repository) : null;
   const mirror =
     values.mirror === undefined ? null : openMirror(values.mirror, values["mirror-url"] ?? "", channel);
-  const version = channelVersion(channel, app.version, published, mirror === null ? [] : versionFolders(mirror.channelDir));
+  const version = channelVersion(channel, configured, published, mirror === null ? [] : versionFolders(mirror.channelDir));
   if (mirror !== null && existsSync(join(mirror.channelDir, version))) {
     throw new Error(`${join(mirror.channelDir, version)} already exists; a published version is never written again`);
   }
   keyFiles(values.keys);
 
   const tag = channelTag(channel, version);
-  const files = BUILDS.flatMap((build) => build.formats.map((kind) => kind.fileName(app.product, version)));
-  const staging = values["dry-run"] ? "<staging>" : mkdtempSync(join(tmpdir(), "jake-desktop-release-"));
+  const files = configs.flatMap((config) =>
+    BUILDS.flatMap((build) => build.formats.map((kind) => assetName(kind.fileName(config.product, version)))),
+  );
+  const staging = values["dry-run"] ? "<staging>" : keep ?? mkdtempSync(join(tmpdir(), "jake-desktop-release-"));
   const publication: GitHubPublication = {
     repository,
     channel,
@@ -336,15 +386,20 @@ function main(): void {
     commit,
     assets: files.flatMap((file) => [file, `${file}.sig`]).map((file) => join(staging, file)),
     ownRead: join(staging, "release.json"),
-    feed: join(staging, "latest.json"),
+    feeds: configs.map((config) => join(staging, config.feed.file)),
     consoleRead: join(staging, "console", "release.json"),
     stableVersion: published?.version ?? null,
     nightlyAssets: assetsNow,
   };
   const calls = githubCalls(publication);
-  const feedUrl = channel === "stable" ? latestAssetUrl(repository, "latest.json") : new URL("latest.json", assetBaseUrl(repository, tag));
   console.log(`desktop release ${version} on ${channel} → ${repository.slug}, tag ${tag}, from ${commit}`);
-  console.log(`  updater feed   ${feedUrl.href}`);
+  for (const config of configs) {
+    const feedUrl =
+      channel === "stable"
+        ? latestAssetUrl(repository, config.feed.file)
+        : new URL(config.feed.file, assetBaseUrl(repository, tag));
+    console.log(`  updater feed   ${feedUrl.href} (${config.app.name})`);
+  }
   console.log(`  console read   ${latestAssetUrl(repository, "release.json").href}`);
   for (const file of files) {
     console.log(`  installer      ${new URL(encodeURIComponent(file), assetBaseUrl(repository, tag)).href}`);
@@ -362,23 +417,36 @@ function main(): void {
   const env = signingEnv(values.keys);
 
   const release: Release = {
-    product: app.product,
     version,
     override: channel === "nightly" ? ["--config", JSON.stringify({ version })] : [],
   };
   const targetDir = cargoTargetDir();
-  const installers = BUILDS.flatMap((build) => runBuild(build, release, env, targetDir));
+  const built: AppBuilt[] = configs.map((config) => ({
+    app: config.app,
+    feedFile: config.feed.file,
+    installers: BUILDS.flatMap((build) => runBuild(config, build, release, env, targetDir)),
+  }));
 
   const date = new Date();
-  const { release: read, feed } = releaseReads(version, date, assetBaseUrl(repository, tag), installers);
-  for (const { path, file } of installers) {
+  const { release: read, feeds } = releaseReads(version, date, assetBaseUrl(repository, tag), built);
+  mkdirSync(staging, { recursive: true });
+  for (const { path, file } of everyInstaller(built)) {
     copyFileSync(path, join(staging, file));
     copyFileSync(`${path}.sig`, join(staging, `${file}.sig`));
   }
   writeFileSync(publication.ownRead, json(read));
-  writeFileSync(publication.feed, json(feed));
+  for (const { file, feed } of feeds) {
+    writeFileSync(join(staging, file), json(feed));
+  }
   mkdirSync(dirname(publication.consoleRead), { recursive: true });
   writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
+  if (keep !== undefined) {
+    for (const call of calls) {
+      console.log(`  would run      ${shown(call)}`);
+    }
+    console.log(`not published: the installers, their signatures and the reads stand in ${keep}`);
+    return;
+  }
   for (const call of calls) {
     console.log(shown(call));
     const result = spawnSync("gh", call, { stdio: "inherit" });
@@ -387,12 +455,12 @@ function main(): void {
     }
   }
   if (mirror !== null) {
-    publishMirror(mirror, channel, version, date, installers);
+    publishMirror(mirror, channel, version, date, built);
   }
   rmSync(staging, { recursive: true, force: true });
 
   console.log(`\npublished ${read.version} on ${channel} at ${read.date}`);
-  for (const { file, size, sha256, url } of read.files) {
+  for (const { file, size, sha256, url } of [...read.files, ...(read.allInOne?.files ?? [])]) {
     console.log(`  ${file}  ${size} bytes  sha256 ${sha256}\n    ${url}`);
   }
 }

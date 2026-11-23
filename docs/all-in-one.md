@@ -157,7 +157,9 @@ flowchart TD
 - **The app updates itself through Tauri's updater,** as the remote controller does (docs/desktop.md,
   「Distribution and updates」), from feeds of its own beside the remote controller's on the public repository's
   GitHub releases: `all-in-one-latest.json` on the latest release for `stable`, and the same file of the nightly
-  pre-release for `nightly`. Each release carries both apps' installers, built from one commit.
+  pre-release for `nightly`. Each release carries both apps' installers, built from one commit by the same
+  `bun run release:desktop` (docs/desktop.md, 「Making a release」), and the read `release.json` names the
+  all-in-one's under `allInOne`.
 - **The set's repositories update through the testbed's deployment,** as every install's do: each repository's
   later commits on GitHub go live by `bmo-testbed deploy` in its checkout. The app does not deploy; the set's own
   supervisor agent puts newer commits live, as on a server.
@@ -193,10 +195,6 @@ a Windows program, and every command of the first run and of the set runs inside
 
 ## What is not built yet
 
-- **The release does not yet build the all-in-one.** `bun run release:desktop` builds and publishes the remote
-  controller alone; the all-in-one's installers, its feed `all-in-one-latest.json` and its entries in
-  `release.json` are added to the release when the all-in-one is first published, and until then its updater finds
-  no feed and installs nothing.
 - **The Windows road is built and not yet run on Windows:** the WSL checks, the image's download and check, the
   import, the bootstrap and the commands wrapped for the distribution are tested as words on Linux alone.
 - **Updating the set's repositories from the app** is the set's own supervisor agent's work, as on a server; the

@@ -5,9 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  ALL_IN_ONE,
   APPIMAGE,
+  APPS,
   DEB,
   NSIS,
+  REMOTE_CONTROLLER,
   type ConsoleRead,
   type Installer,
   type ReleaseRead,
@@ -15,9 +18,11 @@ import {
   assertNewerVersion,
   assertNightlyVersion,
   assetBaseUrl,
+  assetName,
   channelBaseUrl,
   channelTag,
   dayOf,
+  feedOf,
   githubCalls,
   isChannel,
   latestAssetUrl,
@@ -31,18 +36,29 @@ import {
 
 // A mirror folder's served address, as the owner's server serves it.
 const base = new URL("https://mirror.example/bmo/jake/desktop/");
-const repository = repositoryOf("https://github.com/ahas/jake/releases/latest/download/latest.json");
+const remoteFeed = feedOf("https://github.com/ahas/jake/releases/latest/download/latest.json");
+const allInOneFeed = feedOf("https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json");
+const repository = repositoryOf([remoteFeed, allInOneFeed]);
 const date = new Date("2026-11-16T12:00:00Z");
-const installers: Installer[] = [NSIS, APPIMAGE, DEB].map((kind, i) => ({
-  kind,
-  file: kind.fileName("BMO", "0.2.0"),
-  size: 1000 + i,
-  sha256: `${i}`.repeat(64),
-  signature: `sig-${kind.format}`,
-}));
+const installersOf = (product: string, sizes: number): Installer[] =>
+  [NSIS, APPIMAGE, DEB].map((kind, i) => ({
+    kind,
+    file: assetName(kind.fileName(product, "0.2.0")),
+    size: sizes + i,
+    sha256: `${i}`.repeat(64),
+    signature: `sig-${kind.format}`,
+  }));
+const installers = installersOf("BMO", 1000);
+const remoteOnly = [{ app: REMOTE_CONTROLLER, feedFile: "latest.json", installers }];
+const bothApps = [
+  ...remoteOnly,
+  { app: ALL_IN_ONE, feedFile: "all-in-one-latest.json", installers: installersOf("BMO All-in-One", 2000) },
+];
 
-describe("repositoryOf", () => {
-  test("is the repository whose latest release's feed the updater reads", () => {
+describe("feedOf and repositoryOf", () => {
+  test("each app's feed is a file of the latest release, and the repository the one they all name", () => {
+    expect(remoteFeed.file).toBe("latest.json");
+    expect(allInOneFeed.file).toBe("all-in-one-latest.json");
     expect(repository.slug).toBe("ahas/jake");
   });
 
@@ -53,8 +69,27 @@ describe("repositoryOf", () => {
       "https://github.com/ahas/jake/releases/latest/download/feed.json",
       "https://example.com/ahas/jake/releases/latest/download/latest.json",
     ]) {
-      expect(() => repositoryOf(endpoint)).toThrow("latest release feed");
+      expect(() => feedOf(endpoint)).toThrow("latest release feed");
     }
+  });
+
+  test("refuses apps whose feeds name different repositories or one file", () => {
+    const elsewhere = feedOf("https://github.com/someone/else/releases/latest/download/all-in-one-latest.json");
+    expect(() => repositoryOf([remoteFeed, elsewhere])).toThrow("different repositories");
+    expect(() => repositoryOf([remoteFeed, remoteFeed])).toThrow("one file");
+  });
+
+  test("every app the release builds has a feed of its own, the remote controller's the configuration's own", () => {
+    expect(APPS).toEqual([REMOTE_CONTROLLER, ALL_IN_ONE]);
+    expect(ALL_IN_ONE.overlay).toBe("tauri.all-in-one.conf.json");
+    expect(ALL_IN_ONE.features).toEqual(["all-in-one"]);
+  });
+});
+
+describe("assetName", () => {
+  test("is the built name with the product's spaces as dashes, since GitHub rewrites spaces", () => {
+    expect(assetName(APPIMAGE.fileName("BMO All-in-One", "1.0.0"))).toBe("BMO-All-in-One_1.0.0_amd64.AppImage");
+    expect(assetName(NSIS.fileName("BMO", "1.0.0"))).toBe("BMO_1.0.0_x64-setup.exe");
   });
 });
 
@@ -70,10 +105,15 @@ describe("GitHub addresses", () => {
   });
 
   test("the reads name the release's assets", () => {
-    const { release, feed } = releaseReads("1.0.0", date, assetBaseUrl(repository, "desktop-v1.0.0"), installers);
+    const { release, feeds } = releaseReads("1.0.0", date, assetBaseUrl(repository, "desktop-v1.0.0"), bothApps);
 
     expect(release.files[0]?.url).toBe("https://github.com/ahas/jake/releases/download/desktop-v1.0.0/BMO_0.2.0_x64-setup.exe");
-    expect(feed.platforms["linux-x86_64-deb"]?.url).toBe("https://github.com/ahas/jake/releases/download/desktop-v1.0.0/BMO_0.2.0_amd64.deb");
+    expect(feeds[0]?.feed.platforms["linux-x86_64-deb"]?.url).toBe(
+      "https://github.com/ahas/jake/releases/download/desktop-v1.0.0/BMO_0.2.0_amd64.deb",
+    );
+    expect(release.allInOne?.files[1]?.url).toBe(
+      "https://github.com/ahas/jake/releases/download/desktop-v1.0.0/BMO-All-in-One_0.2.0_amd64.AppImage",
+    );
   });
 });
 
@@ -85,7 +125,7 @@ describe("githubCalls", () => {
     commit: "abc123",
     assets: ["s/BMO_1.0.0_x64-setup.exe", "s/BMO_1.0.0_x64-setup.exe.sig"],
     ownRead: "s/release.json",
-    feed: "s/latest.json",
+    feeds: ["s/latest.json", "s/all-in-one-latest.json"],
     consoleRead: "s/console/release.json",
     stableVersion: null,
     nightlyAssets: null,
@@ -96,7 +136,8 @@ describe("githubCalls", () => {
       [
         "release", "create", "desktop-v1.0.0", "--repo", "ahas/jake", "--target", "abc123", "--title", "BMO desktop 1.0.0",
         "--notes", "BMO desktop app 1.0.0, built from abc123.", "--draft",
-        "s/BMO_1.0.0_x64-setup.exe", "s/BMO_1.0.0_x64-setup.exe.sig", "s/latest.json", "s/console/release.json",
+        "s/BMO_1.0.0_x64-setup.exe", "s/BMO_1.0.0_x64-setup.exe.sig", "s/latest.json", "s/all-in-one-latest.json",
+        "s/console/release.json",
       ],
       ["release", "edit", "desktop-v1.0.0", "--repo", "ahas/jake", "--draft=false", "--latest"],
     ]);
@@ -107,7 +148,13 @@ describe("githubCalls", () => {
 
     expect(calls[0]?.slice(0, 7)).toEqual(["release", "create", "desktop-nightly", "--repo", "ahas/jake", "--target", "abc123"]);
     expect(calls[0]).toContain("--prerelease");
-    expect(calls[0]?.slice(-4)).toEqual(["s/BMO_1.0.0_x64-setup.exe", "s/BMO_1.0.0_x64-setup.exe.sig", "s/release.json", "s/latest.json"]);
+    expect(calls[0]?.slice(-5)).toEqual([
+      "s/BMO_1.0.0_x64-setup.exe",
+      "s/BMO_1.0.0_x64-setup.exe.sig",
+      "s/release.json",
+      "s/latest.json",
+      "s/all-in-one-latest.json",
+    ]);
     expect(calls[1]).toEqual(["release", "upload", "desktop-v1.0.0", "--repo", "ahas/jake", "--clobber", "s/console/release.json"]);
     expect(calls).toHaveLength(2);
   });
@@ -128,7 +175,7 @@ describe("githubCalls", () => {
       "release edit desktop-nightly",
       "release upload desktop-v1.0.0",
     ]);
-    expect(calls[1]?.at(-1)).toBe("s/latest.json");
+    expect(calls[1]?.slice(-2)).toEqual(["s/latest.json", "s/all-in-one-latest.json"]);
     expect(calls[2]?.[3]).toBe("BMO_1.1.0-nightly.20261124_x64-setup.exe");
   });
 
@@ -150,7 +197,8 @@ describe("assertNewerVersion", () => {
 });
 
 describe("releaseReads", () => {
-  const { release, feed } = releaseReads("0.2.0", date, versionBaseUrl(base, "0.2.0"), installers);
+  const { release, feeds } = releaseReads("0.2.0", date, versionBaseUrl(base, "0.2.0"), remoteOnly);
+  const feed = feeds[0]!.feed;
 
   test("the console's read names each installer in the version's folder", () => {
     expect(release).toEqual({
@@ -202,7 +250,24 @@ describe("releaseReads", () => {
   });
 
   test("refuses two installers answering one feed key", () => {
-    expect(() => releaseReads("0.2.0", date, versionBaseUrl(base, "0.2.0"), [installers[1]!, installers[1]!])).toThrow("two installers");
+    const twice = [{ app: REMOTE_CONTROLLER, feedFile: "latest.json", installers: [installers[1]!, installers[1]!] }];
+    expect(() => releaseReads("0.2.0", date, versionBaseUrl(base, "0.2.0"), twice)).toThrow("two installers");
+  });
+
+  test("the all-in-one's installers stand under allInOne, each app with its own feed", () => {
+    const both = releaseReads("0.2.0", date, versionBaseUrl(base, "0.2.0"), bothApps);
+
+    expect(both.release.files).toEqual(release.files);
+    expect(both.release.allInOne?.files.map((file) => file.file)).toEqual([
+      "BMO-All-in-One_0.2.0_x64-setup.exe",
+      "BMO-All-in-One_0.2.0_amd64.AppImage",
+      "BMO-All-in-One_0.2.0_amd64.deb",
+    ]);
+    expect(both.feeds.map((one) => one.file)).toEqual(["latest.json", "all-in-one-latest.json"]);
+    expect(both.feeds[1]?.feed.platforms["linux-x86_64"]?.url).toBe(
+      "https://mirror.example/bmo/jake/desktop/0.2.0/BMO-All-in-One_0.2.0_amd64.AppImage",
+    );
+    expect(both.feeds[1]?.feed.version).toBe("0.2.0");
   });
 });
 
@@ -221,12 +286,13 @@ describe("channels", () => {
 
   test("a nightly's feed and read name its own folder", () => {
     const nightly = versionBaseUrl(channelBaseUrl(base, "nightly"), "1.1.0-nightly.20261124");
-    const { release, feed } = releaseReads("1.1.0-nightly.20261124", date, nightly, installers);
+    const { release, feeds } = releaseReads("1.1.0-nightly.20261124", date, nightly, bothApps);
 
     expect(release.files[0]?.url).toBe(
       "https://mirror.example/bmo/jake/desktop/nightly/1.1.0-nightly.20261124/BMO_0.2.0_x64-setup.exe",
     );
-    expect(feed.platforms["windows-x86_64"]?.url).toBe(release.files[0]?.url);
+    expect(feeds[0]?.feed.platforms["windows-x86_64"]?.url).toBe(release.files[0]?.url);
+    expect(feeds[1]?.feed.platforms["windows-x86_64"]?.url).toBe(release.allInOne?.files[0]?.url);
   });
 });
 
@@ -374,9 +440,16 @@ esac
 
     expect(status).toBe(0);
     expect(out).toContain("desktop release 0.2.1 on stable → ahas/jake, tag desktop-v0.2.1");
-    expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/latest/download/latest.json");
+    expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/latest/download/latest.json (remote controller)");
+    expect(out).toContain(
+      "updater feed   https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json (all-in-one)",
+    );
     expect(out).toContain("console read   https://github.com/ahas/jake/releases/latest/download/release.json");
     expect(out).toContain("installer      https://github.com/ahas/jake/releases/download/desktop-v0.2.1/BMO_0.2.1_x64-setup.exe");
+    expect(out).toContain(
+      "installer      https://github.com/ahas/jake/releases/download/desktop-v0.2.1/BMO-All-in-One_0.2.1_amd64.AppImage",
+    );
+    expect(out).toContain("'<staging>/latest.json' '<staging>/all-in-one-latest.json' '<staging>/console/release.json'");
     expect(out).toContain("would run      gh release create desktop-v0.2.1 --repo ahas/jake --target ");
     expect(out).toContain("would run      gh release edit desktop-v0.2.1 --repo ahas/jake --draft=false --latest");
     expect(out).toContain("dry run: nothing built, uploaded or written");
@@ -396,10 +469,23 @@ esac
     expect(status).toBe(0);
     expect(out).toMatch(/desktop release 0\.3\.0-nightly\.\d{8} on nightly → ahas\/jake, tag desktop-nightly/);
     expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/download/desktop-nightly/latest.json");
+    expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/download/desktop-nightly/all-in-one-latest.json");
     expect(out).toContain("would run      gh release delete-asset desktop-nightly BMO_0.3.0-nightly.20261101_amd64.deb --repo ahas/jake --yes");
     expect(out).toContain("would run      gh release upload desktop-v0.2.1 --repo ahas/jake --clobber");
     expect(calls).toContain("release view desktop-nightly --repo ahas/jake --json assets");
     expect(onlyReads(calls)).toBe(true);
+  });
+
+  test("--no-publish takes neither --dry-run nor a mirror", () => {
+    for (const extra of [["--dry-run"], ["--mirror", root, "--mirror-url", "https://mirror.example/"]]) {
+      const result = spawnSync(
+        "bun",
+        ["scripts/desktop-release.ts", "--channel", "stable", "--keys", keys, "--no-publish", join(root, "out"), ...extra],
+        { cwd: join(import.meta.dir, ".."), encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("usage:");
+    }
   });
 
   test("a nightly before the first stable release is refused", () => {
