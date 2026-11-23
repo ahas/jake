@@ -20,3 +20,6 @@ jake は **bmo agent proxy** です。BMO がオーナーのリモートマシ�
 各部品の組み合わせ方は docs/architecture.md、トンネルのフレームは docs/protocol.md、インストールは
 docs/install.md、デスクトップアプリは docs/desktop.md、ハブの立ち上げは docs/deploy.md、シェルのレシピは
 docs/recipes.md を参照してください。
+
+ハブは、エージェントがインデックスの INSTALL.md（`bmo install`、https://bmo.ahas.io/install.md）で BMO のマシンに
+インストールします。

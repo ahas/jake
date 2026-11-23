@@ -18,3 +18,5 @@ BMO는 자기 네트워크에서 안쪽으로 접속할 수 없는 머신에도 
 
 구성 요소가 어떻게 맞물리는지는 docs/architecture.md, 터널 프레임은 docs/protocol.md, 설치는 docs/install.md,
 데스크톱 앱은 docs/desktop.md, 허브를 띄우는 방법은 docs/deploy.md, 셸 활용 예시는 docs/recipes.md를 참고하십시오.
+
+허브는 에이전트가 인덱스의 INSTALL.md(`bmo install`, https://bmo.ahas.io/install.md)로 BMO 머신에 설치합니다.

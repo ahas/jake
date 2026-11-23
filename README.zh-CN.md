@@ -17,3 +17,5 @@ jake 是一个 **bmo agent proxy**:BMO 管理其所有者远程机器时所经�
 
 各部分如何配合见 docs/architecture.md,隧道帧见 docs/protocol.md,安装见 docs/install.md,桌面应用见
 docs/desktop.md,如何部署 hub 见 docs/deploy.md,shell 用法示例见 docs/recipes.md。
+
+hub 由智能体按照索引的 INSTALL.md(`bmo install`,https://bmo.ahas.io/install.md)安装到 BMO 机器上。

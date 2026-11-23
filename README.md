@@ -21,3 +21,6 @@ to.
 See docs/architecture.md for how the pieces fit, docs/protocol.md for the tunnel frames,
 docs/install.md to install it, docs/desktop.md for the desktop app, docs/deploy.md to bring up the
 hub, and docs/recipes.md for shell recipes.
+
+The hub is installed on a BMO machine by an agent with the index's INSTALL.md (`bmo install`,
+https://bmo.ahas.io/install.md).
