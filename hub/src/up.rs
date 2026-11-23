@@ -116,7 +116,7 @@ mod tests {
   fn a_server_bound_to_every_address_is_reached_on_the_loopback_of_its_family() {
     assert_eq!(reachable("0.0.0.0"), "127.0.0.1");
     assert_eq!(reachable("::"), "::1");
-    assert_eq!(reachable("192.0.2.8x"), "192.0.2.8x");
+    assert_eq!(reachable("192.0.2.84"), "192.0.2.84");
     assert_eq!(authority("::1", 8790), "[::1]:8790");
     assert_eq!(authority("127.0.0.1", 8790), "127.0.0.1:8790");
   }

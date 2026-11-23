@@ -8,6 +8,24 @@ Nothing here is run as part of building the hub. Opening the firewall port, crea
 writing the NPM proxy host and reloading nginx, and enabling the service all change live
 infrastructure, so they belong to a deployment turn, not to a build. Run them from main-host unless a step says otherwise.
 
+The names `main-host` (the machine the hub runs on) and `vm-host` (the Proxmox host that holds the NPM
+container) stand for the operator's own machines. The addresses and identifiers this procedure needs are
+not committed: they are read from a local settings file, `~/.local/share/jake/deploy.env`, which the
+operator writes once and keeps outside the repository. It holds plain `KEY=value` lines, none of them a
+secret:
+
+- `HUB_ADDRESS` — the LAN address of main-host, the forward target of the proxy host;
+- `NPM_ADDRESS` — the LAN address of the NPM container, the one source main-host's firewall admits;
+- `PROXY_SSH` — the ssh destination of vm-host;
+- `CLOUDFLARE_ZONE_ID` — the id of the `ahas.io` zone;
+- `PUBLIC_NAME` — the router's public DDNS name the CNAME points at (`home.example.org` here).
+
+Load it into the shell before the steps below:
+
+```sh
+set -a; . ~/.local/share/jake/deploy.env; set +a
+```
+
 The committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
 config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the testbed's declaration
 `testbed.toml`, and this document.
@@ -76,11 +94,11 @@ systemctl --user status jake-hub
 ## 3. The firewall opening
 
 main-host runs ufw, which drops every inbound port it has no rule for. NPM reaches the hub from its
-LXC at 192.168.0.101, so open the hub's port to that address alone; nothing else needs to reach it,
+container at `NPM_ADDRESS`, so open the hub's port to that address alone; nothing else needs to reach it,
 because every agent comes in through NPM.
 
 ```sh
-sudo ufw allow from 192.168.0.101 to any port 8790 proto tcp comment 'jake hub via NPM'
+sudo ufw allow from "$NPM_ADDRESS" to any port 8790 proto tcp comment 'jake hub via NPM'
 ```
 
 Without this rule the hub answers on loopback but NPM's connection hangs, and a request to
@@ -88,15 +106,15 @@ Without this rule the hub answers on loopback but NPM's connection hangs, and a 
 
 ## 4. The DNS record
 
-Add a CNAME `jake.example.org` -> `home.example.org`, DNS only (not proxied), in the `ahas.io` zone with the
+Add a CNAME `jake.example.org` -> `PUBLIC_NAME`, DNS only (not proxied), in the `ahas.io` zone with the
 Cloudflare API token.
 
 ```sh
 curl -s -X POST \
-  "https://api.cloudflare.com/client/v4/zones/5b25bef912499973b4df6b361dfd95b2/dns_records" \
+  "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
   -H "Authorization: Bearer $(cat ~/.config/cloudflare/token)" \
   -H "Content-Type: application/json" \
-  --data '{"type":"CNAME","name":"jake","content":"home.example.org","proxied":false,"ttl":1}'
+  --data '{"type":"CNAME","name":"jake","content":"'"$PUBLIC_NAME"'","proxied":false,"ttl":1}'
 ```
 
 ## 5. The NPM proxy host
@@ -106,11 +124,11 @@ generated nginx config. Write the row first, read back the id it was assigned, t
 under that id and reload nginx. All of this runs inside the NPM LXC (VMID 109) on vm-host, which has
 no `sqlite3` binary — use the `sqlite3` module bundled with the NPM app.
 
-Insert the row (forwarding to main-host on the hub's port, the wildcard certificate 76, websocket
+Insert the row (forwarding to main-host at `HUB_ADDRESS` on the hub's port, the wildcard certificate 76, websocket
 upgrade on), and print the new id:
 
 ```sh
-ssh mm 'pct exec 109 -- node -e '\''
+ssh "$PROXY_SSH" "pct exec 109 -- env HUB_ADDRESS=$HUB_ADDRESS node -" <<'JS'
 const sqlite3 = require("/app/node_modules/sqlite3");
 const db = new sqlite3.Database("/data/database.sqlite");
 const now = new Date().toISOString().slice(0, 19).replace("T", " ");
@@ -124,7 +142,7 @@ db.run(
   [
     now, now,
     JSON.stringify(["jake.example.org"]),
-    "192.0.2.8x", 8790,
+    process.env.HUB_ADDRESS, 8790,
     "client_max_body_size 0;\nproxy_buffering off;\nproxy_request_buffering off;\nproxy_read_timeout 3600s;\nproxy_send_timeout 3600s;",
     JSON.stringify({ letsencrypt_agree: false, dns_challenge: false, nginx_online: true, nginx_err: null }),
   ],
@@ -134,17 +152,18 @@ db.run(
     db.close();
   },
 );
-'\'''
+JS
 ```
 
-Take the printed id. Substitute it for `HOSTID` in the committed template and write the result to the
-container as `<id>.conf`, then check and reload nginx:
+Take the printed id. Substitute it for `HOSTID` in the committed template, and `HUB_ADDRESS` from the
+local settings for the template's `HUB_ADDRESS` placeholder, write the result to the container as
+`<id>.conf`, then check and reload nginx:
 
 ```sh
 ID=<the id printed above>
-sed "s/HOSTID/$ID/g" ~/repos/ahas/jake/deploy/jake.example.org.conf \
-  | ssh mm "pct exec 109 -- sh -c 'cat > /data/nginx/proxy_host/$ID.conf'"
-ssh mm "pct exec 109 -- sh -c 'nginx -t && nginx -s reload'"
+sed -e "s/HOSTID/$ID/g" -e "s/HUB_ADDRESS/$HUB_ADDRESS/g" ~/repos/ahas/jake/deploy/jake.example.org.conf \
+  | ssh "$PROXY_SSH" "pct exec 109 -- sh -c 'cat > /data/nginx/proxy_host/$ID.conf'"
+ssh "$PROXY_SSH" "pct exec 109 -- sh -c 'nginx -t && nginx -s reload'"
 ```
 
 The port in the template must equal `JAKE_HUB_PORT` from step 1 and the port opened in step 3. The

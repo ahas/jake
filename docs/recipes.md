@@ -55,7 +55,7 @@ $g.Dispose(); $bmp.Dispose()
   and `--data` set the method, headers, and body as usual.
 
 ```sh
-jake exec 'curl.exe -sS -i -L http://192.168.0.1/'
+jake exec 'curl.exe -sS -i -L http://192.0.2.1/'
 ```
 
 - A binary body is written to a temp file first and printed as base64. Piping a native program's
@@ -63,14 +63,14 @@ jake exec 'curl.exe -sS -i -L http://192.168.0.1/'
 
 ```sh
 jake exec '$f = "$env:TEMP\jake-get.bin"
-curl.exe -sS -L -o $f http://192.168.0.10/file.zip
+curl.exe -sS -L -o $f http://192.0.2.10/file.zip
 [Convert]::ToBase64String([IO.File]::ReadAllBytes($f)); Remove-Item $f' | base64 -d > file.zip
 ```
 
 - The same request from WSL uses the distribution's own `curl`, and its pipe carries bytes intact.
 
 ```sh
-jake exec --shell wsl 'curl -sS -L http://192.168.0.10/file.zip | base64 -w0' | base64 -d > file.zip
+jake exec --shell wsl 'curl -sS -L http://192.0.2.10/file.zip | base64 -w0' | base64 -d > file.zip
 ```
 
 ## Edge
