@@ -22,7 +22,8 @@
   the repository and never compiled into the executable.
 
 .PARAMETER HubUrl
-  The hub to dial. Prompted for if omitted; an empty answer takes the default, wss://jake.example.org .
+  The hub to dial. Prompted for if omitted; an empty answer takes the hub of the deployment that published
+  this script, and a copy no deployment published has no such default.
 
 .PARAMETER Secret
   The shared secret, matching the hub's JAKE_SECRET. Prompted for (hidden) if omitted.
@@ -64,8 +65,12 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Update) { $NonInteractive = $true }
 
-$Base = 'https://ai.example.org/bmo/jake'
-$DefaultHubUrl = 'wss://jake.example.org'
+# The download address and the hub the deployment that publishes this script writes in (docs/install.md,
+# 「Where the agent comes from」); a copy no deployment published names neither, and asks for the hub.
+$Base = '@JAKE_AGENT_DOWNLOAD_URL@'
+$DefaultHubUrl = '@JAKE_PUBLIC_URL@'
+if ($Base -like '@*@') { $Base = '' }
+if ($DefaultHubUrl -like '@*@') { $DefaultHubUrl = '' }
 $Binary = 'jake.exe'
 $AgentAnchor = 'JakeAgent'
 $GuardAnchor = 'JakeGuard'
@@ -152,6 +157,9 @@ $TempPayload = $null
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $Binary))) {
   $Payload = $PSScriptRoot
 } else {
+  if (-not $Base) {
+    throw "This copy of the installer was not published by a hub's deployment, so it names no download address: run the install.ps1 your hub's download address serves, or this one from a build folder."
+  }
   Write-Step "downloading the agent from $Base"
   $TempPayload = Join-Path ([System.IO.Path]::GetTempPath()) ("jake-install-" + [System.Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $TempPayload | Out-Null

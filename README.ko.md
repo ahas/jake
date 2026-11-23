@@ -10,9 +10,9 @@ BMO는 자기 네트워크에서 안쪽으로 접속할 수 없는 머신에도 
 
 - **실행 모드**: Windows 호스트에서는 PowerShell과 WSL, Linux 또는 WSL 호스트에서는 Linux 셸을 씁니다.
 - **파일 전송**: 터널 자체의 프레임으로 업로드와 다운로드를 하므로, scp 없이 파일이 터널을 건너갑니다.
-- **한 줄 설치**: 기준 주소 `ai.example.org/bmo/jake/`에서 설치합니다.
-  - Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash`
-  - Windows: `powershell -c "irm https://ai.example.org/bmo/jake/install.ps1 | iex"`
+- **한 줄 설치**: 직접 운영하는 허브의 다운로드 주소, 곧 그 배포가 게시하는 `JAKE_AGENT_DOWNLOAD_URL`에서 설치합니다(docs/install.md).
+  - Linux/WSL: `curl -fsSL <다운로드 주소>/install.sh | bash`
+  - Windows: `powershell -c "irm <다운로드 주소>/install.ps1 | iex"`
 - **데스크톱 앱**: BMO의 웹 콘솔을 별도 앱으로 만든 것으로, 에이전트를 앱 안에 품고 있습니다. 설치할 때 비밀값을
   입력하는 대신 콘솔에서 승인하는 방식으로 합류합니다.
 

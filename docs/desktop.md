@@ -584,8 +584,8 @@ section.
   nightlies kept, each version's installers and signatures copied in and its reads naming them at the
   folder's served address. A version folder already there stops the release before building. It is
   what an installation of a build up to 0.2.1, whose updater reads the owner's server's feed, updates
-  from: on main-host `--mirror /var/www/ahas-ai/bmo/jake/desktop --mirror-url
-  https://ai.example.org/bmo/jake/desktop/`.
+  from: on the owner's machine the `desktop` folder of the hub's `JAKE_PUBLISH_DIR`, served at its
+  `JAKE_AGENT_DOWNLOAD_URL` followed by `desktop/`.
 - **The release ends by printing** the channel, the version and, for each installer, its name, its
   size, its SHA-256 and its address.
 - **The Authenticode signature is not part of it:** the installer stays unsigned for Windows until

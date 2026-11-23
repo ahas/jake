@@ -30,12 +30,6 @@ what = "The two Rust targets the agent is built for: rustup target add x86_64-pc
 program = "curl"
 what = "Reads the hub's public road and the published agent builds once the install ends; the curl package."
 
-# The deployment publishes the release's agent builds into the folder this machine's web server serves them from,
-# a path scripts/publish-agents.ts fixes (docs/deploy.md, 「9. The agent downloads」).
-[[needs]]
-check = "test -d /var/www/ahas-ai/bmo/jake && test -w /var/www/ahas-ai/bmo/jake"
-what = "The folder the agent builds are published to, /var/www/ahas-ai/bmo/jake, made by a person with root, owned by this account with the web server's group and mode 2775, and served by this machine's web server over HTTPS at the address the jake.download-address input names."
-
 [[port]]
 name = "jake.agents"
 number = 8790
@@ -67,8 +61,15 @@ file = "env/jake-public-name"
 
 [[input]]
 name = "jake.download-address"
-what = "The HTTPS address the agent builds are downloaded from (for example https://example.org/bmo/jake), the address at which this machine's web server serves the folder the deployment publishes them to."
+what = "The HTTPS address the agent builds are downloaded from (for example https://example.org/bmo/jake), the address at which this machine's web server serves the folder the jake.publish-folder input names."
 file = "env/jake-download-address"
+
+# The deployment publishes the release's agent builds into this folder (docs/deploy.md, 「9. The agent downloads」);
+# it refuses where the folder does not stand.
+[[input]]
+name = "jake.publish-folder"
+what = "The folder every deployment publishes the agent builds and their installers into (for example /var/www/example/bmo/jake): made by a person with root, owned by this account with the web server's group and mode 2775, and served by this machine's web server over HTTPS at the address the jake.download-address input names."
+file = "env/jake-publish-folder"
 
 # The hub's one file, outside the git tree; the hub listens for agents on every interface and for control on its
 # loopback.
@@ -81,7 +82,26 @@ JAKE_AGENT_KEY={{token.jake.agent-key}}
 JAKE_CONTROL_PORT={{port.jake.control}}
 JAKE_CONTROL_TOKEN={{token.jake.control}}
 JAKE_AGENT_DOWNLOAD_URL={{input.jake.download-address}}
+JAKE_PUBLISH_DIR={{input.jake.publish-folder}}
+JAKE_PUBLIC_URL=wss://{{input.jake.public-name}}
 """
+
+# The deployment's addresses, added to a hub file that stands without them: the hub and the publish step name no
+# address of their own (hub.env.example).
+[[line]]
+file = "prefix:jake/hub.env"
+key = "JAKE_AGENT_DOWNLOAD_URL"
+value = "{{input.jake.download-address}}"
+
+[[line]]
+file = "prefix:jake/hub.env"
+key = "JAKE_PUBLISH_DIR"
+value = "{{input.jake.publish-folder}}"
+
+[[line]]
+file = "prefix:jake/hub.env"
+key = "JAKE_PUBLIC_URL"
+value = "wss://{{input.jake.public-name}}"
 
 # The hub's command on the path, linked to the deploy tree's binary so it follows every deployment
 # (docs/deploy.md, 「2. The systemd user service」).

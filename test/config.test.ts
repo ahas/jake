@@ -16,14 +16,14 @@ describe("parseEnvFile", () => {
     const text = [
       "# a comment",
       "",
-      "JAKE_HUB_URL=wss://jake.example.org",
+      "JAKE_HUB_URL=wss://hub.example.test",
       "  JAKE_SECRET = s3cr3t  ",
       'JAKE_AGENT_NAME="hass desktop"',
       "JAKE_TICK_MS='60000'",
       "NO_EQUALS_LINE",
     ].join("\n");
     const env = parseEnvFile(text);
-    expect(env.JAKE_HUB_URL).toBe("wss://jake.example.org");
+    expect(env.JAKE_HUB_URL).toBe("wss://hub.example.test");
     expect(env.JAKE_SECRET).toBe("s3cr3t");
     expect(env.JAKE_AGENT_NAME).toBe("hass desktop");
     expect(env.JAKE_TICK_MS).toBe("60000");

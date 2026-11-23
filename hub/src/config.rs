@@ -11,7 +11,6 @@ const DEFAULT_MAX_PAYLOAD_BYTES: i64 = 16 * 1024 * 1024;
 const DEFAULT_PING_INTERVAL_MS: i64 = 15_000;
 const DEFAULT_MISSED_PONG_LIMIT: i64 = 3;
 const DEFAULT_SOCKET_BACKLOG_BYTES: i64 = 4 * 1024 * 1024;
-const DEFAULT_AGENT_DOWNLOAD_URL: &str = "https://ai.example.org/bmo/jake";
 
 pub struct HubConfig {
   pub host: String,
@@ -197,9 +196,14 @@ fn agent_update(env: &Source, release_build: PathBuf) -> Result<Option<AgentUpda
     "off" => return Ok(None),
     _ => return Err("JAKE_AGENT_UPDATE must be on or off.".into()),
   }
+  // No deployment's address stands in for another's: the orders name the one this deployment publishes at.
+  let download_url = env.present("JAKE_AGENT_DOWNLOAD_URL").ok_or(
+    "JAKE_AGENT_DOWNLOAD_URL is not set: name the address this deployment publishes the agent builds at, or \
+     set JAKE_AGENT_UPDATE=off.",
+  )?;
   Ok(Some(AgentUpdate {
     build_dir: env.present("JAKE_AGENT_BUILD_DIR").map_or(release_build, PathBuf::from),
-    download_url: env.present("JAKE_AGENT_DOWNLOAD_URL").unwrap_or(DEFAULT_AGENT_DOWNLOAD_URL).to_owned(),
+    download_url: download_url.to_owned(),
   }))
 }
 
@@ -260,7 +264,8 @@ mod tests {
 
   #[test]
   fn reads_the_required_keys_and_applies_defaults() {
-    let config = read(&source(&REQUIRED), Path::new(""), PathBuf::new()).expect("loads");
+    let pairs = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_DOWNLOAD_URL", "https://x.test/j")];
+    let config = read(&source(&pairs), Path::new(""), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("0.0.0.0", 8790, 8791));
     assert_eq!((config.secret.as_str(), config.control_token.as_str()), ("s3cr3t", "c0nsole"));
     assert_eq!(config.max_payload_bytes, 16 * 1024 * 1024);
@@ -270,11 +275,17 @@ mod tests {
   #[test]
   fn agent_orders_take_the_release_build_and_the_published_address_unless_told_otherwise() {
     let release = PathBuf::from("/release/agents");
-    let config = read(&source(&REQUIRED), Path::new(""), release.clone()).expect("loads");
+    assert_eq!(
+      read(&source(&REQUIRED), Path::new(""), release.clone()).err().expect("refused"),
+      "JAKE_AGENT_DOWNLOAD_URL is not set: name the address this deployment publishes the agent builds at, or \
+       set JAKE_AGENT_UPDATE=off."
+    );
+    let published = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_DOWNLOAD_URL", "https://downloads.test/jake")];
+    let config = read(&source(&published), Path::new(""), release.clone()).expect("loads");
     let update = config.agent_update.expect("on by default");
     assert_eq!(
       (update.build_dir, update.download_url.as_str()),
-      (release.clone(), "https://ai.example.org/bmo/jake")
+      (release.clone(), "https://downloads.test/jake")
     );
 
     let pairs = [
@@ -308,6 +319,7 @@ mod tests {
       ("JAKE_HUB_HOST", "127.0.0.1"),
       ("JAKE_HUB_PORT", "9000"),
       ("JAKE_CONTROL_PORT", "9001"),
+      ("JAKE_AGENT_UPDATE", "off"),
     ];
     let config = read(&source(&pairs), Path::new(""), PathBuf::new()).expect("loads");
     assert_eq!((config.host.as_str(), config.port, config.control_port), ("127.0.0.1", 9000, 9001));
@@ -338,7 +350,7 @@ mod tests {
     let path = std::env::temp_dir().join(format!("jake-hub-config-{}.env", std::process::id()));
     std::fs::write(
       &path,
-      "# hub\nJAKE_SECRET=from-file\nJAKE_CONTROL_TOKEN=\"quoted\"\nJAKE_HUB_PORT=9001\n",
+      "# hub\nJAKE_SECRET=from-file\nJAKE_CONTROL_TOKEN=\"quoted\"\nJAKE_HUB_PORT=9001\nJAKE_AGENT_UPDATE=off\n",
     )
     .expect("writes");
     let process = HashMap::from([
@@ -358,7 +370,13 @@ mod tests {
   fn a_control_key_is_refused_where_it_is_the_agent_key() {
     let shared = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "k")];
     assert_eq!(error_of(&shared), "JAKE_CONTROL_KEY must differ from JAKE_AGENT_KEY.");
-    let distinct = [REQUIRED[0], REQUIRED[1], ("JAKE_AGENT_KEY", "k"), ("JAKE_CONTROL_KEY", "ck")];
+    let distinct = [
+      REQUIRED[0],
+      REQUIRED[1],
+      ("JAKE_AGENT_KEY", "k"),
+      ("JAKE_CONTROL_KEY", "ck"),
+      ("JAKE_AGENT_UPDATE", "off"),
+    ];
     let config = read(&source(&distinct), Path::new(""), PathBuf::new()).expect("loads");
     assert_eq!(config.control_key.as_deref(), Some("ck"));
   }

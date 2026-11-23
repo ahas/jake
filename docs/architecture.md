@@ -547,12 +547,14 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   The build's output is a small layout: the Windows executable, the Linux binary, the example
   config, the install scripts for both platforms, and the install guide. Nothing else is bundled, because the agent needs nothing beyond the shells
   already on the machine.
-- The build layout is served under `ai.example.org/bmo/jake/`, so 하스 installs with a single command
-  that needs nothing downloaded by hand first. On Linux/WSL it is `curl -fsSL
-  https://ai.example.org/bmo/jake/install.sh | bash`; on Windows it is `powershell -c "irm
-  https://ai.example.org/bmo/jake/install.ps1 | iex"`. Each install script fetches the binary for its own
-  platform — the Linux binary from `ai.example.org/bmo/jake/jake`, the Windows executable from
-  `ai.example.org/bmo/jake/jake.exe` — along with the example config it needs. Each deployment of the hub
+- The build layout is served at the deployment's own download address, `JAKE_AGENT_DOWNLOAD_URL` of the hub's
+  settings, so a machine installs with a single command that needs nothing downloaded by hand first. On
+  Linux/WSL it is `curl -fsSL <download address>/install.sh | bash`; on Windows it is `powershell -c "irm
+  <download address>/install.ps1 | iex"`. Each install script fetches the binary for its own platform — the
+  Linux binary `jake`, the Windows executable `jake.exe`, both under the same address — along with the example
+  config it needs. The scripts name no address of their own: the deployment writes its download address and its
+  hub's public address, `JAKE_PUBLIC_URL`, into them as it publishes, so a copy no deployment published downloads
+  nothing and offers no hub. Each deployment of the hub
   builds that layout from the commit it deploys, carries it in the release, and publishes it there
   once the hub answers (docs/deploy.md, sections 8 and 9), so the download is always the agent build
   of the commit the hub runs. The layout names its own version in `version.txt`, written last when it
@@ -645,7 +647,7 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   and where the console finds the control token — the two sides of the loopback API cannot disagree
   about where it lives. The repository carries only the example; the real file, holding the shared
   secret and the control token, is never committed.
-- 하스's network reaches the hub at `jake.example.org`: a Cloudflare CNAME to `home.example.org`, DNS only,
+- 하스's network reaches the hub at its public name (`HUB_NAME`, docs/deploy.md): a Cloudflare CNAME to `home.example.org`, DNS only,
   resolved through the router's DDNS name to NPM, which forwards it to main-host on the hub's port.
   The agent dials that name over TLS and holds the connection open, so the whole tunnel is a single
   long-lived WebSocket riding the same path a browser would.

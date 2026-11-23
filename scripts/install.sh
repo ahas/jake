@@ -3,7 +3,9 @@
 
 set -euo pipefail
 
-BASE="https://ai.example.org/bmo/jake"
+# The download address and the hub the deployment that publishes this script writes in (docs/install.md,
+# 「Where the agent comes from」); a copy no deployment published names neither, and asks for the hub.
+BASE="@JAKE_AGENT_DOWNLOAD_URL@"
 DATA_DIR="$HOME/.local/share/jake"
 BIN="$DATA_DIR/jake"
 PREVIOUS_BIN="$DATA_DIR/jake.previous"
@@ -11,7 +13,9 @@ ENV_FILE="$DATA_DIR/agent.env"
 UNIT_NAME="jake-agent.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="$UNIT_DIR/$UNIT_NAME"
-DEFAULT_HUB_URL="wss://jake.example.org"
+DEFAULT_HUB_URL="@JAKE_PUBLIC_URL@"
+case "$BASE" in @*@) BASE="" ;; esac
+case "$DEFAULT_HUB_URL" in @*@) DEFAULT_HUB_URL="" ;; esac
 
 step() { printf '\033[36m· %s\033[0m\n' "$1"; }
 ok()   { printf '\033[32m  %s\033[0m\n' "$1"; }
@@ -27,7 +31,7 @@ Install the jake agent for the current user (Linux/WSL).
   ./install.sh                 (from a build folder)
 
 Options:
-  --hub-url <url>       the hub to attach to (default: $DEFAULT_HUB_URL)
+  --hub-url <url>       the hub to attach to${DEFAULT_HUB_URL:+ (default: $DEFAULT_HUB_URL)}
   --secret <secret>     the shared secret, matching the hub's JAKE_SECRET
   --agent-name <name>   this agent's name
   --stream-ports <list> the local ports a byte stream from the hub may reach, comma-separated, or
@@ -100,6 +104,9 @@ fi
 # --- payload: the build folder beside this script, or a download from the base -------------------
 
 fetch() { # url dest
+  if [ -z "$BASE" ]; then
+    die "this copy of the installer was not published by a hub's deployment, so it names no download address: run the install.sh your hub's download address serves, or this one from a build folder"
+  fi
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$1" -o "$2"
   elif command -v wget >/dev/null 2>&1; then

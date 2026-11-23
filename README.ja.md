@@ -11,9 +11,9 @@ jake は **bmo agent proxy** です。BMO がオーナーのリモートマシ�
 - **実行モード**:Windows ホストでは PowerShell と WSL、Linux または WSL ホストでは Linux シェル。
 - **ファイル転送**:トンネル自身のフレームでアップロードとダウンロードを行うため、scp なしでファイルがトンネルを
   通ります。
-- **ワンラインインストール**:ベース `ai.example.org/bmo/jake/` から。
-  - Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash`
-  - Windows: `powershell -c "irm https://ai.example.org/bmo/jake/install.ps1 | iex"`
+- **ワンラインインストール**:自分で運用するハブのダウンロードアドレス、つまりそのデプロイが公開する `JAKE_AGENT_DOWNLOAD_URL` から(docs/install.md)。
+  - Linux/WSL: `curl -fsSL <ダウンロードアドレス>/install.sh | bash`
+  - Windows: `powershell -c "irm <ダウンロードアドレス>/install.ps1 | iex"`
 - **デスクトップアプリ**:BMO の Web コンソールを独立したアプリにしたもので、エージェントを内蔵しています。
   インストール時に秘密の値を入力するのではなく、コンソールで承認することで参加します。
 

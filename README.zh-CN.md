@@ -9,9 +9,9 @@ jake 是一个 **bmo agent proxy**:BMO 管理其所有者远程机器时所经�
 
 - **运行模式**:在 Windows 主机上使用 PowerShell 和 WSL,在 Linux 或 WSL 主机上使用 Linux shell。
 - **文件传输**:通过隧道自身的帧进行上传和下载,文件无需 scp 即可穿过隧道。
-- **一行安装**:基础地址为 `ai.example.org/bmo/jake/`。
-  - Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash`
-  - Windows: `powershell -c "irm https://ai.example.org/bmo/jake/install.ps1 | iex"`
+- **一行安装**:从你自己运行的 hub 的下载地址安装,即其部署发布所在的 `JAKE_AGENT_DOWNLOAD_URL`(docs/install.md)。
+  - Linux/WSL: `curl -fsSL <下载地址>/install.sh | bash`
+  - Windows: `powershell -c "irm <下载地址>/install.ps1 | iex"`
 - **桌面应用**:把 BMO 的 Web 控制台做成一个独立应用,并在其中内置代理;加入方式是在控制台中批准,而不是在安装时
   输入密钥。
 

@@ -5,10 +5,12 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { publishAgents } from "../scripts/publish-agents";
+import { type Deployment, publishAgents, publishSettings } from "../scripts/publish-agents";
 import declaration from "../testbed.toml";
 
 const dirs: string[] = [];
+
+const DEPLOYMENT: Deployment = { downloadUrl: "https://downloads.example.test/jake", hubUrl: "wss://hub.example.test" };
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -28,7 +30,7 @@ describe("publishing the agent build", () => {
     mkdirSync(join(to, "desktop"));
     writeFileSync(join(to, "desktop", "latest.json"), "{}");
 
-    expect(publishAgents(from, to)).toBe("0.1.0+gnew");
+    expect(publishAgents(from, to, DEPLOYMENT)).toBe("0.1.0+gnew");
     expect(readFileSync(join(to, "jake.exe"), "utf8")).toBe("new exe");
     expect(readFileSync(join(to, "jake"), "utf8")).toBe("new elf");
     expect(readFileSync(join(to, "desktop", "latest.json"), "utf8")).toBe("{}");
@@ -38,8 +40,42 @@ describe("publishing the agent build", () => {
   test("a folder with no version file is no build, and nothing is published from it", () => {
     const from = folder({ "jake.exe": "new exe" });
     const to = folder({ "jake.exe": "old exe" });
-    expect(() => publishAgents(from, to)).toThrow("version.txt is missing");
+    expect(() => publishAgents(from, to, DEPLOYMENT)).toThrow("version.txt is missing");
     expect(readFileSync(join(to, "jake.exe"), "utf8")).toBe("old exe");
+  });
+});
+
+describe("the deployment's addresses", () => {
+  test("are written into the installers it publishes, and into nothing else", () => {
+    const script = 'BASE="@JAKE_AGENT_DOWNLOAD_URL@"\nDEFAULT_HUB_URL="@JAKE_PUBLIC_URL@"\n';
+    const from = folder({ "install.sh": script, "install.ps1": script, "INSTALL.md": script, "version.txt": "0.1.0+g1\n" });
+    const to = folder({});
+    publishAgents(from, to, DEPLOYMENT);
+    const filled = 'BASE="https://downloads.example.test/jake"\nDEFAULT_HUB_URL="wss://hub.example.test"\n';
+    expect(readFileSync(join(to, "install.sh"), "utf8")).toBe(filled);
+    expect(readFileSync(join(to, "install.ps1"), "utf8")).toBe(filled);
+    expect(readFileSync(join(to, "INSTALL.md"), "utf8")).toBe(script);
+  });
+
+  test("come from the hub's settings alone, each one missing refused by its name", () => {
+    const settings = {
+      JAKE_PUBLISH_DIR: "/srv/published/jake",
+      JAKE_AGENT_DOWNLOAD_URL: "https://downloads.example.test/jake/",
+      JAKE_PUBLIC_URL: "wss://hub.example.test",
+    };
+    expect(publishSettings(settings)).toEqual({ to: "/srv/published/jake", deployment: DEPLOYMENT });
+    for (const key of Object.keys(settings)) {
+      expect(() => publishSettings({ ...settings, [key]: "" })).toThrow(`${key} is not set in the hub's settings`);
+    }
+  });
+
+  test("stand in none of the repository's installers", () => {
+    for (const name of ["install.sh", "install.ps1"]) {
+      const text = readFileSync(join(import.meta.dir, "..", "scripts", name), "utf8");
+      expect(text).toContain("@JAKE_AGENT_DOWNLOAD_URL@");
+      expect(text).toContain("@JAKE_PUBLIC_URL@");
+      expect(text).not.toMatch(/https?:\/\/|wss:\/\//);
+    }
   });
 });
 

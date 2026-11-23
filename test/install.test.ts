@@ -5,19 +5,41 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { publishAgents } from "../scripts/publish-agents";
+
 const SCRIPT = join(import.meta.dir, "..", "scripts", "install.sh");
 const WINDOWS_SCRIPT = join(import.meta.dir, "..", "scripts", "install.ps1");
 const homes: string[] = [];
+
+// A folder holding the files given, removed after the test like a home.
+function folder(files: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), "jake-build-"));
+  homes.push(dir);
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+  return dir;
+}
 
 afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 
-// Run the installer with --print-config under `script`, so its prompts read a terminal fed `input`.
-async function run(args: string[], input: string): Promise<{ code: number; output: string }> {
+// The hub a published copy names, as a deployment's publish step writes it in.
+const PUBLISHED_HUB = "wss://hub.example.test";
+
+// Run the installer with --print-config under `script`, so its prompts read a terminal fed `input`: the
+// repository's own copy, which no deployment published, or a published one naming `PUBLISHED_HUB`.
+async function run(args: string[], input: string, published = true): Promise<{ code: number; output: string }> {
   const home = mkdtempSync(join(tmpdir(), "jake-install-"));
   homes.push(home);
-  const command = ["bash", SCRIPT, "--print-config", ...args].map((part) => `'${part}'`).join(" ");
+  let script = SCRIPT;
+  if (published) {
+    const from = folder({ "install.sh": readFileSync(SCRIPT, "utf8"), "version.txt": "0.1.0+gtest\n" });
+    script = join(home, "published");
+    mkdirSync(script);
+    publishAgents(from, script, { downloadUrl: "https://downloads.example.test/jake", hubUrl: PUBLISHED_HUB });
+    script = join(script, "install.sh");
+  }
+  const command = ["bash", script, "--print-config", ...args].map((part) => `'${part}'`).join(" ");
   const proc = Bun.spawn(["script", "-qec", command, "/dev/null"], {
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home },
     stdin: new Blob([input]),
@@ -32,12 +54,20 @@ async function run(args: string[], input: string): Promise<{ code: number; outpu
 }
 
 describe("install.sh prompts", () => {
-  test("an empty hub URL answer takes the shown default", async () => {
+  test("an empty hub URL answer takes the hub the publishing deployment wrote in", async () => {
     const { code, output } = await run([], "\nsekrit\nnode2\n");
     expect(code).toBe(0);
-    expect(output).toContain("Hub URL [default: wss://jake.example.org]:");
-    expect(output).toContain("JAKE_HUB_URL=wss://jake.example.org");
+    expect(output).toContain(`Hub URL [default: ${PUBLISHED_HUB}]:`);
+    expect(output).toContain(`JAKE_HUB_URL=${PUBLISHED_HUB}`);
     expect(output).toContain("JAKE_AGENT_NAME=node2");
+  });
+
+  test("a copy no deployment published offers no hub, and an empty answer stops the install", async () => {
+    const { code, output } = await run([], "\n", false);
+    expect(code).not.toBe(0);
+    expect(output).toContain("Hub URL: ");
+    expect(output).not.toContain("default:");
+    expect(output).toContain("JAKE_HUB_URL is required.");
   });
 
   test("the shared secret has no default and an empty answer stops the install", async () => {
@@ -46,10 +76,14 @@ describe("install.sh prompts", () => {
     expect(output).toContain("JAKE_SECRET is required.");
   });
 
-  test("without a terminal the hub URL still falls back to the default", async () => {
-    const { code, output } = await run(["--non-interactive", "--secret", "s", "--agent-name", "n"], "");
-    expect(code).toBe(0);
-    expect(output).toContain("JAKE_HUB_URL=wss://jake.example.org");
+  test("without a terminal the hub URL still falls back to the published one, and to none in a copy never published", async () => {
+    const given = ["--non-interactive", "--secret", "s", "--agent-name", "n"];
+    const published = await run(given, "");
+    expect(published.code).toBe(0);
+    expect(published.output).toContain(`JAKE_HUB_URL=${PUBLISHED_HUB}`);
+    const unpublished = await run(given, "", false);
+    expect(unpublished.code).not.toBe(0);
+    expect(unpublished.output).toContain("JAKE_HUB_URL was not provided");
   });
 
   test("the stream ports are taken as a list of port numbers, and anything else stops the install", async () => {

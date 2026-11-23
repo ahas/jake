@@ -15,30 +15,39 @@
 
 ## One-line install
 
-The install scripts and the binaries are served under `ai.example.org/bmo/jake/`, so one command
-installs from a clean machine.
+The install scripts and the binaries are served at your own hub's download address, the
+`JAKE_AGENT_DOWNLOAD_URL` its deployment publishes at (docs/deploy.md, 「9. The agent downloads」), so one
+command installs from a clean machine.
 
 - **Linux or WSL** — from a shell:
 
   ```sh
-  curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash
+  curl -fsSL <download address>/install.sh | bash
   ```
 
 - **Windows** — from a PowerShell window:
 
   ```powershell
-  powershell -c "irm https://ai.example.org/bmo/jake/install.ps1 | iex"
+  powershell -c "irm <download address>/install.ps1 | iex"
   ```
 
-The script fetches the binary for the machine's platform (`ai.example.org/bmo/jake/jake` on Linux,
-`ai.example.org/bmo/jake/jake.exe` on Windows), writes the config, registers the agent so it stays
-running, and starts it. What it needs is below.
+The script fetches the binary for the machine's platform (`jake` on Linux, `jake.exe` on Windows, under the
+same address), writes the config, registers the agent so it stays running, and starts it. What it needs is
+below.
+
+### Where the agent comes from
+
+- **The scripts in the repository name no address.** Every deployment of the hub writes its own download
+  address and its hub's public address, `JAKE_PUBLIC_URL`, into the copies it publishes. A copy no deployment
+  published downloads nothing, so it runs from a build folder alone, and it offers no hub: the hub URL must be
+  given.
 
 ## What it asks
 
 The install needs three values, and nothing more:
 
-- **Hub URL** — the hub to attach to. An empty answer takes the default, `wss://jake.example.org`.
+- **Hub URL** — the hub to attach to. An empty answer takes the hub of the deployment that published the
+  script; a copy no deployment published has none, and an empty answer stops the install.
 - **Shared secret** — the secret the hub also holds. It is not shown while typed.
 - **Agent name** — this agent's name, which is how the hub and the console tell this machine from
   the others. The hub holds one connection per name: give every machine its own, because a second
@@ -46,11 +55,11 @@ The install needs three values, and nothing more:
 
 Run interactively, the script asks for the three; the secret and the name have no default and must
 be given. On a re-run the values already in `agent.env` are offered instead, and an empty answer
-keeps them. To install without prompts, pass them as arguments (the hub URL may be left out, and
-the default is used):
+keeps them. To install without prompts, pass them as arguments (the hub URL may be left out where the
+published script names one):
 
-- Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash -s -- --hub-url wss://jake.example.org --secret '<shared secret>' --agent-name '<this agent name>'`
-- Windows: run `install.ps1` with `-HubUrl wss://jake.example.org -Secret '<shared secret>' -AgentName '<this agent name>'`.
+- Linux/WSL: `curl -fsSL <download address>/install.sh | bash -s -- --hub-url wss://<hub name> --secret '<shared secret>' --agent-name '<this agent name>'`
+- Windows: run `install.ps1` with `-HubUrl wss://<hub name> -Secret '<shared secret>' -AgentName '<this agent name>'`.
 
 The shared secret is written only to that machine's config file (`agent.env`). It is in neither the
 repository nor the executable.
@@ -171,7 +180,7 @@ server itself needs administrator rights to install, so it is a step taken by ha
 2. Run the install with the key, or add it to `~/.ssh/authorized_keys` by hand:
 
    ```sh
-   curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash -s -- --ssh-key 'ssh-ed25519 AAAA... ahas@main-host'
+   curl -fsSL <download address>/install.sh | bash -s -- --ssh-key 'ssh-ed25519 AAAA... user@main-host'
    ```
 
 3. Check that something answers: `ssh localhost true` on this machine.
@@ -224,7 +233,7 @@ commands are moving.
 ## Update
 
 An installed agent is brought to the live build without anyone at the machine. Every deployment of
-the hub publishes the agent build of the same commit to `ai.example.org/bmo/jake/`, and the hub orders
+the hub publishes the agent build of the same commit to its download address, and the hub orders
 each attached agent that runs another build onto it:
 
 - When an agent says hello, or at a later ping while it is still behind, the hub compares the version
@@ -238,7 +247,7 @@ each attached agent that runs another build onto it:
   manager own it, so it outlives the agent it stops. On Windows the runner and the install script it
   runs are handed to PowerShell as inline text, never as a `.ps1` file, so a PC whose policy blocks
   script files is updated all the same.
-- The runner waits until `ai.example.org/bmo/jake/version.txt` names the build it was ordered onto, which
+- The runner waits until `version.txt` at the download address names the build it was ordered onto, which
   the deployment publishes right after the hub comes up, and gives up after ten minutes. It then
   downloads the install script and runs it in its update mode (`--update` on Linux, `-Update` on
   Windows), the same install as by hand without a question asked: it stops

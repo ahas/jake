@@ -2,7 +2,8 @@
 
 The hub is the main-host side of the tunnel: the agent dials into it, and 비모 and the console drive
 the agent through it. This is the procedure that makes it run permanently on main-host and reachable
-from 하스's network as `jake.example.org`. The commands are given in the order they must run.
+from 하스's network at the hub's public name, `HUB_NAME` below. The commands are given in the order they
+must run.
 
 Nothing here is run as part of building the hub. Opening the firewall port, creating the DNS record,
 writing the NPM proxy host and reloading nginx, and enabling the service all change live
@@ -17,7 +18,8 @@ secret:
 - `HUB_ADDRESS` — the LAN address of main-host, the forward target of the proxy host;
 - `NPM_ADDRESS` — the LAN address of the NPM container, the one source main-host's firewall admits;
 - `PROXY_SSH` — the ssh destination of vm-host;
-- `CLOUDFLARE_ZONE_ID` — the id of the `ahas.io` zone;
+- `CLOUDFLARE_ZONE_ID` — the id of the DNS zone `HUB_NAME` stands in;
+- `HUB_NAME` — the hub's public name, the CNAME the agents dial;
 - `PUBLIC_NAME` — the router's public DDNS name the CNAME points at (`home.example.org` here).
 
 Load it into the shell before the steps below:
@@ -27,7 +29,7 @@ set -a; . ~/.local/share/jake/deploy.env; set +a
 ```
 
 The committed pieces this procedure installs: the systemd user unit `jake-hub.service`, the
-config example `hub.env.example`, the nginx template `deploy/jake.example.org.conf`, the testbed's declaration
+config example `hub.env.example`, the nginx template `deploy/hub-proxy-host.conf`, the testbed's declaration
 `testbed.toml`, and this document.
 
 ## 1. The config file
@@ -52,7 +54,8 @@ credential scoped to named agents (docs/architecture.md, 「Configuration and se
 <agent>...` then prints one, and a tool given it in `JAKE_CONTROL_CREDENTIAL` reaches those agents alone. `JAKE_REVERSE_TARGETS` is
 optional too: the `host:port` targets, comma separated, a stream back from an agent may reach (docs/architecture.md,
 「Carrying a byte stream back」); left out, none may. `JAKE_SECRET` and
-`JAKE_CONTROL_TOKEN` are required and have no default; leave the others commented to
+`JAKE_CONTROL_TOKEN` are required and have no default, and so are the deployment's three addresses:
+`JAKE_AGENT_DOWNLOAD_URL`, `JAKE_PUBLISH_DIR` and `JAKE_PUBLIC_URL` (section 9). Leave the others commented to
 take their defaults. The hub listens on `JAKE_HUB_PORT` (8790 by default) bound to `JAKE_HUB_HOST`
 (0.0.0.0, so it accepts the connection NPM forwards). If you change the port here, change it in the
 nginx template in step 5 too — the two must agree. Record the same `JAKE_SECRET` in the agent's
@@ -102,19 +105,19 @@ sudo ufw allow from "$NPM_ADDRESS" to any port 8790 proto tcp comment 'jake hub 
 ```
 
 Without this rule the hub answers on loopback but NPM's connection hangs, and a request to
-`jake.example.org` times out rather than failing outright.
+`HUB_NAME` times out rather than failing outright.
 
 ## 4. The DNS record
 
-Add a CNAME `jake.example.org` -> `PUBLIC_NAME`, DNS only (not proxied), in the `ahas.io` zone with the
-Cloudflare API token.
+Add a CNAME `HUB_NAME` -> `PUBLIC_NAME`, DNS only (not proxied), in its zone with the Cloudflare API
+token.
 
 ```sh
 curl -s -X POST \
   "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
   -H "Authorization: Bearer $(cat ~/.config/cloudflare/token)" \
   -H "Content-Type: application/json" \
-  --data '{"type":"CNAME","name":"jake","content":"'"$PUBLIC_NAME"'","proxied":false,"ttl":1}'
+  --data '{"type":"CNAME","name":"'"$HUB_NAME"'","content":"'"$PUBLIC_NAME"'","proxied":false,"ttl":1}'
 ```
 
 ## 5. The NPM proxy host
@@ -128,7 +131,7 @@ Insert the row (forwarding to main-host at `HUB_ADDRESS` on the hub's port, the 
 upgrade on), and print the new id:
 
 ```sh
-ssh "$PROXY_SSH" "pct exec 109 -- env HUB_ADDRESS=$HUB_ADDRESS node -" <<'JS'
+ssh "$PROXY_SSH" "pct exec 109 -- env HUB_ADDRESS=$HUB_ADDRESS HUB_NAME=$HUB_NAME node -" <<'JS'
 const sqlite3 = require("/app/node_modules/sqlite3");
 const db = new sqlite3.Database("/data/database.sqlite");
 const now = new Date().toISOString().slice(0, 19).replace("T", " ");
@@ -141,7 +144,7 @@ db.run(
    VALUES (?,?,1,0,?,?,?,0,76,1,0,0,?,?,1,1,'http',1,'[]',0,0)`,
   [
     now, now,
-    JSON.stringify(["jake.example.org"]),
+    JSON.stringify([process.env.HUB_NAME]),
     process.env.HUB_ADDRESS, 8790,
     "client_max_body_size 0;\nproxy_buffering off;\nproxy_request_buffering off;\nproxy_read_timeout 3600s;\nproxy_send_timeout 3600s;",
     JSON.stringify({ letsencrypt_agree: false, dns_challenge: false, nginx_online: true, nginx_err: null }),
@@ -155,29 +158,29 @@ db.run(
 JS
 ```
 
-Take the printed id. Substitute it for `HOSTID` in the committed template, and `HUB_ADDRESS` from the
-local settings for the template's `HUB_ADDRESS` placeholder, write the result to the container as
+Take the printed id. Substitute it for `HOSTID` in the committed template, and `HUB_ADDRESS` and `HUB_NAME`
+from the local settings for the template's placeholders of the same names, write the result to the container as
 `<id>.conf`, then check and reload nginx:
 
 ```sh
 ID=<the id printed above>
-sed -e "s/HOSTID/$ID/g" -e "s/HUB_ADDRESS/$HUB_ADDRESS/g" ~/repos/ahas/jake/deploy/jake.example.org.conf \
+sed -e "s/HOSTID/$ID/g" -e "s/HUB_ADDRESS/$HUB_ADDRESS/g" -e "s/HUB_NAME/$HUB_NAME/g" \
+  ~/repos/ahas/jake/deploy/hub-proxy-host.conf \
   | ssh "$PROXY_SSH" "pct exec 109 -- sh -c 'cat > /data/nginx/proxy_host/$ID.conf'"
 ssh "$PROXY_SSH" "pct exec 109 -- sh -c 'nginx -t && nginx -s reload'"
 ```
 
 The port in the template must equal `JAKE_HUB_PORT` from step 1 and the port opened in step 3. The
-certificate needs nothing new: 76 is the live `ahas.io, *.ahas.io` wildcard, and `jake.example.org` is
-covered by it.
+certificate needs nothing new where certificate 76, the live wildcard of the zone, covers `HUB_NAME`.
 
 ## 6. Verify
 
 ```sh
 systemctl --user status jake-hub                 # active (running)
 jake-hub up                                      # both ports answer as the hub does
-curl -sI https://jake.example.org/                   # HTTP 401 — the hub answers, and wants the secret
+curl -sI "https://$HUB_NAME/"                    # HTTP 401 — the hub answers, and wants the secret
 curl -sI -H "Authorization: Bearer $(grep '^JAKE_SECRET=' ~/.local/share/jake/hub.env | cut -d= -f2)" \
-  https://jake.example.org/                          # HTTP 426 — authorized, expecting a WS upgrade
+  "https://$HUB_NAME/"                           # HTTP 426 — authorized, expecting a WS upgrade
 bun ~/repos/ahas/jake/src/console/main.ts status   # every attached agent, one line each
 ```
 
@@ -250,20 +253,31 @@ The declaration says the rest:
 
 ## 9. The agent downloads
 
-The one-line install reads `https://ai.example.org/bmo/jake/`, which main-host's own nginx serves from
-`/var/www/ahas-ai/bmo/jake/`. A deployment writes there itself, so the folder belongs to the account
-the testbed runs as, with the web server's group, the same as the desktop app's mirror folder inside it
-(docs/desktop.md, 「Making a release」).
-Hand it over once, before the first deployment that publishes:
+The download is the deployment's own, named by three settings of `hub.env` that have no default, since no
+deployment's address stands in for another's:
+
+- `JAKE_PUBLISH_DIR` — the folder every deployment publishes into, which this machine's web server serves;
+- `JAKE_AGENT_DOWNLOAD_URL` — the HTTPS address it is served at, which the one-line install reads and the hub
+  orders its agents to download from;
+- `JAKE_PUBLIC_URL` — the `wss://` address of `HUB_NAME`, the hub the published installers offer as their default.
+
+The install verb writes all three from its inputs `jake.publish-folder`, `jake.download-address` and
+`jake.public-name` (`install.toml`); a hub file written before them gets each added by hand. The hub refuses to
+start without `JAKE_AGENT_DOWNLOAD_URL` while it orders agents onto its build, and the publish step refuses
+without any of the three. A deployment writes into the folder itself, so it belongs to the account the testbed runs
+as, with the web server's group, the same as the desktop app's mirror folder inside it (docs/desktop.md, 「Making
+a release」). Hand it over once, before the first deployment that publishes:
 
 ```sh
-sudo chown -R ahas:www-data /var/www/ahas-ai/bmo/jake
-sudo chmod 2775 /var/www/ahas-ai/bmo/jake
+dir="$(sed -n 's/^JAKE_PUBLISH_DIR=//p' ~/.local/share/jake/hub.env)"
+sudo chown -R "$(id -un)":www-data "$dir"
+sudo chmod 2775 "$dir"
 ```
 
 The deployment's `publish-agents` step runs `bun scripts/publish-agents.ts` from the release, after
-the health. It copies each file of the release's `agents/` into the folder under a temporary name and
-renames it over the old one, so a download in progress reads one whole file or the other, and it
+the health. It copies each file of the release's `agents/` into the folder under a temporary name, the two
+install scripts with the deployment's `JAKE_AGENT_DOWNLOAD_URL` and `JAKE_PUBLIC_URL` written over the marks that
+stand for them, and renames it over the old one, so a download in progress reads one whole file or the other, and it
 writes `version.txt` last. Whoever reads `version.txt` and finds the version he wants can then fetch
 every other file of that build. The `desktop/` folder beside them is left alone.
 

@@ -12,9 +12,10 @@ to.
 - **Run modes** — PowerShell and WSL on a Windows host, and a Linux shell on a Linux or WSL host.
 - **File transfer** — upload and download over the tunnel's own frames, so a file crosses the tunnel
   without scp.
-- **One-line install** — from base `ai.example.org/bmo/jake/`:
-  - Linux/WSL: `curl -fsSL https://ai.example.org/bmo/jake/install.sh | bash`
-  - Windows: `powershell -c "irm https://ai.example.org/bmo/jake/install.ps1 | iex"`
+- **One-line install** — from your own hub's download address, the `JAKE_AGENT_DOWNLOAD_URL` its deployment
+  publishes at (docs/install.md):
+  - Linux/WSL: `curl -fsSL <download address>/install.sh | bash`
+  - Windows: `powershell -c "irm <download address>/install.ps1 | iex"`
 - **Desktop app** — BMO's web console as an app of its own that carries the agent inside it, joined
   by approving it in the console rather than by a secret typed at install.
 
