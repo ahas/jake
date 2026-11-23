@@ -568,7 +568,9 @@ section.
   build as its path and the password through its variable, printing neither. Where either file is
   missing the release stops before building.
 - **Every installer and every signature must come from this run:** a file the build did not write
-  afresh stops the release, so a stale build is never published under a new version.
+  afresh stops the release, so a stale build is never published under a new version. Each is taken into the
+  release's own folder as soon as its build ends, since the next app's build of the same format clears the
+  bundle folder it was written into.
 - **A stable release is published whole at once:** it is made a draft at the checkout's commit holding
   its installers, their signatures, its feeds and the read with the published `nightly` kept, and then
   published as the latest, so its feed never names a file that is not yet there. The commit must be on

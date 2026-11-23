@@ -243,13 +243,18 @@ interface Release {
   readonly override: readonly string[];
 }
 
-/** Runs one build of one app and returns its installers, each written by this run and signed. */
+/**
+ * Runs one build of one app and returns its installers, each written by this run, signed, and copied with its
+ * signature into `collected` under its published name at once, since the next app's build of the same format
+ * clears the bundle folder it was written into.
+ */
 function runBuild(
   config: AppConfig,
   build: Build,
   release: Release,
   env: NodeJS.ProcessEnv,
   targetDir: string,
+  collected: string,
 ): BuiltInstaller[] {
   console.log(`· building the ${config.app.name} for ${build.name}`);
   const startedAt = Date.now();
@@ -274,13 +279,17 @@ function runBuild(
         throw new Error(`the ${config.app.name}'s ${build.name} build did not write ${written}`);
       }
     }
+    const file = assetName(kind.fileName(config.product, release.version));
+    const kept = join(collected, file);
+    copyFileSync(path, kept);
+    copyFileSync(`${path}.sig`, `${kept}.sig`);
     return {
       kind,
-      file: assetName(kind.fileName(config.product, release.version)),
-      size: statSync(path).size,
-      sha256: sha256Of(path),
-      signature: readFileSync(`${path}.sig`, "utf8").trim(),
-      path,
+      file,
+      size: statSync(kept).size,
+      sha256: sha256Of(kept),
+      signature: readFileSync(`${kept}.sig`, "utf8").trim(),
+      path: kept,
     };
   });
 }
@@ -421,19 +430,15 @@ function main(): void {
     override: channel === "nightly" ? ["--config", JSON.stringify({ version })] : [],
   };
   const targetDir = cargoTargetDir();
+  mkdirSync(staging, { recursive: true });
   const built: AppBuilt[] = configs.map((config) => ({
     app: config.app,
     feedFile: config.feed.file,
-    installers: BUILDS.flatMap((build) => runBuild(config, build, release, env, targetDir)),
+    installers: BUILDS.flatMap((build) => runBuild(config, build, release, env, targetDir, staging)),
   }));
 
   const date = new Date();
   const { release: read, feeds } = releaseReads(version, date, assetBaseUrl(repository, tag), built);
-  mkdirSync(staging, { recursive: true });
-  for (const { path, file } of everyInstaller(built)) {
-    copyFileSync(path, join(staging, file));
-    copyFileSync(`${path}.sig`, join(staging, `${file}.sig`));
-  }
   writeFileSync(publication.ownRead, json(read));
   for (const { file, feed } of feeds) {
     writeFileSync(join(staging, file), json(feed));
