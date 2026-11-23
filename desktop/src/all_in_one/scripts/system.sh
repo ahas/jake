@@ -7,7 +7,7 @@ home="$(getent passwd "$account" | cut -d: -f6)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q git build-essential pkg-config libssl-dev curl jq ca-certificates unzip xz-utils tmux ffmpeg \
-  rsync xvfb poppler-utils gnome-remote-desktop
+  rsync zstd xvfb poppler-utils gnome-remote-desktop
 command -v psql >/dev/null || apt-get install -y -q postgresql postgresql-contrib
 command -v valkey-server >/dev/null || command -v redis-server >/dev/null \
   || apt-get install -y -q valkey-server || apt-get install -y -q redis-server

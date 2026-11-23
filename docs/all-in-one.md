@@ -119,7 +119,7 @@ flowchart TD
   values they need, which go to the same screens and back to the plan.
 - **Prerequisites.** Everything the preset's `needs:` lines name that a script can install is installed on one
   press. As root, asked through the system's own prompt (`pkexec` on Linux) and never through the app: the
-  system's packages of `INSTALL.md` 「Install the prerequisites」 with tmux, ffmpeg, rsync, Xvfb, Poppler's
+  system's packages of `INSTALL.md` 「Install the prerequisites」 with tmux, ffmpeg, rsync, zstd, Xvfb, Poppler's
   utilities and gnome-remote-desktop, Google Chrome from Google's package where neither it nor an opened Firefox
   snap stands, and PostgreSQL and Valkey started where no systemd starts them. For the account, in its own folders:
   Rust and Bun by their own installers, Zig at the version herdr's build names, checked against Zig's download
