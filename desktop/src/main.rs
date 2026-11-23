@@ -3,6 +3,7 @@
 
 mod awake;
 mod bridge;
+mod channel;
 mod controller;
 mod follow;
 mod navigation;
@@ -28,18 +29,19 @@ use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::{mpsc, watch};
 use url::Url;
 
+use crate::channel::{Channel, Feeds};
 use crate::controller::{Controller, show_console};
 use crate::follow::follow;
 use crate::navigation::Navigation;
 use crate::pairing::Console;
-use crate::settings::{SettingsFile, SettingsView, Switch, Switches};
+use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch, Switches};
 use crate::sign_in::{Alignment, Registration};
 use crate::status::{AgentState, Status, View};
 use crate::vault::Vault;
 
 const MAIN_WINDOW: &str = "main";
 const TRAY: &str = "tray";
-/// How often a running app asks the update feed.
+/// How often a running app asks its channel's update feed.
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What the commands, the tray and the quit share.
@@ -52,6 +54,8 @@ struct Shared {
   course: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
   settings: Mutex<SettingsFile>,
   switches: watch::Sender<Switches>,
+  /// The update channel, which the updates follow.
+  channel: watch::Sender<Channel>,
   /// Held so the lock's watch stays open on a platform that reports no lock.
   _locked: watch::Sender<bool>,
   /// The tray's starting-at-sign-in item, kept in step with the console's section.
@@ -100,18 +104,40 @@ fn settings(shared: State<'_, Shared>) -> SettingsView {
   settings_view(&shared)
 }
 
-/// Turn one setting on or off; it is written and takes effect at once. The key and the value are read
-/// as a switch and a boolean or the call is refused, and a switch this platform does not offer is
-/// refused before anything is written.
+/// Change one setting, a switch turned on or off or the update channel chosen; it is written and takes
+/// effect at once. The key is read as a switch's or the channel's, `on` as a boolean and `value` as a
+/// channel, or the call is refused; a key given the other's value, or none, and a switch this platform
+/// does not offer are refused before anything is written.
 #[tauri::command]
-async fn change_setting(app: AppHandle, setting: Switch, on: bool) -> Result<SettingsView, String> {
-  change(&app, setting.offered_here()?, on)?;
+async fn change_setting(
+  app: AppHandle,
+  setting: Key,
+  on: Option<bool>,
+  value: Option<Channel>,
+) -> Result<SettingsView, String> {
+  match Change::read(setting, on, value)? {
+    Change::Switch(switch, on) => change(&app, switch, on)?,
+    Change::Channel(channel) => change_channel(&app, channel)?,
+  }
   Ok(settings_view(&app.state::<Shared>()))
 }
 
 fn settings_view(shared: &Shared) -> SettingsView {
   let file = shared.settings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-  shared.switches.borrow().view(file.unreadable())
+  shared.switches.borrow().view(*shared.channel.borrow(), file.unreadable())
+}
+
+/// Write the update channel and hand it to the updates, which ask its feed at once.
+fn change_channel(app: &AppHandle, channel: Channel) -> Result<(), String> {
+  let shared = app.state::<Shared>();
+  let mut file = shared.settings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+  if let Some(reason) = file.unreadable() {
+    return Err(reason.to_owned());
+  }
+  file.set_channel(channel)?;
+  drop(file);
+  shared.channel.send_replace(channel);
+  Ok(())
 }
 
 /// Write a setting and hand it to what acts on it; starting at sign-in is registered first, and a
@@ -332,17 +358,23 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
   Ok(autostart)
 }
 
-/// Ask the update feed now and every few hours; an update whose signature verifies is installed and
-/// the app starts again on it.
-async fn keep_updated(app: AppHandle, log: Log) {
+/// Ask the channel's update feed now, every few hours and whenever the channel changes; an update whose
+/// signature verifies is installed and the app starts again on it. An update is taken only above the
+/// running version, so a channel changed to stable waits for a release above the nightly it runs.
+async fn keep_updated(app: AppHandle, log: Log, feeds: Feeds, mut channel: watch::Receiver<Channel>) {
   loop {
-    let found = match app.updater() {
+    let following = *channel.borrow_and_update();
+    let found = match app
+      .updater_builder()
+      .endpoints(vec![feeds.of(following).clone()])
+      .and_then(|builder| builder.build())
+    {
       Ok(updater) => updater.check().await.map_err(|error| error.to_string()),
       Err(error) => Err(error.to_string()),
     };
     match found {
       Ok(Some(update)) => {
-        log.info("update-found", json!({ "version": update.version }));
+        log.info("update-found", json!({ "version": update.version, "channel": following }));
         match update.download_and_install(|_, _| {}, || {}).await {
           Ok(()) => {
             stop_then(&app, |app| app.restart());
@@ -352,13 +384,20 @@ async fn keep_updated(app: AppHandle, log: Log) {
         }
       }
       Ok(None) => {}
-      Err(error) => log.warn("update-check-failed", json!({ "error": error })),
+      Err(error) => log.warn("update-check-failed", json!({ "channel": following, "error": error })),
     }
-    tokio::time::sleep(UPDATE_EVERY).await;
+    tokio::select! {
+      () = tokio::time::sleep(UPDATE_EVERY) => {}
+      changed = channel.changed() => {
+        if changed.is_err() {
+          return;
+        }
+      }
+    }
   }
 }
 
-fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Box<dyn std::error::Error>> {
   let log = Log::open(app.path().app_local_data_dir()?.join("agent.log"));
   let mut file = SettingsFile::open(&app.path().app_config_dir()?);
   if let Some(reason) = file.unreadable() {
@@ -379,6 +418,7 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
   let autostart = tray(app, switches.on(Switch::StartAtSignIn))?;
 
   let switches = watch::Sender::new(switches);
+  let channel = watch::Sender::new(settings.channel);
   let locked = watch::Sender::new(false);
   session::report(locked.clone(), log.clone());
   let paused = watch::Sender::new(false);
@@ -428,8 +468,17 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
     }
     .run(),
   );
-  if updates {
-    tauri::async_runtime::spawn(keep_updated(app.handle().clone(), log.clone()));
+  match updates {
+    Some(Ok(feeds)) => {
+      tauri::async_runtime::spawn(keep_updated(
+        app.handle().clone(),
+        log.clone(),
+        feeds,
+        channel.subscribe(),
+      ));
+    }
+    Some(Err(reason)) => log.warn("update-feed-unreadable", json!({ "reason": reason })),
+    None => {}
   }
   app.manage(Shared {
     console,
@@ -440,6 +489,7 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
     course: Mutex::new(Some(course)),
     settings: Mutex::new(file),
     switches,
+    channel,
     _locked: locked,
     autostart,
     registration,
@@ -449,11 +499,13 @@ fn setup(app: &mut App, updates: bool) -> Result<(), Box<dyn std::error::Error>>
 
 fn main() {
   let context = tauri::generate_context!();
-  // The updater runs only once the owner's public key is written into the configuration.
-  let updates = context.config().plugins.0.contains_key("updater");
+  // The updater runs only once the owner's public key is written into the configuration, and reads the
+  // feed of the channel the settings name beside the endpoint it gives (docs/desktop.md, 「The update
+  // channel」).
+  let updates = context.config().plugins.0.get("updater").map(Feeds::from_updater_config);
   let mut builder =
     tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)));
-  if updates {
+  if updates.is_some() {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }
   let app = builder

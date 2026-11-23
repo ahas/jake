@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use url::Url;
 
+use crate::channel::Channel;
+
 /// The console the deployment serves, which the window opens unless the settings name another.
 pub const DEFAULT_CONSOLE_URL: &str = "https://ai.example.org/bmo/";
 const CONSOLE_KEY: &str = "consoleUrl";
+const CHANNEL_KEY: &str = "updateChannel";
 const FILE_NAME: &str = "settings.json";
 /// The byte-order mark Windows editors and PowerShell write before UTF-8.
 const BYTE_ORDER_MARK: &[u8] = b"\xEF\xBB\xBF";
@@ -73,6 +76,42 @@ impl Switch {
   }
 }
 
+/// A setting's key over the bridge: a switch's, or the update channel's; any other is refused as the call
+/// is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Key {
+  Switch(Switch),
+  Channel(ChannelKey),
+}
+
+/// The update channel's one key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelKey {
+  UpdateChannel,
+}
+
+/// One change the console asks for, checked before anything is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+  Switch(Switch, bool),
+  Channel(Channel),
+}
+
+impl Change {
+  /// The change a call names: a switch this platform offers with `on`, or the channel with `value`;
+  /// either given the other's value, or none, is refused.
+  pub fn read(key: Key, on: Option<bool>, value: Option<Channel>) -> Result<Self, String> {
+    match (key, on, value) {
+      (Key::Switch(switch), Some(on), None) => Ok(Self::Switch(switch.offered_here()?, on)),
+      (Key::Switch(switch), _, _) => Err(format!("{} takes on, true or false, and no value", switch.key())),
+      (Key::Channel(_), None, Some(channel)) => Ok(Self::Channel(channel)),
+      (Key::Channel(_), _, _) => Err(format!("{CHANNEL_KEY} takes a value, stable or nightly, and no on")),
+    }
+  }
+}
+
 /// The switches as the file states them; one it does not state runs on its default.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Switches(BTreeMap<Switch, bool>);
@@ -95,12 +134,13 @@ impl Switches {
   }
 }
 
-/// The settings as the console draws them: the switches this platform offers, why the file cannot be
-/// changed, where it cannot, and who draws the window's controls.
+/// The settings as the console draws them: the switches this platform offers, the update channel, why
+/// the file cannot be changed, where it cannot, and who draws the window's controls.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
   pub switches: Vec<SwitchView>,
+  pub update_channel: Channel,
   pub unreadable: Option<String>,
   pub window_controls: WindowControls,
 }
@@ -132,8 +172,8 @@ pub struct SwitchView {
 }
 
 impl Switches {
-  /// The console's view of these switches, with the file's reason where it cannot be read.
-  pub fn view(&self, unreadable: Option<&str>) -> SettingsView {
+  /// The console's view of these switches and the channel, with the file's reason where it cannot be read.
+  pub fn view(&self, channel: Channel, unreadable: Option<&str>) -> SettingsView {
     let offered = Switch::ALL.into_iter().filter(|switch| switch.offered());
     SettingsView {
       switches: offered
@@ -142,6 +182,7 @@ impl Switches {
           on: self.on(switch),
         })
         .collect(),
+      update_channel: channel,
       unreadable: unreadable.map(str::to_owned),
       window_controls: WindowControls::here(),
     }
@@ -154,6 +195,7 @@ pub struct Settings {
   /// The console's address, ending in a slash so its API paths join onto it.
   pub console: Url,
   pub switches: Switches,
+  pub channel: Channel,
 }
 
 impl Settings {
@@ -162,6 +204,7 @@ impl Settings {
     Self {
       console: console_url(DEFAULT_CONSOLE_URL).expect("the default console address is well-formed"),
       switches: Switches::default(),
+      channel: Channel::default(),
     }
   }
 
@@ -180,9 +223,15 @@ impl Settings {
         Some(_) => return Err(format!("{key} is not true or false")),
       }
     }
+    let channel = match document.get(CHANNEL_KEY) {
+      None => Channel::default(),
+      Some(value) => serde_json::from_value(value.clone())
+        .map_err(|_| format!("{CHANNEL_KEY} is neither stable nor nightly"))?,
+    };
     Ok(Self {
       console: console_url(console)?,
       switches,
+      channel,
     })
   }
 }
@@ -218,13 +267,26 @@ impl SettingsFile {
   /// State a switch and write the whole file at once, keeping every other key as it was read; the
   /// switches as they now stand.
   pub fn set(&mut self, switch: Switch, on: bool) -> Result<Switches, String> {
-    let (document, settings) = self.kept.as_mut().map_err(|reason| reason.clone())?;
-    let mut changed = document.clone();
-    changed.insert(switch.key(), Value::Bool(on));
-    write(&self.path, &changed).map_err(|error| format!("{}: {error}", self.path.display()))?;
-    *document = changed;
+    let settings = self.write_key(switch.key(), Value::Bool(on))?;
     settings.switches = std::mem::take(&mut settings.switches).with(switch, on);
     Ok(settings.switches.clone())
+  }
+
+  /// State the update channel and write the whole file at once, keeping every other key as it was read.
+  pub fn set_channel(&mut self, channel: Channel) -> Result<(), String> {
+    let value = serde_json::to_value(channel).map_err(|error| error.to_string())?;
+    self.write_key(CHANNEL_KEY.to_owned(), value)?.channel = channel;
+    Ok(())
+  }
+
+  /// Write one key into the file as read, replacing it whole; the settings to bring into line with it.
+  fn write_key(&mut self, key: String, value: Value) -> Result<&mut Settings, String> {
+    let (document, settings) = self.kept.as_mut().map_err(|reason| reason.clone())?;
+    let mut changed = document.clone();
+    changed.insert(key, value);
+    write(&self.path, &changed).map_err(|error| format!("{}: {error}", self.path.display()))?;
+    *document = changed;
+    Ok(settings)
   }
 }
 
@@ -331,6 +393,7 @@ mod tests {
     let on: Vec<bool> = Switch::ALL.iter().map(|switch| settings.switches.on(*switch)).collect();
     assert_eq!(on, [true, true, false, false, false]);
     assert_eq!(settings.switches.stated(Switch::StartAtSignIn), None);
+    assert_eq!(settings.channel, Channel::Stable);
   }
 
   #[test]
@@ -364,6 +427,8 @@ mod tests {
     for (name, text) in [
       ("settings-broken", "{"),
       ("settings-wrong-type", r#"{"consoleUrl":"https://console.example/","closeToTray":"no"}"#),
+      ("settings-no-channel", r#"{"updateChannel":"beta"}"#),
+      ("settings-channel-type", r#"{"updateChannel":true}"#),
     ] {
       let dir = Dir::holding(name, text);
       let mut file = SettingsFile::open(&dir.0);
@@ -371,6 +436,7 @@ mod tests {
       assert!(file.unreadable().unwrap().contains(FILE_NAME), "{name}");
       assert_eq!(file.settings().console.as_str(), DEFAULT_CONSOLE_URL, "{name}");
       assert!(file.set(Switch::KeepAwake, true).is_err(), "{name}");
+      assert!(file.set_channel(Channel::Nightly).is_err(), "{name}");
       assert_eq!(std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap(), text, "{name}");
     }
   }
@@ -396,6 +462,64 @@ mod tests {
     let reopened = SettingsFile::open(&dir.0).settings();
     assert!(!reopened.switches.on(Switch::CloseToTray));
     assert!(!dir.0.join("settings.json.new").exists());
+  }
+
+  #[test]
+  fn the_channel_is_written_at_once_and_read_back() {
+    let dir = Dir::holding("settings-channel", r#"{"closeToTray":false}"#);
+    let mut file = SettingsFile::open(&dir.0);
+    file.set_channel(Channel::Nightly).unwrap();
+
+    assert_eq!(file.settings().channel, Channel::Nightly);
+    assert_eq!(dir.file(), serde_json::json!({ "closeToTray": false, "updateChannel": "nightly" }));
+    let reopened = SettingsFile::open(&dir.0).settings();
+    assert_eq!(reopened.channel, Channel::Nightly);
+    assert!(!reopened.switches.on(Switch::CloseToTray));
+  }
+
+  #[test]
+  fn the_bridge_reads_a_key_as_a_switch_or_the_channel_alone() {
+    let read = |value: Value| serde_json::from_value::<Key>(value);
+
+    assert_eq!(read(Value::from("keepAwake")).unwrap(), Key::Switch(Switch::KeepAwake));
+    assert_eq!(read(Value::from("updateChannel")).unwrap(), Key::Channel(ChannelKey::UpdateChannel));
+    for refused in [
+      Value::from("consoleUrl"),
+      Value::from("UpdateChannel"),
+      Value::from("update_channel"),
+      Value::from(""),
+      Value::from(1),
+      Value::Null,
+    ] {
+      assert!(read(refused.clone()).is_err(), "{refused}");
+    }
+  }
+
+  #[test]
+  fn a_change_takes_on_for_a_switch_and_a_value_for_the_channel() {
+    let channel = Key::Channel(ChannelKey::UpdateChannel);
+    let switch = Key::Switch(Switch::CloseToTray);
+
+    assert_eq!(
+      Change::read(channel, None, Some(Channel::Nightly)).unwrap(),
+      Change::Channel(Channel::Nightly)
+    );
+    assert_eq!(
+      Change::read(switch, Some(false), None).unwrap(),
+      Change::Switch(Switch::CloseToTray, false)
+    );
+    for (key, on, value) in [
+      (channel, None, None),
+      (channel, Some(true), None),
+      (channel, Some(true), Some(Channel::Stable)),
+      (switch, None, None),
+      (switch, None, Some(Channel::Stable)),
+      (switch, Some(true), Some(Channel::Stable)),
+    ] {
+      assert!(Change::read(key, on, value).is_err(), "{key:?} {on:?} {value:?}");
+    }
+    let windows_only = Change::read(Key::Switch(Switch::KeepAwake), Some(true), None);
+    assert_eq!(windows_only.is_ok(), cfg!(windows));
   }
 
   #[test]
@@ -434,7 +558,7 @@ mod tests {
   #[test]
   fn the_view_holds_the_offered_switches_and_who_draws_the_controls() {
     let switches = Switches::default().with(Switch::CloseToTray, false);
-    let view = serde_json::to_value(switches.view(Some("unreadable"))).unwrap();
+    let view = serde_json::to_value(switches.view(Channel::Nightly, Some("unreadable"))).unwrap();
     let offered: Vec<Value> = Switch::ALL
       .into_iter()
       .filter(|switch| switch.offered())
@@ -442,6 +566,7 @@ mod tests {
       .collect();
 
     assert_eq!(view["switches"], Value::Array(offered));
+    assert_eq!(view["updateChannel"], "nightly");
     assert_eq!(view["unreadable"], "unreadable");
     let controls = if cfg!(target_os = "macos") { "inset" } else { "console" };
     assert_eq!(view["windowControls"], controls);

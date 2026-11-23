@@ -20,7 +20,7 @@ to it.
   starting at sign-in on and off, and quits. Quitting stops the agent.
 - **Settings of its own,** set in the console's own settings while the console runs in the app:
   whether control is kept while the PC is locked, what closing the window does, starting at sign-in,
-  starting in the tray, and keeping the PC awake (「Settings」).
+  starting in the tray, keeping the PC awake, and which channel its updates come from (「Settings」).
 - **One copy at a time.** A second launch brings the running copy's window forward and exits, since two
   copies would hold one name twice.
 
@@ -162,14 +162,15 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
 | `startAtSignIn` | Start the app when the person signs in | off | every platform |
 | `startInTray` | Start in the tray, with no window, when started at sign-in | off | every platform |
 | `keepAwake` | Keep the PC from sleeping while the built-in agent serves | off | Windows |
+| `updateChannel` | The channel updates come from, `stable` or `nightly` (「The update channel」) | `stable` | every platform |
 | `consoleUrl` | The console's address | `https://ai.example.org/bmo/` | the file alone |
 
 ### Reading and writing
 
-- **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON or
-  a value of the wrong type, leaves the app on its defaults with the reason in its log, and the
-  console's section then says the file cannot be read and the app changes nothing, since writing it
-  would overwrite the hand edit it could not read.
+- **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON, a
+  value of the wrong type or a channel that is neither `stable` nor `nightly`, leaves the app on its
+  defaults with the reason in its log, and the console's section then says the file cannot be read and
+  the app changes nothing, since writing it would overwrite the hand edit it could not read.
 - **A byte-order mark at the file's start is read past,** since Windows editors and PowerShell write
   one before UTF-8; the app writes none.
 - **A change is written the moment it is made,** the whole file replaced by a rename, so a reader never
@@ -177,7 +178,8 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   version wrote survives an older one.
 - **Every setting takes effect at once,** with no restart: each is read again where it acts, at the next
   close of the window, the next lock of the session, the next sign-in, or at once where it holds
-  something now (starting at sign-in, keeping awake).
+  something now (starting at sign-in, keeping awake, and the update channel, whose change asks its feed
+  at once).
 - **The console's address is not in the console's section.** Another address is another console, whose pairing
   the stored credential does not answer to, so it stays a hand edit read at start.
 
@@ -210,6 +212,23 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   they always do, and the tray opens the window. Started by hand, the app always opens its window. A
   pairing needs the person, so one that opens shows the window however the app was started.
 
+### The update channel
+
+- **Two channels, each with a feed of its own** (「Releases」). `stable` takes the set's releases alone,
+  the versions the owner declares; `nightly` takes the day's build between releases as well, named
+  `<next minor>-nightly.<YYYYMMDD>`, as bmo-chat's `docs/conventions.md` 「Versions」 states. `stable` is
+  the default, and a file that names no channel runs on it.
+- **The app asks its channel's feed,** the address Tauri's updater is given at each check: the stable
+  feed is the configuration's own updater endpoint, and the nightly feed is `nightly/latest.json` beside
+  it. A change of channel asks the new channel's feed at once, and from then on at the usual times.
+- **An update is taken only where its version is higher than the running one,** by semver, on either
+  channel. Semver orders a nightly before the release it leads to and after the release before it, so:
+  - **Stable to nightly** takes the newest nightly at once, since it stands above the release it follows.
+  - **Nightly to stable never goes back.** The installed nightly stays until a release higher than it is
+    published: a nightly of `1.1.0` is replaced by `1.1.0` or a later release, never by the `1.0.0` it
+    followed. To return to a stable version at once, the person installs it by hand from the download
+    page.
+
 ### Where the settings are set
 
 - **In the console's own settings, in a section of their own that stands only in the app's window.**
@@ -217,11 +236,11 @@ The app's settings are kept in its `settings.json`, the file that holds the cons
   what the console may call」); in a browser no bridge answers and the section is not there. The
   section's wording and layout are the console's (its `docs/web.md`, 「Settings」).
 - **What the bridge hands the console is what the section draws:** the switches this platform offers,
-  each with its value, and why the file cannot be changed, where it cannot. Only the settings the
-  platform offers are handed over, so only those are drawn.
-- **Each switch takes effect and is written the moment it is turned;** nothing is held unsaved. A
-  change that fails leaves the saved value standing and answers with the reason, which the console
-  shows beside the switch.
+  each with its value, the update channel, and why the file cannot be changed, where it cannot. Only the
+  settings the platform offers are handed over, so only those are drawn.
+- **Each switch and the channel take effect and are written the moment they are changed;** nothing is
+  held unsaved. A change that fails leaves the saved value standing and answers with the reason, which
+  the console shows beside the setting.
 - **The app keeps no settings screen of its own.** Every setting acts while the app runs whether the
   console is shown or not, and each is reached in the console as soon as it loads; starting at sign-in
   is also the tray's check item, and quitting the tray's. While the console cannot be reached the local
@@ -333,13 +352,16 @@ processes and its network stay as they were.
   path. The scope follows `consoleUrl` as the app read it at start, since the capability is built from
   it then.
 - **The bridge holds two of the app's commands and the window's own controls:**
-  - `settings` reads the settings: each switch the platform offers with its value, why the file
-    cannot be changed where it cannot, and `windowControls`, `console` where the page draws the
-    window's controls and `inset` where the system's stand inset at the top left.
-  - `change_setting` changes one setting: its key, one of the switches' camelCase keys, and `on`,
-    true or false. The app checks it before anything is written: an unknown key or a value that is
-    not true or false is refused as the call is read, and a switch this platform does not offer is
-    refused with the reason. It answers with the settings as they now stand.
+  - `settings` reads the settings: each switch the platform offers with its value, `updateChannel`,
+    `stable` or `nightly`, why the file cannot be changed where it cannot, and `windowControls`,
+    `console` where the page draws the window's controls and `inset` where the system's stand inset at
+    the top left.
+  - `change_setting` changes one setting by its key, `setting`: a switch's camelCase key with `on`,
+    true or false, or `updateChannel` with `value`, `stable` or `nightly`. The app checks it before
+    anything is written: an unknown key, an `on` that is not true or false and a `value` that is no
+    channel are refused as the call is read; a switch given no `on` or a `value`, the channel given no
+    `value` or an `on`, and a switch this platform does not offer are refused with the reason. It
+    answers with the settings as they now stand.
   - The window's own commands for its frame: minimise, toggle maximise, close, start dragging, the
     double press's maximise, whether it is maximised, and its title. Nothing else of the window, and
     no other plugin's command.
@@ -362,9 +384,9 @@ processes and its network stay as they were.
   administrator rights. It is unsigned until an Authenticode certificate exists, which is the owner's
   decision, so Windows SmartScreen warns on first run until then.
 - **Linux second:** an AppImage and a deb package.
-- **Updates go through Tauri's updater plugin with its signature check.** The app checks the feed at
-  start and every six hours, and installs an update only once its signature verifies against the
-  public key built into the app.
+- **Updates go through Tauri's updater plugin with its signature check.** The app checks its channel's
+  feed (「The update channel」) at start, every six hours and when the channel changes, and installs an
+  update only once its signature verifies against the public key built into the app.
 - **The update key is the owner's.** It is made once with `cargo tauri signer generate`, which writes a
   private key and asks for its password; the private key and its password are kept outside every
   repository, in the deployment's secret store (the data root's env folder), a file each, readable by
@@ -375,8 +397,10 @@ processes and its network stay as they were.
   with the private key; a release build without the two variables fails rather than ship an unsigned
   update. The app checks the feed and installs an update in Windows's passive mode, showing its progress
   and asking nothing. An app built from a configuration with no updater entry checks for none.
-- **The feed is served beside the agent's builds,** at `https://ai.example.org/bmo/jake/desktop/latest.json`,
-  with the installers and their signatures it names (「Releases」).
+- **The feeds are served beside the agent's builds,** the stable one at
+  `https://ai.example.org/bmo/jake/desktop/latest.json` and the nightly one at
+  `https://ai.example.org/bmo/jake/desktop/nightly/latest.json`, with the installers and their signatures
+  they name (「Releases」).
 - **A build** runs `cargo tauri build` inside the `desktop` folder. The NSIS installer is built on
   main-host as well as on a Windows machine: cross-compiled for `x86_64-pc-windows-gnu` with
   `cargo-zigbuild` as the CLI's runner and `--bundles nsis`, which needs `nsis` and the mingw-w64
@@ -386,7 +410,15 @@ processes and its network stay as they were.
 ## Releases
 
 A release is one version of the app, built for every platform at once, signed for the updater and
-published where both the updater and the console read it.
+published where both the updater and the console read it. It goes out on one of two channels, as bmo-chat's
+`docs/conventions.md` 「Versions」 states the set's versions:
+
+- **`stable`** carries the set's releases, the versions the owner declares, and is what the app takes
+  unless its setting says otherwise.
+- **`nightly`** carries the day's build between releases, named `<next minor>-nightly.<YYYYMMDD>`: the
+  minor above the release the app's configuration names, then the day it was built in the platform's
+  time zone, `Asia/Seoul`, as `1.1.0-nightly.20261124` after `1.0.0`. A second nightly the same day adds
+  `.<n>` counting from 2, `1.1.0-nightly.20261124.2`, so each stands above the one before it.
 
 ### Where releases are kept
 
@@ -394,54 +426,76 @@ published where both the updater and the console read it.
   directory `/var/www/ahas-ai/bmo/jake/desktop/`, which the `ai.example.org` site serves statically as
   `https://ai.example.org/bmo/jake/desktop/`. The folder belongs to the user that runs releases, so a
   release writes it without root; serving the path is host infrastructure BMO owns.
-- **Each version has a folder of its own,** named by the bare version (`0.1.0`), holding the Windows
-  installer, the AppImage and the deb, each beside its updater signature, and that version's release
-  read. A published version is never written again: the updater installs only a version higher than
-  the running one, so a fix ships as a new version.
-- **Two files at the folder's top name the current version:** `latest.json`, the updater's feed in
-  the form Tauri's updater reads, and `release.json`, the read the console uses. Both are replaced
-  whole, each by a rename, and only once the version's folder is complete, so neither ever names a
-  file that is not yet there.
-- **The feed names every installer the updater may take,** each with its signature and its address:
+- **Each stable version has a folder of its own at the top,** named by the bare version (`1.0.0`),
+  and each nightly one under `nightly/` (`nightly/1.1.0-nightly.20261124/`). A version's folder holds
+  the Windows installer, the AppImage and the deb, each beside its updater signature, and that
+  version's release read. A published version is never written again: the updater installs only a
+  version higher than the running one, so a fix ships as a new version.
+- **Only the seven newest nightlies are kept.** Once a nightly is published, the folders of older
+  nightlies past the seventh are removed, since a feed only ever names the newest. A stable version's
+  folder is never removed.
+- **Each channel has its updater feed,** in the form Tauri's updater reads, naming that channel's
+  newest version: `latest.json` at the folder's top for `stable`, where installed apps have always
+  read it, and `nightly/latest.json` for `nightly`. Beside them `release.json` at the top is the read the
+  console uses, holding both channels. Each is replaced whole, by a rename, and only once the version's
+  folder is complete, so none ever names a file that is not yet there.
+- **A feed names every installer the updater may take,** each with its signature and its address:
   the NSIS installer under `windows-x86_64-nsis` and `windows-x86_64`, the AppImage under
   `linux-x86_64-appimage` and `linux-x86_64`, and the deb under `linux-x86_64-deb`. An app installed
   from the deb looks for the deb's key first, so it is never handed an AppImage.
 
 ### The read the console uses
 
-The console builds its download page against this contract alone.
+The console builds its download page against this contract alone, and the project's site its download
+section.
 
-- **It reads `https://ai.example.org/bmo/jake/desktop/release.json`,** a JSON object that always describes
-  the current version. The same object is kept in that version's own folder, at
+- **It reads `https://ai.example.org/bmo/jake/desktop/release.json`,** a JSON object whose top level always
+  describes the current stable version. The same top level is kept in that version's own folder, at
   `https://ai.example.org/bmo/jake/desktop/<version>/release.json`, and never changes there.
 - **The object holds:** `version`, the bare semantic version; `date`, when it was published, as an
-  RFC 3339 UTC timestamp; and `files`, one entry per installer.
+  RFC 3339 UTC timestamp; `files`, one entry per installer; and `nightly`, the newest nightly as an
+  object of the same `version`, `date` and `files`, absent until the first nightly is published. A
+  nightly's own folder keeps its object at `nightly/<version>/release.json`.
 - **Each entry of `files` holds:** `platform`, `windows` or `linux`; `arch`, `x86_64`; `format`,
   `nsis`, `appimage` or `deb`; `file`, the file's name; `size`, its length in bytes; `sha256`, its
   SHA-256 digest in lowercase hex; and `url`, the absolute address it downloads from.
 - **The download route is each entry's `url`,** a file in the version's folder served as it is, so
-  a link to it downloads the installer and a version's link never changes once published.
+  a link to it downloads the installer and a stable version's link never changes once published.
 - **No release yet reads as not found:** until the first release is published the address answers
-  404, and the console shows that the app is not yet available.
+  404, and the console shows that the app is not yet available. A nightly is published only after a
+  stable release, so the top level is always there once the read is.
 - **A field may be added and none is removed or renamed,** so a console built against this contract
   reads every later release.
 
 ### Making a release
 
-- **A release is one command run on main-host from the repository's root, `bun run release:desktop`.**
-  It runs `scripts/desktop-release.ts` under a memory cap of its own, and that builds the app for
-  Windows and then for Linux, one after the other, finds the installers and their signatures, and
-  publishes them.
-- **The version is the one in the app's Tauri configuration,** and the address it is published under
-  is the folder holding the updater's endpoint, so neither is stated twice. A version not higher than
-  the one already published is refused before anything is built.
+- **A release is one command run on main-host from the repository's root, naming its channel:**
+  `bun run release:desktop --channel stable` or `bun run release:desktop --channel nightly`. It runs
+  `scripts/desktop-release.ts` under a memory cap of its own, and that builds the app for Windows and
+  then for Linux, one after the other, finds the installers and their signatures, and publishes them.
+  A channel that is not named, or neither of the two, stops it before anything else.
+- **`--dry-run` builds and writes nothing:** it reads the published reads, works out the version and
+  checks it, and prints the channel, the version and where it would be published.
+- **The stable version is the one in the app's Tauri configuration,** the set's release version,
+  moved only in the commit that releases the set. A version not higher than the stable one already
+  published is refused before anything is built.
+- **The nightly version is worked out as the build starts,** from the configuration's version and the
+  day, and handed to that build alone as an override of the configuration's version on the Tauri CLI's
+  command line; nothing is written into the repository, and no commit carries it. A nightly is refused
+  before anything is built where no stable release is published yet, and where its version is not higher
+  than both the published nightly and the published stable, which is a checkout behind the release.
+- **The address it is published under** is the folder holding the configuration's updater endpoint,
+  and the nightly's the `nightly/` folder in it, so no address is stated twice.
 - **The update key is read from the deployment's secret store by its path:** the env folder holds
   `jake-desktop-updater.key` and `jake-desktop-updater.password`, and the release hands the key to the
   build as its path and the password through its variable, printing neither. Where either file is
   missing the release stops before building.
 - **Every installer and every signature must come from this run:** a file the build did not write
   afresh stops the release, so a stale build is never published under a new version.
-- **The release ends by printing** the version and, for each installer, its name, its size, its
-  SHA-256 and its address.
+- **A release rewrites only its own channel:** a stable release replaces `latest.json` and the top
+  level of `release.json`, keeping its `nightly`; a nightly replaces `nightly/latest.json` and the
+  `nightly` of `release.json`, keeping the top level.
+- **The release ends by printing** the channel, the version and, for each installer, its name, its
+  size, its SHA-256 and its address.
 - **The Authenticode signature is not part of it:** the installer stays unsigned for Windows until
   the owner provides a certificate (「Distribution and updates」).
