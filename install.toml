@@ -15,7 +15,7 @@ check = "test -x \"$HOME/.bun/bin/bun\""
 what = "Runs the agent build and the publish step, both of which name it at ~/.bun/bin/bun; the Bun runtime from https://bun.sh."
 
 [[needs]]
-check = "cargo zigbuild --version >/dev/null"
+check = "cargo-zigbuild --version >/dev/null"
 what = "Links the agent builds for Windows and Linux; cargo-zigbuild, installed with cargo install --locked cargo-zigbuild."
 
 [[needs]]
