@@ -19,7 +19,7 @@ use crate::credential::{self, Reach};
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
   Checksum, Direction, EncodedBytes, Frame, NAME_HELD_REASON, ReceiveWindow, STREAM_CHUNK_BYTES,
-  SUPERSEDED_REASON, SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
+  SUPERSEDED_REASON, SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame, machine_held_reason,
 };
 use crate::timed_names::TimedNames;
 use crate::update::{self, AgentBuild};
@@ -34,7 +34,8 @@ const TAIL_BACKLOG: usize = 1024;
 const CLOSE_HUB_INITIATED: u16 = 4000;
 /// The close code of a socket whose hello named another name than its credential was made for.
 const CLOSE_OTHER_NAME: u16 = 4003;
-/// The close code of a socket whose hello named a name another agent instance holds.
+/// The close code of a socket whose hello named a name another agent instance holds, or a machine an agent of
+/// another name holds.
 const CLOSE_NAME_HELD: u16 = 4009;
 /// The reason a revoked name's departure is logged and its socket closed with.
 const REVOKED_REASON: &str = "its name is revoked";
@@ -183,11 +184,19 @@ pub struct TrafficEntry {
   pub summary: Value,
 }
 
+// Where a hello says it comes from: the install and the machine, each where it named one.
+struct Origin {
+  instance: Option<String>,
+  machine: Option<String>,
+}
+
 // One attached agent and everything that lives and dies with its connection.
 struct Agent {
   link: Link,
   // The install the agent said hello from, where it named one.
   instance: Option<String>,
+  // The fingerprint of the machine the agent said hello from, where it named one.
+  machine: Option<String>,
   agent_version: String,
   capabilities: Vec<String>,
   connected_at: i64,
@@ -348,28 +357,47 @@ impl State {
     })
   }
 
-  // A hello under a name another instance holds attaches nothing: the reject goes out in the welcome's place,
-  // ahead of the socket's close, and the connection holding the name stays as it is.
-  fn refuse_held(&mut self, link: &Link, name: &str, summary: Value) {
+  // The attached agent of another name than `name`, on another socket, that holds `machine`; none for a hello
+  // that names no machine, which is not checked.
+  fn machine_holder(&self, name: &str, socket_id: u64, machine: Option<&str>) -> Option<String> {
+    let machine = machine?;
+    self.holder_of(machine, |held, agent| held != name && agent.link.socket_id != socket_id)
+  }
+
+  // The first attached agent, by name, that said hello from `machine` and that `admits` lets count.
+  fn holder_of(&self, machine: &str, admits: impl Fn(&str, &Agent) -> bool) -> Option<String> {
+    let mut holders: Vec<&String> = self
+      .agents
+      .iter()
+      .filter(|(held, agent)| agent.machine.as_deref() == Some(machine) && admits(held, agent))
+      .map(|(held, _)| held)
+      .collect();
+    holders.sort_by(|a, b| by_name(a, b));
+    holders.first().map(|holder| (*holder).clone())
+  }
+
+  // A hello another agent holds the name or the machine of attaches nothing: the reject goes out in the welcome's
+  // place, ahead of the socket's close, and the connection that holds it stays as it is.
+  fn refuse_held(&mut self, link: &Link, name: &str, summary: Value, reason: &str) {
     self.record(Some(name), "in", "hello", summary);
     // Whatever name the socket held goes with the socket rather than staying attached to a closed link.
     if let Some(previous) = self.by_socket.get(&link.socket_id).cloned() {
-      self.detach(&previous, "the connection said hello under a name another agent holds", false);
+      self.detach(&previous, "the connection said hello as an agent another one holds", false);
     }
     let reject = Frame::Reject {
-      reason: NAME_HELD_REASON.into(),
+      reason: reason.into(),
     };
     link.send(reject.encode());
     self.record(Some(name), "out", reject.kind(), reject.summary());
-    link.close(CLOSE_NAME_HELD, NAME_HELD_REASON);
-    eprintln!("jake hub: a hello under {name} was refused: {NAME_HELD_REASON}");
+    link.close(CLOSE_NAME_HELD, reason);
+    eprintln!("jake hub: a hello under {name} was refused: {reason}");
   }
 
   fn attach(
     &mut self,
     link: &Link,
     name: String,
-    instance: Option<String>,
+    Origin { instance, machine }: Origin,
     agent_version: String,
     capabilities: Vec<String>,
     summary: Value,
@@ -395,6 +423,7 @@ impl State {
     let agent = Agent {
       link: link.clone(),
       instance,
+      machine,
       agent_version,
       capabilities,
       connected_at: now,
@@ -774,6 +803,12 @@ impl Hub {
     Reach::of_names(credential::subject(key, presented)?)
   }
 
+  /// The attached agent that said hello from `machine`, the first by name where several did; an install asks it
+  /// before it puts a second agent on a machine (docs/architecture.md, 「Many agents, one hub」).
+  pub fn machine_held_by(&self, machine: &str) -> Option<String> {
+    self.lock().holder_of(machine, |_, _| true)
+  }
+
   pub fn next_socket_id(&self) -> u64 {
     self.socket_seq.fetch_add(1, Ordering::Relaxed) + 1
   }
@@ -802,6 +837,7 @@ impl Hub {
       agent_version,
       capabilities,
       instance,
+      machine,
     } = &frame
     {
       if let Some(only) = &link.only
@@ -822,13 +858,20 @@ impl Hub {
         return;
       }
       if state.held_by_another(agent, link.socket_id, instance.as_deref()) {
-        state.refuse_held(link, agent, summary);
+        state.refuse_held(link, agent, summary, NAME_HELD_REASON);
+        return;
+      }
+      if let Some(holder) = state.machine_holder(agent, link.socket_id, machine.as_deref()) {
+        state.refuse_held(link, agent, summary, &machine_held_reason(&holder));
         return;
       }
       state.attach(
         link,
         agent.clone(),
-        instance.clone(),
+        Origin {
+          instance: instance.clone(),
+          machine: machine.clone(),
+        },
         agent_version.clone(),
         capabilities.clone(),
         summary,
@@ -1319,6 +1362,7 @@ impl Hub {
             "name": name,
             "agentVersion": agent.agent_version,
             "capabilities": agent.capabilities,
+            "machine": agent.machine,
             "connectedAt": agent.connected_at,
             "lastPongAt": agent.last_pong_at,
             "inFlight": agent.commands.keys().collect::<Vec<_>>(),
@@ -1704,6 +1748,81 @@ mod tests {
       assert_eq!(closed_with(&mut first_queue), Some(CLOSE_HUB_INITIATED), "{held:?} then {next:?}");
       assert_eq!(hub.lock().agents["u7"].link.socket_id, second.socket_id);
     }
+  }
+
+  fn hello_on(name: &str, instance: &str, machine: Option<&str>) -> String {
+    let machine = machine.map_or(String::new(), |machine| format!(r#","machine":"{machine}""#));
+    format!(
+      r#"{{"type":"hello","v":1,"agent":"{name}","agentVersion":"0.1.0","capabilities":[],"instance":"{instance}"{machine}}}"#
+    )
+  }
+
+  #[tokio::test]
+  async fn a_hello_from_a_held_machine_under_another_name_is_refused_naming_the_holder_and_the_first_stays()
+  {
+    let hub = hub(CAP);
+    let (first, mut first_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&first, &hello_on("jake-wsl", "wsl", Some("pc-1")));
+    while first_queue.try_recv().is_ok() {}
+
+    let (second, mut second_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&second, &hello_on("u63", "windows", Some("pc-1")));
+    let answers: Vec<Outbound> = std::iter::from_fn(|| second_queue.try_recv().ok()).collect();
+    match answers.as_slice() {
+      [Outbound::Text(text), Outbound::Close(code, reason)] => {
+        let frame = decode_frame(text, CAP).expect("a valid frame");
+        let wanted = "machine held by another agent: jake-wsl";
+        assert!(matches!(frame, Frame::Reject { reason: ref said } if said == wanted), "{frame:?}");
+        assert_eq!((*code, reason.as_str()), (CLOSE_NAME_HELD, wanted));
+      }
+      _ => panic!("{} answers, not a reject and a close", answers.len()),
+    }
+    assert_eq!(closed_with(&mut first_queue), None);
+    assert_eq!(attached_names(&hub), ["jake-wsl"]);
+    assert_eq!(hub.machine_held_by("pc-1").as_deref(), Some("jake-wsl"));
+    assert_eq!(hub.machine_held_by("pc-2"), None);
+  }
+
+  #[tokio::test]
+  async fn a_redial_of_the_name_holding_the_machine_replaces_its_connection_as_before() {
+    let hub = hub(CAP);
+    let (first, mut first_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&first, &hello_on("jake-wsl", "wsl", Some("pc-1")));
+    while first_queue.try_recv().is_ok() {}
+
+    let (second, mut second_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&second, &hello_on("jake-wsl", "wsl", Some("pc-1")));
+    assert_eq!(kinds(&queued(&mut second_queue)), ["welcome"]);
+    assert_eq!(closed_with(&mut first_queue), Some(CLOSE_HUB_INITIATED));
+    assert_eq!(hub.lock().agents["jake-wsl"].link.socket_id, second.socket_id);
+
+    // Another instance of the same name is still refused for the name, not for the machine.
+    let (third, mut third_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&third, &hello_on("jake-wsl", "desktop", Some("pc-1")));
+    let reject = queued(&mut third_queue).into_iter().find_map(|(frame, _)| match frame {
+      Frame::Reject { reason } => Some(reason),
+      _ => None,
+    });
+    assert_eq!(reject.as_deref(), Some(NAME_HELD_REASON));
+  }
+
+  #[tokio::test]
+  async fn a_hello_naming_no_machine_or_another_machine_attaches_beside_the_holder() {
+    let hub = hub(CAP);
+    for (name, machine) in [("jake-wsl", Some("pc-1")), ("u4", None), ("n2", Some("pc-2"))] {
+      let (link, mut queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+      hub.on_message(&link, &hello_on(name, name, machine));
+      assert_eq!(kinds(&queued(&mut queue)), ["welcome"], "{name}");
+    }
+    assert_eq!(attached_names(&hub), ["jake-wsl", "n2", "u4"]);
+    let status = hub.status(&Reach::All);
+    let machines: Vec<(&str, &Value)> = status["agents"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|agent| (agent["name"].as_str().unwrap(), &agent["machine"]))
+      .collect();
+    assert_eq!(machines, [("jake-wsl", &json!("pc-1")), ("n2", &json!("pc-2")), ("u4", &Value::Null)]);
   }
 
   #[tokio::test]

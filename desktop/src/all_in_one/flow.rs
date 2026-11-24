@@ -320,6 +320,8 @@ mod tests {
       git: true,
       cargo: true,
       cc: true,
+      console_port: None,
+      jake: None,
     }
   }
 

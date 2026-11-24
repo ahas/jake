@@ -155,6 +155,7 @@ async function update(at: ReturnType<typeof machine>): Promise<{ code: number; o
       HOME: at.home,
       XDG_CONFIG_HOME: join(at.home, ".config"),
       JAKE_INSTALL_WAIT_SECONDS: "0",
+      JAKE_WINDOWS_USERS: join(at.home, "windows", "users"),
     },
     stdin: "ignore",
     stdout: "pipe",
@@ -416,6 +417,7 @@ async function runOnWsl(
   script: string[],
   refuse = "",
 ): Promise<{ code: number; output: string }> {
+  mkdirSync(join(at.home, "windows", "users"), { recursive: true });
   const proc = Bun.spawn(["bash", ...script], {
     env: {
       PATH: `${at.stubs}:${process.env.PATH ?? "/usr/bin:/bin"}`,
@@ -426,6 +428,7 @@ async function runOnWsl(
       LOCALAPPDATA: at.localAppData,
       JAKE_TEST_TASKS: at.tasks,
       JAKE_TEST_REFUSE: refuse,
+      JAKE_WINDOWS_USERS: join(at.home, "windows", "users"),
     },
     stdin: "ignore",
     stdout: "pipe",
@@ -483,5 +486,131 @@ describe("install.sh on WSL", () => {
     const { code } = await runOnWsl(at, [join(at.folder, "uninstall.sh")]);
     expect(code).toBe(0);
     expect(readFileSync(at.tasks, "utf8")).toBe("stopped JakeWsl-Ubuntu-24.04\nunregistered JakeWsl-Ubuntu-24.04\n");
+  }, 30_000);
+});
+
+// A Windows install of the same PC, as a WSL distribution sees it through /mnt/c: its executable, its agent.env
+// naming `name`, and an uninstall.ps1 that records the folder it was asked to remove.
+function windowsInstall(at: ReturnType<typeof wslMachine>, name: string): { dir: string; removed: string } {
+  const dir = join(at.home, "windows", "users", "person", "AppData", "Local", "Programs", "jake");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "jake.exe"), "the windows build");
+  writeFileSync(join(dir, "agent.env"), `JAKE_HUB_URL=wss://example.test\nJAKE_SECRET=s\nJAKE_AGENT_NAME=${name}\n`);
+  const removed = join(at.home, "windows", "removed");
+  writeFileSync(join(dir, "uninstall.ps1"), `param($InstallDir)\nSet-Content -LiteralPath '${removed}' -Value "removed $InstallDir"\n`);
+  return { dir, removed };
+}
+
+// Whether the install stopped the agent's unit at any point.
+function unitStopped(at: ReturnType<typeof machine>): boolean {
+  const calls = join(at.home, "systemctl.calls");
+  return existsSync(calls) && readFileSync(calls, "utf8").includes("stop");
+}
+
+describe("install.sh: one jake per machine", () => {
+  test("beside a Windows install of the same PC, refuses naming it and the two ways on, and changes nothing", async () => {
+    const at = wslMachine(false);
+    windowsInstall(at, "u63");
+    const { code, output } = await install(at);
+    expect(code).not.toBe(0);
+    expect(output).toContain("a Windows install in");
+    expect(output).toContain("another jake already serves this machine as u63");
+    expect(output).toContain("bind your account to u63 as a shared node");
+    expect(output).toContain("--replace");
+    expect(readFileSync(at.bin, "utf8")).toBe("old reaches");
+    expect(existsSync(`${at.bin}.new`)).toBe(false);
+    expect(unitStopped(at)).toBe(false);
+  });
+
+  test("with --replace, runs the Windows install's own uninstaller first and then installs", async () => {
+    const at = wslMachine(true);
+    const windows = windowsInstall(at, "u63");
+    const { code, output } = await runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive", "--replace"]);
+    expect(output).toContain("removing u63 through its own uninstaller");
+    expect(code).toBe(0);
+    expect(readFileSync(windows.removed, "utf8").trim()).toBe(`removed ${windows.dir}`);
+    expect(readFileSync(at.bin, "utf8")).toBe("new reaches");
+  }, 60_000);
+
+  test("an agent of another name the hub says holds this machine refuses the install, and one out of reach refuses --replace too", async () => {
+    const at = wslMachine(false);
+    writeFileSync(
+      join(at.folder, "jake"),
+      "#!/bin/sh\n# reaches\necho machine=0123456789abcdef0123456789abcdef\necho hub=answered\necho held-by=jake-other\n",
+    );
+    const refused = await install(at);
+    expect(refused.code).not.toBe(0);
+    expect(refused.output).toContain("an agent the hub says holds this machine: jake-other");
+    expect(refused.output).toContain("another jake already serves this machine as jake-other");
+
+    const replacing = await runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive", "--replace"]);
+    expect(replacing.code).not.toBe(0);
+    expect(replacing.output).toContain("jake-other holds this machine from where this install cannot reach it");
+    expect(unitStopped(at)).toBe(false);
+  });
+
+  test("the hub naming this install itself, by its name now or before, refuses nothing", async () => {
+    const at = wslMachine(false);
+    writeFileSync(join(at.folder, "jake"), "#!/bin/sh\n# reaches\necho hub=answered\necho held-by=n2\n");
+    const { code, output } = await install(at);
+    expect(output).toContain("none found");
+    expect(code).toBe(0);
+  });
+
+  test("an update looks at none of it", async () => {
+    const at = wslMachine(false);
+    windowsInstall(at, "u63");
+    const { code } = await runOnWsl(at, [join(at.folder, "install.sh"), "--update"]);
+    expect(code).toBe(0);
+    expect(readFileSync(at.bin, "utf8")).toBe("new reaches");
+  });
+
+  test("a listen port another program holds refuses the install, naming the port", async () => {
+    const at = wslMachine(false);
+    const env = join(at.home, ".local", "share", "jake", "agent.env");
+    writeFileSync(env, `${readFileSync(env, "utf8")}JAKE_LISTEN_PORTS=4100\n`);
+    writeFileSync(
+      join(at.stubs, "ss"),
+      `#!/bin/sh\necho 'LISTEN 0 4096 127.0.0.1:4100 0.0.0.0:* users:(("node",pid=4242,fd=20))'\n`,
+      { mode: 0o755 },
+    );
+    const { code, output } = await install(at);
+    expect(code).not.toBe(0);
+    expect(output).toContain("port 4100 is already held on this machine by node");
+    expect(unitStopped(at)).toBe(false);
+  });
+});
+
+describe("install.ps1: one jake per machine", () => {
+  test("beside a WSL install of the same PC, refuses naming it, and changes nothing", async () => {
+    const at = windowsMachine("old reaches", "new reaches");
+    const run = `${WINDOWS_STAND_INS}
+function wsl.exe { 'distribution=Ubuntu-24.04'; 'jake=jake-wsl'; 'listen=22 sshd' }
+try { & (Join-Path $env:JAKE_TEST_BUILD 'install.ps1') -HubUrl wss://example.test -Secret s -AgentName u63 -NonInteractive -InstallDir $env:JAKE_TEST_INSTALL; 'OUTCOME: installed' }
+catch { "OUTCOME: $_" }
+'RUNNING: ' + (($global:JakeRunning.Keys | Sort-Object) -join ' ')`;
+    const runner = join(at.localAppData, "..", "run-refused.ps1");
+    writeFileSync(runner, run);
+    const proc = Bun.spawn(["pwsh", "-NoProfile", "-NonInteractive", "-File", runner], {
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: at.localAppData,
+        LOCALAPPDATA: at.localAppData,
+        JAKE_TEST_BUILD: at.build,
+        JAKE_TEST_INSTALL: at.install,
+        JAKE_INSTALL_WAIT_SECONDS: "0",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+    expect(output).toContain("a WSL install in Ubuntu-24.04: jake-wsl");
+    expect(output).toContain("OUTCOME: another jake already serves this machine as jake-wsl");
+    expect(output).toContain("-Replace");
+    expect(output).toContain("RUNNING: JakeAgent JakeGuard");
+    expect(readFileSync(join(at.install, "jake.exe"), "utf8")).toBe("old reaches");
+    expect(existsSync(join(at.install, "jake.new.exe"))).toBe(false);
   }, 30_000);
 });

@@ -233,6 +233,7 @@ describe("status", () => {
         connectedAt: NOW - 65_000,
         lastPongAt: NOW - 4_000,
         inFlight: ["c1"],
+        machine: "3f2a9c0d41b7e8f61a2b3c4d5e6f7081",
       },
       { name: "node2", agentVersion: "0.1.0", capabilities: ["exec:linux"], connectedAt: NOW - 5_000, lastPongAt: NOW, inFlight: [] },
     ],
@@ -251,6 +252,8 @@ describe("status", () => {
     expect(text).toContain("connected for 1m 5s, last pong 4s ago");
     expect(text).toContain("exec:powershell, exec:wsl");
     expect(text).toContain("in-flight commands: c1");
+    expect(text).toContain("machine: 3f2a9c0d41b7e8f61a2b3c4d5e6f7081");
+    expect(text.match(/machine:/g)).toHaveLength(1);
     expect(text).toContain("node2 v0.1.0");
     expect(text).toContain("exec:linux");
     expect(text).toContain("jungsu-wsl departed 2m 0s ago");

@@ -63,6 +63,22 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
   Both reasons are part of the contract: the desktop app's built-in agent reads either to give its
   name up rather than redial (docs/desktop.md, 「One agent per name」).
+- **One machine, one agent.** A hello may also carry the machine it comes from: a fingerprint of the
+  physical machine that every install on it reports alike, a WSL distribution's and the Windows host's
+  among them (「The machine's fingerprint」). Two installs on one PC under two names would otherwise both
+  attach, and both claim the same loopback ports. A hello whose machine an attached agent of another
+  name already holds is refused: the hub answers it with a reject whose reason is
+  `machine held by another agent: <the holder's name>`, closes its socket with code 4009 as for a held
+  name, and leaves the holder as it is. The first one attached keeps the machine; the refused agent
+  dials again on its backoff and attaches once the holder is gone. A hello under the name it already
+  holds follows the instance rules above whatever machine it names, and a hello that names no machine,
+  from an older agent or an uninstaller's leave notice, is not checked. The desktop app's built-in agent
+  reads this reason too, and gives the machine up rather than redial.
+- **An install may ask whether its machine is held** before it puts a second agent on it. A request to
+  the agent address with an agent credential and the query `machine=<fingerprint>` is answered, in place
+  of an upgrade, 200 with `{"heldBy": <the attached holder's name, or null>}` and, where one holds it,
+  the header `X-Jake-Machine-Held-By` naming it. The agent's `--machine-check` asks it
+  (docs/install.md, 「One jake per machine」).
 - Everything that belongs to a connection lives and dies with it: its liveness probe, its commands,
   its transfers and its streams. An agent that drops, is declared dead, or is superseded ends only what was
   running on it; the other agents' work carries on.
@@ -73,8 +89,8 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   command needs no name, because a command's id is unique across the whole hub. A revoke always
   names its agent, attached or not, since it stands for the name rather than a connection.
 - The status the control API reports lists every attached agent — its name, version, capabilities,
-  when it connected, when it last answered a ping, and the commands running on it — every
-  departed one with when it left, and every revoked name with when it was revoked; the traffic log
+  the machine fingerprint its hello carried (null where none), when it connected, when it last
+  answered a ping, and the commands running on it — every departed one with when it left, and every revoked name with when it was revoked; the traffic log
   tags each frame with the agent it crossed to or from.
 - A departed agent is one that was uninstalled, told apart from one that is merely disconnected. An
   agent the hub sends a leave to is recorded as departed at once, and so is an agent whose
@@ -142,6 +158,26 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   directory: made once, by the first run that finds none, and read by every run after, the uninstaller's
   leave notice among them, so the notice is refused while another install holds the name. A data
   directory that cannot be written leaves the agent an id for this run alone.
+
+### The machine's fingerprint
+
+- The machine a hello names is the first 32 hex digits of SHA-256 over the prefix `jake-machine:` and
+  the machine's own id, trimmed and lowercased; the raw id never leaves the machine.
+- **On Windows** the id is the `MachineGuid` value under `HKLM\SOFTWARE\Microsoft\Cryptography`, read
+  through the registry in-process, with no program started.
+- **On Linux** it is `/etc/machine-id`, else `/var/lib/dbus/machine-id`.
+- **Inside WSL** it is the Windows host's `MachineGuid`, so a WSL agent and a Windows agent of one PC
+  name one machine. Reading it from Linux starts a Windows program through interop, and every interop
+  start costs Windows dearly, so it is read at most once per agent start and kept, as the fingerprint,
+  in the file `machine` in the agent's data directory; every later start reads that file and starts
+  nothing. Interop is tried only where its handler is registered. Where it cannot be reached and no
+  file stands, the distribution's own machine id stands in for that start and nothing is kept, so a
+  later start that reaches interop still keeps the host's. The agent's systemd service may have no
+  interop, so the install, run from a WSL shell that has it, keeps the file first (docs/install.md,
+  「One jake per machine」).
+- The installed agent sends its fingerprint in every hello of its run; the uninstaller's leave notice
+  sends none, so a leave is never refused for the machine. The desktop app's built-in agent reads the
+  same way, keeping its file, `agent-machine`, beside its instance in the app's config directory.
 
 ## Configuration and secrets
 

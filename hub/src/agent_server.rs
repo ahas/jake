@@ -8,8 +8,8 @@ use axum::extract::ws::{
   CloseFrame, Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection,
 };
 use axum::extract::{ConnectInfo, State};
-use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, UPGRADE};
+use axum::http::{HeaderMap, HeaderValue, Uri};
 use axum::response::Response;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -18,9 +18,29 @@ use tokio::sync::mpsc;
 use crate::control::json;
 use crate::core::Hub;
 use crate::link::{Link, Outbound};
+use crate::protocol::MACHINE_HELD_BY_HEADER;
 
 /// How long a socket the hub closed may wait for the agent's answering close before it is dropped.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+// The machine fingerprint a request asks after, from its query's `machine`, or none.
+fn asked_machine(uri: &Uri) -> Option<String> {
+  form_urlencoded::parse(uri.query()?.as_bytes())
+    .find(|(key, _)| key == "machine")
+    .map(|(_, value)| value.into_owned())
+    .filter(|machine| !machine.is_empty())
+}
+
+// The answer to a machine query: which attached agent holds the machine, in the body and, where one does, in a
+// header, which a WebSocket client reads from a response it did not upgrade on.
+fn machine_answer(hub: &Hub, machine: &str) -> Response {
+  let holder = hub.machine_held_by(machine);
+  let mut response = json(200, &serde_json::json!({ "heldBy": holder }));
+  if let Some(value) = holder.and_then(|holder| HeaderValue::from_str(&holder).ok()) {
+    response.headers_mut().insert(MACHINE_HELD_BY_HEADER, value);
+  }
+  response
+}
 
 // Where an agent's attempt came from: the address the proxy in front forwarded, else the peer's own.
 fn peer_of(headers: &HeaderMap, address: SocketAddr) -> String {
@@ -35,6 +55,7 @@ fn peer_of(headers: &HeaderMap, address: SocketAddr) -> String {
 pub async fn entry(
   State(hub): State<Arc<Hub>>,
   ConnectInfo(address): ConnectInfo<SocketAddr>,
+  uri: Uri,
   headers: HeaderMap,
   upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
@@ -50,6 +71,10 @@ pub async fn entry(
     }
     return json(401, &serde_json::json!({ "error": "unauthorized" }));
   };
+  // A machine query is answered in place of an upgrade, whether or not the request asked for one.
+  if let Some(machine) = asked_machine(&uri) {
+    return machine_answer(&hub, &machine);
+  }
   let Ok(upgrade) = upgrade else {
     return json(426, &serde_json::json!({ "error": "expected a WebSocket upgrade" }));
   };

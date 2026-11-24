@@ -38,6 +38,8 @@ pub struct Controller<W: Window> {
   pub carrying: watch::Sender<usize>,
   /// The app's own instance, which the built-in agent's hello names (docs/desktop.md, 「Pairing」).
   pub instance: String,
+  /// This machine's fingerprint, which the built-in agent's hello names; none where it could not be read.
+  pub machine: Option<String>,
 }
 
 /// How long a quit waits for the built-in agent to close its connection.
@@ -107,9 +109,15 @@ impl<W: Window> Controller<W> {
       .ok()
       .flatten()
       .map(|installed| installed.name);
-    if installed.as_deref() == Some(machine.node.as_str()) {
-      self.log.info("built-in-agent-held-off", json!({ "agent": machine.node }));
-      return Some(AgentState::HeldOff(machine.node.clone()));
+    if let Some(name) = installed {
+      self
+        .log
+        .info("built-in-agent-held-off", json!({ "agent": machine.node, "installed": name }));
+      return Some(if name == machine.node {
+        AgentState::HeldOff(name)
+      } else {
+        AgentState::MachineHeld(name)
+      });
     }
     match self.serve(machine, stop).await {
       Ended::Stopped => None,
@@ -122,6 +130,7 @@ impl<W: Window> Controller<W> {
         Some(AgentState::Removed)
       }
       Ended::Superseded => Some(AgentState::Yielded(machine.node.clone())),
+      Ended::MachineHeld(holder) => Some(AgentState::MachineHeld(holder)),
     }
   }
 
@@ -189,6 +198,7 @@ impl<W: Window> Controller<W> {
         AgentConfig::new(machine.hub_url.clone(), machine.credential.clone(), machine.node.clone());
       let agent = Agent::new(config, AGENT_VERSION.to_owned(), log.clone())
         .instance(self.instance.clone())
+        .machine(self.machine.clone())
         .when_superseded(WhenSuperseded::GiveUp);
       let mut link = agent.link();
       let mut carried = agent.carrying();
@@ -239,8 +249,9 @@ impl<W: Window> Controller<W> {
 
 /// Switch from the installed agent the course is held off for to the built-in one: the installed agent of that
 /// name, found by `find`, is stopped through its own uninstaller, `uninstall`, and the course looks again, which then
-/// starts the built-in agent. An uninstaller that fails leaves the installed agent serving, and the page says why. Asked
-/// in any other state, it does nothing.
+/// starts the built-in agent. An uninstaller that fails leaves the installed agent serving, and the page says why; so
+/// does a jake holding the machine that `find` does not see here, one inside a WSL distribution. Asked in any other
+/// state, it does nothing.
 pub async fn switch_to_built_in<F, U>(
   status: &watch::Sender<Status>,
   retries: &mpsc::Sender<()>,
@@ -251,14 +262,16 @@ pub async fn switch_to_built_in<F, U>(
   F: FnOnce() -> Option<Installed> + Send + 'static,
   U: FnOnce(&Installed) -> Result<(), String> + Send + 'static,
 {
-  let name = match &status.borrow().agent {
-    AgentState::HeldOff(name) | AgentState::SwitchFailed { name, .. } => name.clone(),
+  let (name, held_machine) = match &status.borrow().agent {
+    AgentState::HeldOff(name) | AgentState::SwitchFailed { name, .. } => (name.clone(), false),
+    AgentState::MachineHeld(holder) => (holder.clone(), true),
     _ => return,
   };
   status.send_modify(|status| status.agent = AgentState::Switching);
   let wanted = name.clone();
   let outcome = tokio::task::spawn_blocking(move || match find() {
     Some(installed) if installed.name == wanted => uninstall(&installed),
+    _ if held_machine => Err(unseen_holder(&wanted)),
     _ => Ok(()),
   })
   .await
@@ -273,6 +286,13 @@ pub async fn switch_to_built_in<F, U>(
       status.send_modify(|status| status.agent = AgentState::SwitchFailed { name, reason });
     }
   }
+}
+
+/// Why a jake holding the machine cannot be stopped from the app: it is installed where the app does not see it.
+fn unseen_holder(holder: &str) -> String {
+  format!(
+    "이 PC에서 jake 설치({holder})를 찾지 못했습니다. WSL 배포판 안에 설치되어 있다면 그 배포판에서 ~/.local/share/jake/uninstall.sh를 실행한 뒤 다시 확인해 주세요."
+  )
 }
 
 /// Show the console if it answers, the bundled page with the reason if it does not; while a pairing
@@ -391,6 +411,57 @@ mod tests {
       )
       .await;
       assert_eq!(retried.try_recv(), Ok(()));
+    }
+  }
+
+  #[tokio::test]
+  async fn a_jake_holding_the_machine_under_another_name_is_uninstalled_where_it_is_found() {
+    let status = watch::Sender::new(Status {
+      console: ConsoleState::Shown,
+      agent: AgentState::MachineHeld("u63".to_owned()),
+    });
+    let (retries, mut retried) = mpsc::channel(1);
+    let uninstalled = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = uninstalled.clone();
+    switch_to_built_in(
+      &status,
+      &retries,
+      &log(),
+      || installed("u63"),
+      move |found: &Installed| {
+        seen.lock().unwrap().push(found.name.clone());
+        Ok(())
+      },
+    )
+    .await;
+
+    assert_eq!(*uninstalled.lock().unwrap(), ["u63"]);
+    assert_eq!(retried.try_recv(), Ok(()));
+  }
+
+  #[tokio::test]
+  async fn a_jake_holding_the_machine_that_is_not_found_here_is_named_with_where_to_remove_it() {
+    let status = watch::Sender::new(Status {
+      console: ConsoleState::Shown,
+      agent: AgentState::MachineHeld("jake-wsl".to_owned()),
+    });
+    let (retries, mut retried) = mpsc::channel(1);
+    switch_to_built_in(
+      &status,
+      &retries,
+      &log(),
+      || installed("other"),
+      |_: &Installed| panic!("nothing is uninstalled"),
+    )
+    .await;
+
+    assert!(retried.try_recv().is_err());
+    match &status.borrow().agent {
+      AgentState::SwitchFailed { name, reason } => {
+        assert_eq!(name, "jake-wsl");
+        assert!(reason.contains("uninstall.sh"), "{reason}");
+      }
+      other => panic!("{other:?}"),
     }
   }
 

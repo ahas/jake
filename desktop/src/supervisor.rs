@@ -65,6 +65,7 @@ mod tests {
     move || {
       started += 1;
       let panic = started <= panics;
+      let last = last.clone();
       tokio::spawn(async move {
         assert!(!panic, "fault {started}");
         last

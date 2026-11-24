@@ -5,15 +5,17 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
-use jake_protocol::{Frame, NAME_HELD_REASON, SUPERSEDED_REASON, decode_frame};
+use jake_protocol::{
+  Frame, MACHINE_HELD_BY_HEADER, NAME_HELD_REASON, SUPERSEDED_REASON, decode_frame, machine_holder,
+};
 use serde_json::{Number, json};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -46,6 +48,8 @@ pub struct Agent {
   pub log: Log,
   // The install the agent runs from, named in its hello; none names no instance.
   instance: Option<String>,
+  // The fingerprint of the machine the agent runs on, named in its hello; none names no machine.
+  machine: Option<String>,
   when_superseded: WhenSuperseded,
   link: watch::Sender<Link>,
   carrying: watch::Sender<usize>,
@@ -65,7 +69,7 @@ pub enum Link {
 }
 
 /// What the agent does once the hub hands its name to a newer connection, or refuses it because another
-/// instance holds the name.
+/// instance holds the name or an agent of another name holds its machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhenSuperseded {
   /// Dial again, as an installed agent does after a half-dead connection was replaced.
@@ -75,7 +79,7 @@ pub enum WhenSuperseded {
 }
 
 /// Why the agent stopped serving the hub.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ended {
   /// The caller asked it to stop.
   Stopped,
@@ -84,6 +88,9 @@ pub enum Ended {
   /// The hub handed its name to a newer connection, or refused it because another instance holds the name,
   /// and it was told to give the name up.
   Superseded,
+  /// The hub refused it because the named agent of another name holds its machine, and it was told to give the
+  /// machine up.
+  MachineHeld(String),
 }
 
 /// How the hub learned of a leave the uninstaller announced.
@@ -110,6 +117,7 @@ impl Agent {
       version,
       log,
       instance: None,
+      machine: None,
       when_superseded: WhenSuperseded::Redial,
       link: watch::Sender::new(Link::Connecting),
       carrying: watch::Sender::new(0),
@@ -131,6 +139,12 @@ impl Agent {
       instance: Some(instance),
       ..self
     }
+  }
+
+  /// The same agent, naming the machine it runs on in its hello by its fingerprint (docs/architecture.md, 「The
+  /// machine's fingerprint」); none leaves the hello naming no machine.
+  pub fn machine(self, machine: Option<String>) -> Self {
+    Self { machine, ..self }
   }
 
   /// A watch on the agent's link, current from the moment it is taken.
@@ -157,6 +171,7 @@ impl Agent {
       agent_version: self.version.clone(),
       capabilities: self.capabilities(),
       instance: self.instance.clone(),
+      machine: self.machine.clone(),
     }
   }
 
@@ -197,9 +212,16 @@ impl Agent {
           if session.leave {
             return Ended::Left;
           }
-          if (session.superseded || session.name_held) && self.when_superseded == WhenSuperseded::GiveUp {
+          let giving_up = self.when_superseded == WhenSuperseded::GiveUp;
+          if (session.superseded || session.name_held) && giving_up {
             self.log.warn("name-given-up", json!({ "agent": self.config.agent_name }));
             return Ended::Superseded;
+          }
+          if let Some(holder) = session.machine_held.filter(|_| giving_up) {
+            self
+              .log
+              .warn("machine-given-up", json!({ "agent": self.config.agent_name, "holder": holder }));
+            return Ended::MachineHeld(holder);
           }
           if session.welcomed && started.elapsed() >= stable {
             attempt = 0;
@@ -226,6 +248,34 @@ impl Agent {
 
   fn backoff(&self, attempt: u32) -> Duration {
     backoff(self.config.redial_base, self.config.redial_cap, attempt, rand::random::<f64>())
+  }
+
+  /// Ask the hub which attached agent holds this agent's machine, before an install puts a second agent on it
+  /// (docs/architecture.md, 「Many agents, one hub」): a request to the agent address carrying the credential and the
+  /// machine's fingerprint, which the hub answers in place of an upgrade. None where no agent holds it.
+  pub async fn machine_held_by(&self) -> Result<Option<String>, String> {
+    let machine = self.machine.as_deref().ok_or("this machine's fingerprint could not be read")?;
+    let address = machine_query(&self.config.hub_url, machine)?;
+    let mut request = address.as_str().into_client_request().map_err(|error| error.to_string())?;
+    let credential = HeaderValue::from_str(&format!("Bearer {}", self.config.secret))
+      .map_err(|_| "the shared secret cannot be sent as a header".to_owned())?;
+    request.headers_mut().insert(AUTHORIZATION, credential);
+    match timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async_with_config(request, None, true)).await {
+      Ok(Err(WsError::Http(response))) if response.status() == 200 => Ok(
+        response
+          .headers()
+          .get(MACHINE_HELD_BY_HEADER)
+          .and_then(|holder| holder.to_str().ok())
+          .map(str::to_owned),
+      ),
+      Ok(Err(WsError::Http(response))) => Err(format!("the hub answered HTTP {}", response.status())),
+      Ok(Err(error)) => Err(format!("the hub could not be reached: {error}")),
+      Ok(Ok((mut socket, _))) => {
+        let _ = timeout(CLOSE_GRACE, socket.close(None)).await;
+        Err("the hub does not answer machine queries".to_owned())
+      }
+      Err(_) => Err(format!("the hub did not answer within {DIAL_TIMEOUT:?}")),
+    }
   }
 
   /// Tell the hub this agent is uninstalled, so it is forgotten rather than counted as disconnected.
@@ -266,6 +316,19 @@ impl Agent {
   }
 }
 
+// The hub's address asking after `machine`: its own path, `/` where it names none, and its query with the machine's
+// added.
+fn machine_query(hub_url: &str, machine: &str) -> Result<String, String> {
+  let uri: Uri = hub_url.parse().map_err(|error| format!("{hub_url}: {error}"))?;
+  let (scheme, authority) = match (uri.scheme_str(), uri.authority()) {
+    (Some(scheme), Some(authority)) => (scheme, authority.as_str()),
+    _ => return Err(format!("{hub_url} names no scheme and host")),
+  };
+  let path = if uri.path().is_empty() { "/" } else { uri.path() };
+  let query = uri.query().map_or(String::new(), |query| format!("{query}&"));
+  Ok(format!("{scheme}://{authority}{path}?{query}machine={machine}"))
+}
+
 // The one task that writes to the socket, so no handler ever waits on the writer it would block.
 fn writer(
   mut sink: SplitSink<Socket, Message>,
@@ -295,6 +358,8 @@ struct Outcome {
   superseded: bool,
   // The hub refused the hello because another instance holds the name.
   name_held: bool,
+  // The agent of another name the hub refused the hello for, holding the machine.
+  machine_held: Option<String>,
 }
 
 struct Session<'a> {
@@ -312,6 +377,7 @@ struct Session<'a> {
   leave: bool,
   superseded: bool,
   name_held: bool,
+  machine_held: Option<String>,
   last_inbound: Instant,
 }
 
@@ -342,6 +408,7 @@ impl<'a> Session<'a> {
       leave: false,
       superseded: false,
       name_held: false,
+      machine_held: None,
       last_inbound: Instant::now(),
     }
   }
@@ -400,6 +467,7 @@ impl<'a> Session<'a> {
       leave: self.leave,
       superseded: self.superseded,
       name_held: self.name_held,
+      machine_held: self.machine_held.clone(),
     }
   }
 
@@ -450,6 +518,7 @@ impl<'a> Session<'a> {
       Frame::Reject { reason } => {
         log.warn("rejected", json!({ "reason": reason }));
         self.name_held = reason == NAME_HELD_REASON;
+        self.machine_held = machine_holder(&reason).map(str::to_owned);
         self.agent.link.send_replace(Link::Refused(reason.clone()));
         return Some(format!("hub rejected the connection: {reason}"));
       }
@@ -554,6 +623,20 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_machine_query_keeps_the_hubs_path_and_query_and_names_a_path_where_it_has_none() {
+    assert_eq!(machine_query("ws://127.0.0.1:7000", "m1").unwrap(), "ws://127.0.0.1:7000/?machine=m1");
+    assert_eq!(
+      machine_query("wss://hub.example/agent", "m1").unwrap(),
+      "wss://hub.example/agent?machine=m1"
+    );
+    assert_eq!(
+      machine_query("wss://hub.example/a?x=1", "m1").unwrap(),
+      "wss://hub.example/a?x=1&machine=m1"
+    );
+    assert!(machine_query("not a url", "m1").is_err());
+  }
 
   #[test]
   fn the_redial_window_doubles_per_attempt_and_settles_at_the_cap() {

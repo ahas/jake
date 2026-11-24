@@ -9,6 +9,7 @@ mod exec;
 pub mod installed;
 pub mod instance;
 pub mod log;
+pub mod machine;
 pub mod pair;
 pub mod platform;
 mod stream;

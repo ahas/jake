@@ -542,6 +542,7 @@ export function formatStatus(snapshot: StatusSnapshot, now: number): string {
       `  in-flight commands: ${agent.inFlight.length > 0 ? agent.inFlight.join(", ") : "(none)"}`,
     );
     if ((agent.streams ?? []).length > 0) lines.push(`  open streams: ${agent.streams!.join(", ")}`);
+    if (agent.machine) lines.push(`  machine: ${agent.machine}`);
   }
   for (const agent of snapshot.departed ?? []) {
     lines.push(`${agent.name} departed ${formatDuration(now - agent.departedAt)} ago`);

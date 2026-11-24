@@ -37,6 +37,8 @@ Options:
   --stream-ports <list> the local ports a byte stream from the hub may reach, comma-separated, or
                         none (default: 22, this machine's sshd)
   --ssh-key <key>       a public key to add to ~/.ssh/authorized_keys, so ssh over the hub logs in
+  --replace             where another jake already serves this machine, run its own uninstaller
+                        first rather than refuse
   --non-interactive     never prompt; the secret and name must be passed or already in agent.env
   --update              an unattended update: never prompt, and put the previous binary back where the
                         new one does not reach the hub
@@ -55,6 +57,7 @@ SSH_KEY=""
 NON_INTERACTIVE=0
 UPDATE=0
 PRINT_CONFIG=0
+REPLACE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --hub-url) HUB_URL="${2:-}"; shift 2 ;;
@@ -67,6 +70,7 @@ while [ $# -gt 0 ]; do
     --stream-ports=*) STREAM_PORTS="${1#*=}"; shift ;;
     --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
     --ssh-key=*) SSH_KEY="${1#*=}"; shift ;;
+    --replace) REPLACE=1; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --update) UPDATE=1; NON_INTERACTIVE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
@@ -207,6 +211,8 @@ unit_stopped=0
 finish() {
   local code=$?
   [ -z "$stage" ] || rm -rf "$stage"
+  # A binary staged and never put in place, as when the install refused, is not left behind.
+  [ ! -f "$new_bin" ] || rm -f "$new_bin"
   if [ "$unit_stopped" -eq 1 ]; then
     warn "the install ended before it started the agent again, so it starts the agent now"
     if [ ! -f "$BIN" ] && [ -f "$PREVIOUS_BIN" ]; then
@@ -226,6 +232,148 @@ place_from_payload "uninstall.sh" "$stage/uninstall.sh"
 if [ "$UPDATE" -eq 1 ] && [ -f "$BIN" ]; then
   cp -f "$BIN" "$PREVIOUS_BIN"
 fi
+
+# --- Windows interop, where this is a WSL shell ----------------------------------------------------
+
+ps_quote() { # value → a PowerShell single-quoted literal
+  printf "'%s'" "${1//\'/\'\'}"
+}
+
+windows_powershell() { # → the path of Windows PowerShell reached through interop, or nothing
+  local path
+  if path="$(command -v powershell.exe 2>/dev/null)"; then printf '%s' "$path"; return 0; fi
+  path="$(wslpath -u 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 2>/dev/null)" || return 0
+  if [ -x "$path" ]; then printf '%s' "$path"; fi
+}
+
+run_powershell() { # powershell script → the last line the script printed, in UTF-8 with plain line ends
+  local encoded
+  encoded="$(printf '%s' "$2" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
+  "$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" 2>/dev/null \
+    | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1
+}
+
+# --- one jake per machine (docs/install.md, 「One jake per machine」) --------------------------------
+# One PC carries one jake agent whatever its names: a Windows install and an install in one of its WSL
+# distributions are two agents of one machine. Before anything is stopped or written, the install looks
+# for another and refuses to add a second, unless --replace has the other's own uninstaller run first.
+# An update refreshes the install already here, so it looks at none of this.
+
+# The Windows accounts' folders as this distribution mounts them; JAKE_WINDOWS_USERS points elsewhere.
+WINDOWS_USERS="${JAKE_WINDOWS_USERS:-/mnt/c/Users}"
+
+in_wsl() { [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
+
+# Each other jake found: where it is, its name, and the Windows folder its uninstaller stands in, or
+# nothing where this install cannot reach it.
+other_where=()
+other_name=()
+other_dir=()
+add_other() { other_where+=("$1"); other_name+=("$2"); other_dir+=("$3"); }
+
+find_other_installs() {
+  local dir name settings check holder own_name i known
+  if in_wsl; then
+    # A Windows install of any account, read through the mount with no Windows program started.
+    for dir in "$WINDOWS_USERS"/*/AppData/Local/Programs/jake; do
+      [ -f "$dir/jake.exe" ] && [ -f "$dir/agent.env" ] || continue
+      name="$(env_value "$dir/agent.env" JAKE_AGENT_NAME)"
+      [ -n "$name" ] || continue
+      add_other "a Windows install in $dir" "$name" "$dir"
+    done
+    for settings in "$WINDOWS_USERS"/*/AppData/Roaming/io.ahas.jake.desktop/settings.json; do
+      [ -f "$settings" ] && grep -q '"consoleUrl"' "$settings" 2>/dev/null || continue
+      warn "the BMO desktop app is set up on Windows ($settings); it keeps its own agent off beside an installed jake it sees, and the hub names it below where its agent is attached"
+    done
+  fi
+  # The hub's answer: the new binary reads this machine's fingerprint (keeping it, on WSL, where the
+  # agent's service reads it) and asks which attached agent holds it.
+  check="$(JAKE_HUB_URL="$HUB_URL" JAKE_SECRET="$SECRET" JAKE_AGENT_NAME="$AGENT_NAME" \
+    timeout 60 "$new_bin" --machine-check 2>/dev/null || true)"
+  holder="$(printf '%s\n' "$check" | sed -n 's/^held-by=//p' | head -n 1)"
+  case "$(printf '%s\n' "$check" | sed -n 's/^hub=//p' | head -n 1)" in
+    answered) : ;;
+    unanswered\ *) warn "the hub could not say whether another jake holds this machine: $(printf '%s\n' "$check" | sed -n 's/^hub=unanswered //p' | head -n 1)" ;;
+  esac
+  # This install, attached under the name it had before, is the one being replaced in place.
+  own_name="$(env_value "$ENV_FILE" JAKE_AGENT_NAME)"
+  if [ -n "$holder" ] && [ "$holder" != "$AGENT_NAME" ] && [ "$holder" != "$own_name" ]; then
+    known=0
+    for i in "${!other_name[@]}"; do [ "${other_name[$i]}" != "$holder" ] || known=1; done
+    [ "$known" -eq 1 ] || add_other "an agent the hub says holds this machine" "$holder" ""
+  fi
+}
+
+# Run a Windows install's own uninstaller through interop; it stops that install, tells the hub it left
+# and keeps its agent.env.
+uninstall_windows() { # folder
+  local powershell script answer
+  powershell="$(windows_powershell)"
+  [ -n "$powershell" ] || die "Windows interop is not reachable from here, so the Windows install in $1 cannot be removed: run its uninstall.ps1 on Windows, then run this install again"
+  script="try { & $(ps_quote "$(wslpath -w "$1/uninstall.ps1")") -InstallDir $(ps_quote "$(wslpath -w "$1")"); 'uninstalled' } catch { 'failed ' + \$_.Exception.Message }"
+  answer="$(run_powershell "$powershell" "$script")" || true
+  [ "$answer" = "uninstalled" ] || die "the Windows install in $1 could not be removed${answer:+: ${answer#failed }}"
+}
+
+settle_other_installs() {
+  local i
+  [ "$UPDATE" -eq 0 ] || return 0
+  step "looking for another jake on this machine"
+  find_other_installs
+  if [ "${#other_name[@]}" -eq 0 ]; then
+    ok "none found"
+    return 0
+  fi
+  for i in "${!other_name[@]}"; do
+    warn "${other_where[$i]}: ${other_name[$i]}"
+  done
+  if [ "$REPLACE" -eq 0 ]; then
+    die "another jake already serves this machine as ${other_name[0]}, and one machine carries one jake. Either join it: install nothing here, since this machine is ${other_name[0]}'s node, and ask the BMO administrator to bind your account to ${other_name[0]} as a shared node. Or replace it: run this install again with --replace, which runs its own uninstaller first."
+  fi
+  for i in "${!other_name[@]}"; do
+    if [ -z "${other_dir[$i]}" ]; then
+      die "${other_name[$i]} holds this machine from where this install cannot reach it, another WSL distribution or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/uninstall.sh in that distribution), or quit the desktop app, then run this install again"
+    fi
+    step "removing ${other_name[$i]} through its own uninstaller"
+    uninstall_windows "${other_dir[$i]}"
+    ok "removed"
+  done
+}
+
+settle_other_installs
+
+# --- the ports the agent listens on (docs/install.md, 「Ports」) -------------------------------------
+# The agent listens only on JAKE_LISTEN_PORTS. A port something else already listens on, on this side
+# or on Windows' side, which WSL shares or forwards its loopback to, stops the install rather than being
+# taken. The agent being replaced is not counted; nor, on Windows' side, the relay that forwards this
+# distribution's own listeners, which this side's check covers.
+
+check_listen_ports() {
+  local ports port own_pid line holder powershell answer script
+  [ "$UPDATE" -eq 0 ] || return 0
+  ports="$(env_value "$ENV_FILE" JAKE_LISTEN_PORTS)"
+  case "$ports" in ''|none|NONE|None) return 0 ;; esac
+  step "checking that nothing else listens on $ports"
+  own_pid="$(systemctl --user show --property=MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
+  for port in ${ports//,/ }; do
+    line="$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -v "pid=${own_pid:-0}," | head -n 1 || true)"
+    if [ -n "$line" ]; then
+      holder="$(printf '%s\n' "$line" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')"
+      die "port $port is already held on this machine by ${holder:-another program}; an install never takes a port another program holds. Free it, or take it out of JAKE_LISTEN_PORTS in $ENV_FILE."
+    fi
+  done
+  in_wsl || return 0
+  powershell="$(windows_powershell)"
+  [ -n "$powershell" ] || return 0
+  script="\$held = Get-NetTCPConnection -State Listen -LocalPort ${ports} -ErrorAction SilentlyContinue | ForEach-Object { \$name = (Get-Process -Id \$_.OwningProcess -ErrorAction SilentlyContinue).ProcessName; if (\$name -ne 'wslrelay') { \"\$(\$_.LocalPort) \$name\" } } | Select-Object -First 1; if (\$held) { \$held } else { 'free' }"
+  answer="$(run_powershell "$powershell" "$script")" || true
+  case "$answer" in
+    ''|free) : ;;
+    *) die "port ${answer%% *} is already held on Windows by ${answer#* }; an install never takes a port another program holds. Free it, or take it out of JAKE_LISTEN_PORTS in $ENV_FILE." ;;
+  esac
+}
+
+check_listen_ports
 
 # --- stop any running unit and put the binary in place ----------------------------------------------
 
@@ -323,6 +471,7 @@ wait_for_hub() { # mark
       log_tail="$(tail -c +"$((mark + 1))" "$log_file" 2>/dev/null || true)"
       case "$log_tail" in
         *'"event":"welcomed"'*) reached=1; return 0 ;;
+        *'machine held by another agent'*) failure="another jake holds this machine (see docs/install.md, One jake per machine)"; return 0 ;;
         *'"event":"rejected"'*) failure="the hub rejected the agent (the shared secret or the agent name is wrong)"; return 0 ;;
         *'"event":"dial-failed"'*) failure="the agent could not reach the hub (check the hub URL and that the hub is running)" ;;
       esac
@@ -373,24 +522,6 @@ fi
 # through the Windows jake executable's windowless hold. It needs Windows interop, which a WSL shell
 # has and the systemd service an unattended update runs in does not; without it the task is left as
 # it is.
-
-ps_quote() { # value → a PowerShell single-quoted literal
-  printf "'%s'" "${1//\'/\'\'}"
-}
-
-windows_powershell() { # → the path of Windows PowerShell reached through interop, or nothing
-  local path
-  if path="$(command -v powershell.exe 2>/dev/null)"; then printf '%s' "$path"; return 0; fi
-  path="$(wslpath -u 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 2>/dev/null)" || return 0
-  if [ -x "$path" ]; then printf '%s' "$path"; fi
-}
-
-run_powershell() { # powershell script → the last line the script printed, in UTF-8 with plain line ends
-  local encoded
-  encoded="$(printf '%s' "$2" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
-  "$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded" 2>/dev/null \
-    | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1
-}
 
 # The task's name for one distribution: its name with anything but letters, digits, dots and dashes
 # made a dash. The hold's executable, where one is needed, has a folder of the same name.

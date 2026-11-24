@@ -536,6 +536,12 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
   if let Some(reason) = unkept {
     log.warn("instance-not-kept", json!({ "reason": reason }));
   }
+  // It names the machine too, kept beside the instance where reading it starts a Windows program (docs/desktop.md,
+  // 「Pairing」).
+  let machine = jake_agent::machine::fingerprint(&app.path().app_config_dir()?.join("agent-machine"));
+  if let Some(reason) = &machine.unkept {
+    log.warn("machine-not-kept", json!({ "reason": reason }));
+  }
 
   // The course runs on a named server alone; with none, the bundled page asks for one and the app starts
   // again on it.
@@ -553,6 +559,7 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
         retries: retried,
         carrying: carrying.clone(),
         instance: instance.clone(),
+        machine: machine.fingerprint.clone(),
       }
       .run(),
     )

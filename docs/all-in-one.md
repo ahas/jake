@@ -95,6 +95,18 @@ flowchart TD
   reason; too little memory or disk is said and asked to be accepted. Where git, Rust or a C compiler is missing,
   as on a fresh system, the prerequisites (「Prerequisites」) come first, since preparing clones with git and builds
   the installer with Rust, and preparing follows them.
+- **The console's port, and another jake.** The check also reads two things of the machine the set shares:
+  - **Whether the console's port, 3210, is already held.** The probe reads it with `ss -ltnp` where the set will run,
+    and on Windows the app also tries the port on Windows' own loopback, which a WSL 2 distribution shares under
+    mirrored networking and forwards to otherwise. A listener there that is not the set's own — a process whose
+    executable or working folder stands in one of the set's releases under the install prefix — refuses the
+    machine, naming the port and the program that holds it: the set never takes a port another install on the
+    machine holds. The set's other ports are its installer's own.
+  - **Whether a jake agent is installed on the machine:** in the account the set runs in, an `agent.env` naming an
+    agent in `~/.local/share/jake` with its `jake-agent` user unit, and on Windows an installed jake on the Windows
+    side (docs/desktop.md, 「One agent per name」). The all-in-one carries and installs no jake agent, so it adds no
+    second agent to the machine; one found is said, naming it, as something to accept: this machine already serves
+    a BMO server as that agent's node, and the set beside it is a BMO of its own.
 - **Preparing.** The index is cloned from its public repository, or brought up to its main branch where it
   stands, and the installer is built from source as `INSTALL.md` 「Lay down the index and build the installer」
   states: the base libraries and the testbed cloned into the index, or brought up to their main branches where

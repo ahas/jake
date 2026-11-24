@@ -36,11 +36,15 @@ Connection handshake:
   for each local port the agent lets a byte stream reach. The shell names are just names; the
   protocol does not know what they mean. It may carry `instance`, the id of the install the agent
   runs from, which the hub tells two installs of one name apart by (docs/architecture.md, 「Many
-  agents, one hub」); a hello without it is from an agent that names none.
+  agents, one hub」); a hello without it is from an agent that names none. It may carry `machine`, the
+  fingerprint of the physical machine the agent runs on, which the hub keeps one agent per
+  (docs/architecture.md, 「The machine's fingerprint」); a hello without it is not checked for its
+  machine.
 - **welcome** — hub to agent, accepting the hello and naming the hub's version.
 - **reject** — hub to agent, refusing the hello with a stated reason. A hello under a name another
-  instance holds is refused with the reason `name held by another agent`, and the socket is then
-  closed.
+  instance holds is refused with the reason `name held by another agent`, and a hello whose machine an
+  attached agent of another name holds with the reason `machine held by another agent: <holder>`, the
+  holder's name after the colon; either way the socket is then closed with code 4009.
 
 Command execution (streaming):
 

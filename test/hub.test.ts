@@ -25,7 +25,7 @@ import {
 } from "./hub-process";
 import { StandInPort } from "./stand-in-port";
 import { HubClient, type UploadContent } from "../src/console/client";
-import { agentLaunchOf, ensureAgentBuilt, ensureLaunchBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
+import { AGENT_COMMAND, agentLaunchOf, ensureAgentBuilt, ensureLaunchBuilt, startAgentProcess, type AgentProcess } from "./agent-process";
 
 const V = PROTOCOL_VERSION;
 const SECRET = "s3cr3t";
@@ -424,6 +424,76 @@ describe("many agents", () => {
     await reader.ready;
     await second.waitFor((f) => f.type === "exec");
   });
+
+  test("a second agent of one machine under another name is refused naming the holder, and an install can ask who holds it", async () => {
+    const hub = await launch();
+    const ask = (secret: string) =>
+      fetch(`http://127.0.0.1:${hub.agentPort}/?machine=m-1`, { headers: { Authorization: `Bearer ${secret}` } });
+    expect((await ask("nope")).status).toBe(401);
+    const vacant = await ask(SECRET);
+    expect(vacant.status).toBe(200);
+    expect(vacant.headers.get("x-jake-machine-held-by")).toBeNull();
+    expect(await vacant.json()).toEqual({ heldBy: null });
+
+    // The hello is sent as JSON of its own, since it carries the machine the console's frames do not.
+    const sayHello = async (name: string, machine?: string): Promise<FakeAgent> => {
+      const agent = new FakeAgent(hub.agentPort, SECRET);
+      agents.push(agent);
+      expect(await agent.outcome()).toBe("open");
+      agent.ws.send(JSON.stringify({ type: "hello", v: V, agent: name, agentVersion: "0.1.0", capabilities: [], machine }));
+      return agent;
+    };
+    const holder = await sayHello("jake-wsl", "m-1");
+    await holder.waitFor((f) => f.type === "welcome");
+    const second = await sayHello("u63", "m-1");
+    await second.waitClose();
+    expect(second.closeCode).toBe(4009);
+    expect(second.received.some((f) => f.type === "reject" && f.reason === "machine held by another agent: jake-wsl")).toBe(true);
+    const unnamed = await sayHello("u4");
+    await unnamed.waitFor((f) => f.type === "welcome");
+    expect(holder.closeCode).toBeNull();
+
+    const held = await ask(SECRET);
+    expect(held.headers.get("x-jake-machine-held-by")).toBe("jake-wsl");
+    expect(await held.json()).toEqual({ heldBy: "jake-wsl" });
+    const status = await (await control(hub, "/status")).json();
+    expect(status.agents.map((a: { name: string; machine: string | null }) => [a.name, a.machine])).toEqual([
+      ["jake-wsl", "m-1"],
+      ["u4", null],
+    ]);
+  });
+
+  test("a real agent names its machine, a second one of another name is refused for it, and the machine check names the holder", async () => {
+    const hub = await launch();
+    const hubUrl = `ws://127.0.0.1:${hub.agentPort}`;
+    startRealAgent(hubUrl, SECRET);
+    let machine: string | null = null;
+    await until(async () => {
+      const agents = (await (await control(hub, "/status")).json()).agents as { name: string; machine: string | null }[];
+      machine = agents.find((agent) => agent.name === "hass")?.machine ?? null;
+      return machine !== null;
+    });
+    expect(machine).toMatch(/^[0-9a-f]{32}$/);
+
+    const home = mkdtempSync(join(tmpdir(), "jake-hub-second-"));
+    dirs.push(home);
+    const second = startAgentProcess({ hubUrl, secret: SECRET, name: "hass-two", home, env: { JAKE_REDIAL_BASE_MS: "20" } });
+    realAgents.push(second);
+    await until(() => second.log().some((line) => line.event === "rejected" && line.reason === "machine held by another agent: hass"));
+
+    const checking = mkdtempSync(join(tmpdir(), "jake-hub-check-"));
+    dirs.push(checking);
+    const check = Bun.spawn([...AGENT_COMMAND, "--machine-check"], {
+      cwd: checking,
+      env: { PATH: process.env.PATH ?? "", HOME: checking, JAKE_HUB_URL: hubUrl, JAKE_SECRET: SECRET, JAKE_AGENT_NAME: "hass-three" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const printed = await new Response(check.stdout).text();
+    expect(await check.exited).toBe(0);
+    expect(printed.split("\n").filter((line) => line !== "")).toEqual([`machine=${machine}`, "hub=answered", "held-by=hass"]);
+  }, 30_000);
 
   test("a named command goes to that agent only, and its output comes back from it", async () => {
     const hub = await launch();

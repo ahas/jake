@@ -10,13 +10,17 @@ use std::process::ExitCode;
 use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
 use jake_agent::platform::{self, Platform, Role};
 use jake_agent::wsl::{self, HOLD_WSL_FLAG};
-use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure, instance};
+use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure, instance, machine};
 use serde_json::json;
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
 const LEAVE_FLAG: &str = "--leave";
 /// The argument that has the executable print the build it is, and exit.
 const VERSION_FLAG: &str = "--version";
+/// The argument that has the executable read this machine's fingerprint, ask the hub which agent holds it, print
+/// both, and exit; the install runs it before it puts an agent on the machine (docs/install.md, 「One jake per
+/// machine」).
+const MACHINE_CHECK_FLAG: &str = "--machine-check";
 
 /// What one start of the executable does, by its arguments.
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +36,7 @@ enum Mode {
   Agent,
   Guard,
   Leave,
+  MachineCheck,
 }
 
 /// The invocation the arguments name. Anything else is refused rather than run as the agent, since a
@@ -41,13 +46,14 @@ fn invocation(arguments: &[String]) -> Result<Invocation, String> {
     [] => Ok(Invocation::Configured(Mode::Agent)),
     [flag] if flag == GUARD_MODE_FLAG => Ok(Invocation::Configured(Mode::Guard)),
     [flag] if flag == LEAVE_FLAG => Ok(Invocation::Configured(Mode::Leave)),
+    [flag] if flag == MACHINE_CHECK_FLAG => Ok(Invocation::Configured(Mode::MachineCheck)),
     [flag] if flag == VERSION_FLAG => Ok(Invocation::Version),
     [flag, distribution] if flag == HOLD_WSL_FLAG && !distribution.is_empty() => {
       Ok(Invocation::HoldWsl(distribution.clone()))
     }
     _ => Err(format!(
       "unknown arguments {arguments:?}; run with none for the agent, or with {GUARD_MODE_FLAG}, {LEAVE_FLAG}, \
-       {VERSION_FLAG} or {HOLD_WSL_FLAG} <distribution>"
+       {MACHINE_CHECK_FLAG}, {VERSION_FLAG} or {HOLD_WSL_FLAG} <distribution>"
     )),
   }
 }
@@ -84,6 +90,20 @@ impl Start {
       self.log.warn("instance-not-kept", json!({ "reason": reason }));
     }
     id
+  }
+
+  /// This machine's fingerprint, kept in the data directory where reading it starts a Windows program
+  /// (docs/architecture.md, 「The machine's fingerprint」).
+  fn machine(&self) -> Option<String> {
+    let path = PathBuf::from(Platform::HOST.join(&Platform::HOST.data_dir(&self.env), &["machine"]));
+    let reading = machine::fingerprint(&path);
+    if let Some(reason) = reading.unkept {
+      self.log.warn("machine-not-kept", json!({ "reason": reason }));
+    }
+    if reading.fingerprint.is_none() {
+      self.log.warn("machine-unread", json!({ "reason": "no machine id could be read" }));
+    }
+    reading.fingerprint
   }
 }
 
@@ -163,7 +183,9 @@ async fn run_agent(start: Start) -> ExitCode {
     "agent-starting",
     json!({ "hubUrl": start.config.hub_url, "agent": start.config.agent_name, "version": VERSION }),
   );
-  let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone()).instance(start.instance());
+  let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone())
+    .instance(start.instance())
+    .machine(start.machine());
   // The tunnel ends only on a hub's leave; by then every run and transfer it carried has ended.
   let leave = jake_agent::run(&agent, stop_requested(&log)).await == Ended::Left;
   // The watchdog stops before anything is torn down, so it neither rewrites an anchor nor revives the guard.
@@ -191,6 +213,7 @@ async fn run_guard(start: Start) -> ExitCode {
 }
 
 async fn run_leave(start: Start) -> ExitCode {
+  // The notice names no machine, so it is never refused for one another agent holds.
   let instance = start.instance();
   let agent = Agent::new(start.config, VERSION.to_owned(), start.log).instance(instance);
   match agent.announce_leave().await {
@@ -207,6 +230,24 @@ async fn run_leave(start: Start) -> ExitCode {
       ExitCode::FAILURE
     }
   }
+}
+
+/// Print this machine's fingerprint and which attached agent the hub says holds it, one `name=value` line each:
+/// `machine`, then `hub` as `answered` or `unanswered` with why, then `held-by` where an agent holds it.
+async fn run_machine_check(start: Start) -> ExitCode {
+  let machine = start.machine();
+  let agent = Agent::new(start.config, VERSION.to_owned(), start.log).machine(machine.clone());
+  println!("machine={}", machine.unwrap_or_default());
+  match agent.machine_held_by().await {
+    Ok(holder) => {
+      println!("hub=answered");
+      if let Some(holder) = holder {
+        println!("held-by={holder}");
+      }
+    }
+    Err(reason) => println!("hub=unanswered {reason}"),
+  }
+  ExitCode::SUCCESS
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
@@ -265,6 +306,7 @@ fn run_configured(mode: Mode) -> ExitCode {
       Mode::Agent => run_agent(start).await,
       Mode::Guard => run_guard(start).await,
       Mode::Leave => run_leave(start).await,
+      Mode::MachineCheck => run_machine_check(start).await,
     }
   })
 }
@@ -282,6 +324,7 @@ mod tests {
     assert_eq!(invoked(&[]), Ok(Invocation::Configured(Mode::Agent)));
     assert_eq!(invoked(&["--guard"]), Ok(Invocation::Configured(Mode::Guard)));
     assert_eq!(invoked(&["--leave"]), Ok(Invocation::Configured(Mode::Leave)));
+    assert_eq!(invoked(&["--machine-check"]), Ok(Invocation::Configured(Mode::MachineCheck)));
     assert_eq!(invoked(&["--version"]), Ok(Invocation::Version));
     assert_eq!(
       invoked(&["--hold-wsl", "Ubuntu-24.04"]),

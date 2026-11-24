@@ -19,3 +19,33 @@ if test -S "$runtime/systemd/private"; then echo systemd=yes; else echo systemd=
 if command -v git >/dev/null 2>&1; then echo git=yes; else echo git=no; fi
 if command -v cargo >/dev/null 2>&1 || test -x "$HOME/.cargo/bin/cargo"; then echo cargo=yes; else echo cargo=no; fi
 if command -v cc >/dev/null 2>&1; then echo cc=yes; else echo cc=no; fi
+# Whatever already listens on the console's port, and whether it runs from one of the set's own releases.
+console_port=3210
+listener="$(ss -ltnpH "sport = :$console_port" 2>/dev/null | head -n 1)"
+if test -z "$listener" && ! command -v ss >/dev/null 2>&1; then
+  # Without ss the kernel's own table says whether the port listens, though not who holds it.
+  hex="$(printf '%04X' "$console_port")"
+  if awk -v port=":$hex" '$2 ~ port"$" && $4 == "0A" { found = 1 } END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    listener="held"
+  fi
+fi
+if test -n "$listener"; then
+  echo console_port=held
+  pid="$(printf '%s\n' "$listener" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')"
+  printf 'console_port_holder=%s\n' "$(printf '%s\n' "$listener" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')"
+  own=no
+  if test -n "$pid"; then
+    for path in "$(readlink "/proc/$pid/exe" 2>/dev/null)" "$(readlink "/proc/$pid/cwd" 2>/dev/null)"; do
+      case "$path" in "$HOME"/.local/share/bmo-*) own=yes ;; esac
+    done
+  fi
+  printf 'console_port_own=%s\n' "$own"
+else
+  echo console_port=free
+fi
+# A jake agent installed for this account: its agent.env naming an agent, with its user unit registered.
+jake_env="$HOME/.local/share/jake/agent.env"
+jake_unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/jake-agent.service"
+if test -f "$jake_env" && test -f "$jake_unit"; then
+  printf 'jake=%s\n' "$(sed -n 's/^[[:space:]]*JAKE_AGENT_NAME=//p' "$jake_env" | head -n 1 | tr -d "\"'")"
+fi

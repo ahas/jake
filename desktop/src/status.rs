@@ -36,6 +36,9 @@ pub enum AgentState {
   Paused,
   /// An installed agent of this name is on the machine, so the built-in one stays off.
   HeldOff(String),
+  /// A jake of the other name given serves this machine, found installed here or named by the hub's refusal, so the
+  /// built-in one stays off.
+  MachineHeld(String),
   /// The installed agent's uninstaller runs, after which the built-in agent starts.
   Switching,
   /// The installed agent's uninstaller could not stop it, for the reason given, so it serves on.
@@ -162,6 +165,7 @@ impl AgentState {
       Self::NoStore(_)
         | Self::PairingFailed(_)
         | Self::HeldOff(_)
+        | Self::MachineHeld(_)
         | Self::SwitchFailed { .. }
         | Self::Yielded(_)
         | Self::Removed
@@ -170,7 +174,7 @@ impl AgentState {
 
   /// Whether the page offers to switch from the installed agent to the built-in one.
   pub fn offers_switch(&self) -> bool {
-    matches!(self, Self::HeldOff(_) | Self::SwitchFailed { .. })
+    matches!(self, Self::HeldOff(_) | Self::MachineHeld(_) | Self::SwitchFailed { .. })
   }
 
   fn words(&self) -> (String, Vec<String>, Tone, Option<Action>) {
@@ -245,6 +249,18 @@ impl AgentState {
         Tone::Good,
         Some(Action::LookAgain),
       ),
+      Self::MachineHeld(holder) => (
+        "다른 jake가 이 PC를 사용합니다".into(),
+        vec![
+          format!("이 PC에는 이미 다른 이름({holder})의 jake 에이전트가 있어 내장 에이전트는 켜지 않았습니다."),
+          format!(
+            "그 jake를 계속 사용하면 이 PC는 {holder} 기기로 BMO에 연결됩니다. 이 계정에서 쓰려면 BMO 관리자가 공유 기기로 지정합니다."
+          ),
+          "내장 에이전트로 전환하면 그 jake를 중지하고 제거합니다. 설정 파일(agent.env)과 로그는 남습니다.".into(),
+        ],
+        Tone::Idle,
+        Some(Action::LookAgain),
+      ),
       Self::Switching => (
         "내장 에이전트로 전환하는 중".into(),
         line("설치된 jake를 중지하고 제거하는 중입니다."),
@@ -310,6 +326,7 @@ mod tests {
       AgentState::NoStore("none".to_owned()),
       AgentState::PairingFailed(PairingFailure::Gone),
       AgentState::HeldOff("agent-a".to_owned()),
+      AgentState::MachineHeld("jake-wsl".to_owned()),
       AgentState::SwitchFailed {
         name: "agent-a".to_owned(),
         reason: "failed".to_owned(),
@@ -337,11 +354,12 @@ mod tests {
   #[test]
   fn an_installed_agent_in_use_offers_the_switch_and_nothing_else_does() {
     let held = AgentState::HeldOff("agent-a".to_owned());
+    let machine = AgentState::MachineHeld("jake-wsl".to_owned());
     let failed = AgentState::SwitchFailed {
       name: "agent-a".to_owned(),
       reason: "the uninstaller ended with 1".to_owned(),
     };
-    for state in [&held, &failed] {
+    for state in [&held, &machine, &failed] {
       let view = Status {
         console: ConsoleState::Shown,
         agent: state.clone(),
@@ -351,6 +369,13 @@ mod tests {
       assert_eq!(view.action, Some(Action::LookAgain), "{state:?}");
     }
     assert!(failed.words().1.iter().any(|line| line.contains("ended with 1")));
+    assert!(
+      machine
+        .words()
+        .1
+        .iter()
+        .any(|line| line.contains("jake-wsl") && line.contains("공유 기기"))
+    );
     for state in [
       AgentState::Switching,
       AgentState::Link(Link::Attached),

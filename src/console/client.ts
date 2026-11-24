@@ -8,6 +8,8 @@ export interface AgentStatus {
   name: string;
   agentVersion: string;
   capabilities: string[];
+  /** The fingerprint of the machine the agent said hello from; null or absent where it named none. */
+  machine?: string | null;
   connectedAt: number;
   lastPongAt: number;
   /** The ids of the commands still streaming on this agent. */

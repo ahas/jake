@@ -9,8 +9,8 @@
 - The desktop app is the other way: BMO's web console as an app of its own that carries the agent
   inside it and is joined by approving it in the console, with no secret typed. It is described in
   docs/desktop.md; this guide is the one-line install, which works as it always has beside it. Give
-  the two different machines, or one of them alone: on a machine where an installed agent of the same
-  name runs, the app keeps its own agent off.
+  the two different machines, or one of them alone: on a machine where an installed agent runs, the app
+  keeps its own agent off.
 - No administrator rights are needed. Everything runs in his own user account.
 
 ## One-line install
@@ -50,8 +50,8 @@ The install needs three values, and nothing more:
   script; a copy no deployment published has none, and an empty answer stops the install.
 - **Shared secret** — the secret the hub also holds. It is not shown while typed.
 - **Agent name** — this agent's name, which is how the hub and the console tell this machine from
-  the others. The hub holds one connection per name: give every machine its own, because a second
-  install under a name already attached replaces the first.
+  the others. The hub holds one connection per name and one agent per machine: give every machine its
+  own name, and every machine one install (「One jake per machine」).
 
 Run interactively, the script asks for the three; the secret and the name have no default and must
 be given. On a re-run the values already in `agent.env` are offered instead, and an empty answer
@@ -61,8 +61,68 @@ published script names one):
 - Linux/WSL: `curl -fsSL <download address>/install.sh | bash -s -- --hub-url wss://<hub name> --secret '<shared secret>' --agent-name '<this agent name>'`
 - Windows: run `install.ps1` with `-HubUrl wss://<hub name> -Secret '<shared secret>' -AgentName '<this agent name>'`.
 
+Both also take `--replace` (Linux/WSL) or `-Replace` (Windows), which replaces another jake already on
+this machine rather than refusing (「One jake per machine」).
+
 The shared secret is written only to that machine's config file (`agent.env`). It is in neither the
 repository nor the executable.
+
+## One jake per machine
+
+One physical PC carries one jake agent, whatever its names and its sides: a Windows install and an
+install inside one of its WSL distributions are two agents of one machine, and the hub attaches only the
+first (docs/architecture.md, 「Many agents, one hub」). So before it installs, the install looks for another
+jake serving this machine, and refuses to add a second one.
+
+- **What it looks at,** before anything is stopped or written, with as few programs started across
+  the WSL boundary as it can — each such start costs Windows dearly: from WSL, at most the one read of
+  the fingerprint through interop, and from Windows one `wsl.exe` call:
+  - **From WSL** (`install.sh`): a Windows install, an executable with an `agent.env` naming an agent in
+    `AppData\Local\Programs\jake` of any account under `C:\Users`, read through `/mnt/c` with no Windows
+    program started. The BMO desktop app set up on Windows, its `settings.json` naming a server, is said
+    as a note: its built-in agent's name is kept in Windows' credential store, which the install does
+    not read, and the hub's answer below names it where it is attached. Another WSL distribution's
+    install is seen through the hub's answer alone, since every distribution of a PC reports the
+    Windows host's fingerprint.
+  - **From Windows** (`install.ps1`): the default WSL distribution, through one `wsl.exe` call that
+    prints the name in its `jake-agent` install, where the unit is registered, and the ports listening
+    there; and the BMO desktop app's `settings.json`, said as a note as above. The desktop app keeps its
+    own agent off beside an installed one it sees (docs/desktop.md, 「One agent per name」).
+  - **The hub's answer:** the new executable, run as `jake --machine-check` with the values being
+    installed, reads this machine's fingerprint (on WSL through interop, once, keeping it in the data
+    directory, where the agent's service then reads it with no interop of its own) and asks the hub
+    whether an attached agent holds it. The hub names its holder; a holder of another name than the
+    one being installed is another jake on this machine. A hub that cannot be reached, or does not
+    answer the question, leaves the local look alone to decide.
+
+  An install in the same place as this one, `~/.local/share/jake` in this distribution or the install
+  folder on Windows, is this install run again, not a second one, and is replaced as always.
+- **What it says.** Another jake found, the install stops before changing anything and names it, where
+  it is and under what name, with the two ways on:
+  - **Join it:** do nothing more here. This machine is that install's node; the BMO administrator binds
+    the account that wanted this install to that node as a shared node.
+  - **Replace it:** run the install again with `--replace` (Linux/WSL) or `-Replace` (Windows). The
+    other install's own uninstaller runs first — a Windows install's `uninstall.ps1` from WSL through
+    interop, a WSL install's `uninstall.sh` from Windows through `wsl.exe` — which stops it, tells the
+    hub it left and keeps its `agent.env` (「Uninstall」); then this install goes on. A holder the hub
+    names that the install cannot reach from here, another WSL distribution or the desktop app, is not
+    removed: the install says to run that one's uninstaller where it is, or to quit the desktop app,
+    and stops.
+- **An update looks at none of this.** `--update` and `-Update` refresh the install already on the
+  machine, so they never stop for another.
+
+### Ports
+
+An install never takes a loopback port another program on the machine holds. The agent listens only on
+the ports `JAKE_LISTEN_PORTS` names (「SSH over the tunnel」), and under WSL's mirrored networking a
+Windows program and a WSL program share one loopback, so a port one side holds the other cannot take.
+Before it stops anything, the install checks each of those ports on both sides — on Linux with
+`ss -ltn`, on Windows with `Get-NetTCPConnection -State Listen`; from WSL the Windows side through one
+more interop call made only for those ports, and from Windows the WSL side through the one `wsl.exe`
+call above — and where something other than the agent being replaced listens there, it stops,
+naming the port and the program holding it. With no `JAKE_LISTEN_PORTS`, the default, there is nothing
+to check and nothing is started for it. An update refreshes the agent already listening there, and checks
+none of them.
 
 ## Installing from a build folder
 
@@ -216,6 +276,8 @@ The install starts the agent, watches briefly whether it reaches the hub, and re
 
 - **connected to the hub** — attached. Done.
 - **the hub rejected the agent** — the hub answered but refused the shared secret or the agent name.
+- **another jake holds this machine** — the hub refused the agent because an agent of another name on
+  this machine is attached (「One jake per machine」).
 - **could not reach the hub** — no answer came from the address: the URL is wrong, or the hub or the
   path to it is down.
 

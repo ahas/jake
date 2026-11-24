@@ -230,7 +230,10 @@ async fn perform(app: &AppHandle, shared: &Arc<Shared>, work: Work) -> Option<Ev
       }
       let line = shared.host.script(&[], &[], As::Account);
       let ended = run(&line, Some(probe::SCRIPT.to_owned()), |_| {}).await;
-      let facts = probe::facts(&ended.out);
+      let facts = match shared.host {
+        Host::Local => probe::facts(&ended.out),
+        Host::Wsl { .. } => probe::with_windows_side(probe::facts(&ended.out)),
+      };
       *shared.layout.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Layout {
         home: facts.home.clone(),
       });

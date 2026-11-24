@@ -45,6 +45,10 @@
   Never prompt. Requires Secret and AgentName to be passed as arguments or already in agent.env;
   HubUrl falls back to the default.
 
+.PARAMETER Replace
+  Where another jake already serves this machine, a WSL install of it among them, run that install's own
+  uninstaller first rather than refuse (INSTALL.md, One jake per machine).
+
 .PARAMETER Update
   An unattended update: never prompt, and put the previous executable back where the new one does not
   reach the hub, ending with an error. Whatever fails once the pair is stopped, the install leaves an
@@ -59,6 +63,7 @@ param(
   [string]$SshKey,
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\jake",
   [switch]$NonInteractive,
+  [switch]$Replace,
   [switch]$Update
 )
 
@@ -271,6 +276,7 @@ function Wait-ForHub($logMark) {
     if ($i -gt 0) { Start-Sleep -Seconds 1 }
     $tail = Read-LogSince $logMark
     if ($tail -match '"event":"welcomed"') { return @{ Reached = $true; Failure = $null } }
+    if ($tail -match 'machine held by another agent') { return @{ Reached = $false; Failure = "another jake holds this machine (see INSTALL.md, One jake per machine)" } }
     if ($tail -match '"event":"rejected"') { return @{ Reached = $false; Failure = "the hub rejected the agent (the shared secret or the agent name is wrong)" } }
     if ($tail -match '"event":"dial-failed"') { $failure = "the agent could not reach the hub (check the hub URL and that the hub is running)" }
     if ($null -eq $startedAt -and $tail -match '"event":"agent-starting"') { $startedAt = $i }
@@ -279,6 +285,129 @@ function Wait-ForHub($logMark) {
   }
   if ($null -eq $startedAt) { $failure = "the agent did not start within $StartSeconds seconds" }
   return @{ Reached = $false; Failure = $failure }
+}
+
+# --- one jake per machine (INSTALL.md, One jake per machine) --------------------------------------
+# One PC carries one jake agent whatever its names: this Windows install and an install in one of its WSL
+# distributions are two agents of one machine. Before anything is stopped or written, the install looks for
+# another and refuses to add a second, unless -Replace has the other's own uninstaller run first. An update
+# refreshes the install already here, so it looks at none of this.
+
+# The one look into WSL: the default distribution's name, the agent its jake install names where its unit is
+# registered, and the TCP ports listening there, all from one wsl.exe call, since every start of a WSL program
+# costs Windows dearly. The script goes over as base64, so no quoting stands between PowerShell and the shell.
+# Refuse before anything is written: a downloaded payload is removed, and the install ends with why.
+function Stop-Install($message) {
+  if ($TempPayload -and (Test-Path $TempPayload)) {
+    Remove-Item -LiteralPath $TempPayload -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  throw $message
+}
+
+function Read-WslSide {
+  $side = @{ Distribution = $null; Agent = $null; Listening = @{} }
+  if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $side }
+  $script = @'
+printf 'distribution=%s\n' "$WSL_DISTRO_NAME"
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/jake-agent.service"
+config="$HOME/.local/share/jake/agent.env"
+if [ -f "$unit" ] && [ -f "$config" ]; then printf 'jake=%s\n' "$(sed -n 's/^[[:space:]]*JAKE_AGENT_NAME=//p' "$config" | head -n 1 | tr -d "\"'")"; fi
+ss -ltnpH 2>/dev/null | while read -r state recv send local peer rest; do printf 'listen=%s %s\n' "${local##*:}" "$(printf '%s' "$rest" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')"; done
+'@
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script.Replace("`r", '')))
+  try { $lines = @(& wsl.exe -e sh -c "echo $encoded | base64 -d | sh" 2>$null) } catch { return $side }
+  foreach ($line in $lines) {
+    $t = "$line".Trim()
+    if ($t.StartsWith('distribution=')) { $side.Distribution = $t.Substring(13) }
+    elseif ($t.StartsWith('jake=') -and $t.Length -gt 5) { $side.Agent = $t.Substring(5) }
+    elseif ($t.StartsWith('listen=')) {
+      $parts = $t.Substring(7).Split(' ', 2)
+      $side.Listening[$parts[0]] = $(if ($parts.Count -gt 1) { $parts[1] } else { '' })
+    }
+  }
+  return $side
+}
+
+# The hub's answer: the new executable, where it still stands in the payload, reads this machine's fingerprint and
+# asks which attached agent holds it, with the values being installed laid over its environment for that run alone.
+function Read-HubHolder {
+  $values = @{ JAKE_HUB_URL = $HubUrl; JAKE_SECRET = $Secret; JAKE_AGENT_NAME = $AgentName }
+  $saved = @{}
+  foreach ($key in $values.Keys) {
+    $saved[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+    [Environment]::SetEnvironmentVariable($key, $values[$key], 'Process')
+  }
+  try {
+    $check = @(& (Join-Path $Payload $Binary) --machine-check 2>$null | ForEach-Object { "$_".Trim() })
+  } catch {
+    $check = @()
+  } finally {
+    foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key], 'Process') }
+  }
+  $unanswered = $check | Where-Object { $_.StartsWith('hub=unanswered ') } | Select-Object -First 1
+  if ($unanswered) { Write-Warn2 "the hub could not say whether another jake holds this machine: $($unanswered.Substring(15))" }
+  $held = $check | Where-Object { $_.StartsWith('held-by=') } | Select-Object -First 1
+  if ($held) { return $held.Substring(8) }
+  return $null
+}
+
+$WslSide = $null
+if (-not $Update) {
+  Write-Step "looking for another jake on this machine"
+  $WslSide = Read-WslSide
+  $others = @()
+  if ($WslSide.Agent) {
+    $others += @{ Where = "a WSL install in $($WslSide.Distribution)"; Name = $WslSide.Agent; Distribution = $WslSide.Distribution }
+  }
+  $desktopSettings = if ($env:APPDATA) { Join-Path $env:APPDATA 'io.ahas.jake.desktop\settings.json' } else { $null }
+  if ($desktopSettings -and (Test-Path -LiteralPath $desktopSettings) -and ((Get-Content -Raw -LiteralPath $desktopSettings) -match '"consoleUrl"')) {
+    Write-Warn2 "the BMO desktop app is set up here ($desktopSettings); it keeps its own agent off beside an installed jake it sees, and the hub names it below where its agent is attached"
+  }
+  $holder = Read-HubHolder
+  # This install, attached under the name it had before, is the one being replaced in place.
+  $ownName = Get-EnvValue $existingEnv 'JAKE_AGENT_NAME'
+  if ($holder -and $holder -ne $AgentName -and $holder -ne $ownName -and -not ($others | Where-Object { $_.Name -eq $holder })) {
+    $others += @{ Where = 'an agent the hub says holds this machine'; Name = $holder; Distribution = $null }
+  }
+  if ($others.Count -eq 0) {
+    Write-Ok "none found"
+  } else {
+    foreach ($other in $others) { Write-Warn2 "$($other.Where): $($other.Name)" }
+    $first = $others[0].Name
+    if (-not $Replace) {
+      Stop-Install "another jake already serves this machine as $first, and one machine carries one jake. Either join it: install nothing here, since this machine is $first's node, and ask the BMO administrator to bind your account to $first as a shared node. Or replace it: run this install again with -Replace, which runs its own uninstaller first."
+    }
+    foreach ($other in $others) {
+      if (-not $other.Distribution) {
+        Stop-Install "$($other.Name) holds this machine from where this install cannot reach it, a WSL distribution other than the default or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/uninstall.sh in that distribution), or quit the desktop app, then run this install again."
+      }
+      Write-Step "removing $($other.Name) through its own uninstaller"
+      & wsl.exe -d $other.Distribution -e bash -c 'bash "$HOME/.local/share/jake/uninstall.sh"'
+      if ($LASTEXITCODE -ne 0) { Stop-Install "$($other.Name) in $($other.Distribution) could not be removed: its uninstaller ended with $LASTEXITCODE." }
+      Write-Ok "removed"
+    }
+  }
+
+  # --- the ports the agent listens on (INSTALL.md, Ports) ---------------------------------------
+  # The agent listens only on JAKE_LISTEN_PORTS. A port something else already listens on, on Windows or in
+  # WSL, which shares or is forwarded Windows' loopback, stops the install rather than being taken; this
+  # install's own running agent is not counted.
+  $listenPorts = Get-EnvValue $existingEnv 'JAKE_LISTEN_PORTS'
+  if ($listenPorts -and $listenPorts -ne 'none') {
+    Write-Step "checking that nothing else listens on $listenPorts"
+    foreach ($port in $listenPorts.Split(',')) {
+      $port = $port.Trim()
+      $held = Get-NetTCPConnection -State Listen -LocalPort ([int]$port) -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue } |
+        Where-Object { -not ($_.Name -eq 'jake' -and $_.Path -eq $Exe) } | Select-Object -First 1
+      if ($held) { Stop-Install "port $port is already held on this machine by $($held.Name); an install never takes a port another program holds. Free it, or take it out of JAKE_LISTEN_PORTS in $existingEnv." }
+      if ($WslSide.Listening.ContainsKey($port)) {
+        $program = $WslSide.Listening[$port]
+        if (-not $program) { $program = 'another program' }
+        Stop-Install "port $port is already held in WSL ($($WslSide.Distribution)) by $program; an install never takes a port another program holds. Free it, or take it out of JAKE_LISTEN_PORTS in $existingEnv."
+      }
+    }
+  }
 }
 
 # --- stage the payload beside the executable, while the pair still runs ---------------------------

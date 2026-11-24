@@ -21,6 +21,24 @@ pub const SUPERSEDED_REASON: &str = "superseded by a new connection";
 /// the name stays, and an agent that gives its name up rather than redial reads its refusal by it.
 pub const NAME_HELD_REASON: &str = "name held by another agent";
 
+/// The start of the reason the hub refuses a hello with where an attached agent of another name holds its machine;
+/// the holder's name follows after a colon and a space.
+pub const MACHINE_HELD_REASON: &str = "machine held by another agent";
+
+/// The header the hub's answer to a machine query names the machine's holder in, where an attached agent holds it;
+/// a WebSocket client reads it from the answer it did not upgrade on.
+pub const MACHINE_HELD_BY_HEADER: &str = "x-jake-machine-held-by";
+
+/// The reason the hub refuses a hello with where the agent `holder` holds its machine.
+pub fn machine_held_reason(holder: &str) -> String {
+  format!("{MACHINE_HELD_REASON}: {holder}")
+}
+
+/// The holder a machine-held refusal names, or none where the reason is another.
+pub fn machine_holder(reason: &str) -> Option<&str> {
+  reason.strip_prefix(MACHINE_HELD_REASON)?.strip_prefix(": ")
+}
+
 /// The decoded size of one file-transfer chunk, held far below either side's payload cap.
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 
@@ -135,6 +153,9 @@ pub enum Frame {
     /// The install the agent runs from, which tells two installs of one name apart; none from an agent that
     /// names none.
     instance: Option<String>,
+    /// The fingerprint of the physical machine the agent runs on, which the hub keeps one agent per; none from an
+    /// agent that names none.
+    machine: Option<String>,
   },
   Welcome {
     hub_version: String,
@@ -283,11 +304,15 @@ impl Frame {
         agent_version,
         capabilities,
         instance,
+        machine,
       } => {
         let mut fields =
           json!({ "agent": agent, "agentVersion": agent_version, "capabilities": capabilities });
         if let Some(instance) = instance {
           fields["instance"] = json!(instance);
+        }
+        if let Some(machine) = machine {
+          fields["machine"] = json!(machine);
         }
         fields
       }
@@ -500,11 +525,17 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
         Some(Value::String(instance)) => Some(instance.clone()),
         Some(_) => return bad("hello.instance must be a string"),
       };
+      let machine = match o.get("machine") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(machine)) => Some(machine.clone()),
+        Some(_) => return bad("hello.machine must be a string"),
+      };
       Ok(Frame::Hello {
         agent,
         agent_version,
         capabilities,
         instance,
+        machine,
       })
     }
     "welcome" => Ok(Frame::Welcome {
@@ -731,6 +762,30 @@ mod tests {
     let wrong =
       r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[],"instance":7}"#;
     assert_eq!(code_of(wrong), "bad-field");
+  }
+
+  #[test]
+  fn a_hello_carries_its_machine_where_it_names_one() {
+    let named = r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[],"instance":"i-1","machine":"m-1"}"#;
+    let frame = decode_frame(named, CAP).expect("valid");
+    assert!(matches!(&frame, Frame::Hello { machine: Some(machine), .. } if machine == "m-1"));
+    assert_eq!(frame.encode(), named);
+
+    let unnamed = r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[]}"#;
+    assert!(matches!(decode_frame(unnamed, CAP).expect("valid"), Frame::Hello { machine: None, .. }));
+
+    let wrong =
+      r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[],"machine":7}"#;
+    assert_eq!(code_of(wrong), "bad-field");
+  }
+
+  #[test]
+  fn a_machine_held_reason_names_its_holder_and_reads_back() {
+    let reason = machine_held_reason("jake-wsl");
+    assert_eq!(reason, "machine held by another agent: jake-wsl");
+    assert_eq!(machine_holder(&reason), Some("jake-wsl"));
+    assert_eq!(machine_holder(NAME_HELD_REASON), None);
+    assert_eq!(machine_holder(SUPERSEDED_REASON), None);
   }
 
   #[test]
