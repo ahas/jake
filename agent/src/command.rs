@@ -71,3 +71,22 @@ pub async fn finish(argv: &[String], within: Duration) -> Result<(), String> {
     Err(_) => Err(format!("{} did not finish within {within:?} and was ended", argv[0])),
   }
 }
+
+/// Start a program that outlives this one: with no window, in a process group of its own, and out of any
+/// job that would end it with this process where the job lets it leave.
+pub fn spawn_detached(argv: &[String]) -> Result<(), String> {
+  let (program, arguments) = argv.split_first().ok_or("an empty command")?;
+  let mut command = std::process::Command::new(program);
+  command.args(arguments).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    command.creation_flags(CHILD_CREATION_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+    if command.spawn().is_ok() {
+      return Ok(());
+    }
+    command.creation_flags(CHILD_CREATION_FLAGS);
+  }
+  command.spawn().map(drop).map_err(|error| format!("{program}: {error}"))
+}

@@ -404,15 +404,22 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   the agent. When only the guard is up, it revives the agent first and the leave waits for that. The
   agent then stops its own watchdog, so it stops rewriting anchors and reviving the guard; it stops
   the guard by the process id the guard records in its single-instance lock, ending the guard's whole
-  tree, so the guard stops rewriting anchors and reviving the agent. With neither process restoring
-  anything, it removes all three anchors for both run modes, hands the file deletion to a separate,
-  self-owned cleanup, and exits.
-- The Windows cleanup cannot be the agent itself: a running executable cannot delete its own file. It
-  is therefore a one-shot scheduled task, run the same way the watchdog relaunches a peer — Task
-  Scheduler owns the process, so it outlives the agent's exit. The cleanup waits for the executable to
-  become deletable, which happens once the agent has exited and released it, then deletes the
-  executable, the whole install folder, and the whole data directory (log, heartbeats, locks), and
-  finally deletes its own task, so the uninstall leaves nothing running and nothing registered.
+  tree, so the guard stops rewriting anchors and reviving the agent. Its own lock is given up with the
+  watchdog. With neither process restoring anything, it hands the rest to the install's own
+  uninstaller (「The uninstaller」): it starts its executable as `jake.exe uninstall --name <its name>
+  --yes --remove-config`, detached — no window, a process group of its own, outside any job that would
+  end it with the agent where the job lets it leave — and exits. The uninstaller ends any process of
+  the pair still running from the install, tells the hub (which has recorded the departure already),
+  removes all three anchors for both run modes, and starts its own detached cleanup, which waits for
+  the executable to become deletable, once the agent and the uninstaller have both exited, then deletes
+  the whole install folder and the whole data directory (log, heartbeats, locks), so the leave leaves
+  nothing running and nothing registered.
+- The removal cannot be the agent itself, since a running executable cannot delete its own file, and
+  it is no scheduled task either: a task's command line holds at most 261 characters, far fewer than a
+  cleanup script handed to PowerShell takes, so registering one could fail and strand the files. A
+  detached uninstaller needs no registration and is the same removal a person runs by hand. Where it
+  cannot be started, the agent removes all three anchors for both run modes itself, so nothing revives
+  it, and writes to its log that the files stay behind.
 - The departure is idempotent in spirit rather than transactional: each step is guarded so one failure
   does not strand the rest, because a half-removed install is worse than one that pressed on. Nothing
   needs an administrator account, matching the rest of the per-user scheme.
@@ -426,7 +433,8 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   on Windows), so removing an install needs nothing but the executable the install placed: a machine
   whose policy refuses every PowerShell script file can still remove it. The uninstall scripts the
   install leaves beside it only run that command with the options they were given, and the desktop
-  app's switch to its built-in agent and an install's replacement of another run it too.
+  app's switch to its built-in agent, an install's replacement of another and a Windows agent's
+  leave (「Leaving」) run it too.
 - It removes the install it belongs to, the folder its own executable stands in, and nothing else. It
   takes three options: `--name` with the agent's name, `--yes`, and `--remove-config`.
 - **It checks whose install it is before it touches anything.** The agent an install serves is the

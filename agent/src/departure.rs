@@ -9,14 +9,9 @@ use serde_json::json;
 use crate::command;
 use crate::exec::tree_kill_command;
 use crate::log::Log;
-use crate::pair::{
-  JAKE_BINARY, anchor_remove_commands, install_targets, powershell_command, ps_single_quote, read_number,
-  task_run_command,
-};
+use crate::pair::{JAKE_BINARY, anchor_remove_commands, install_targets, read_number};
 use crate::platform::{Platform, SYSTEMD_UNIT_NAME};
-
-/// The one-shot task the Windows cleanup runs under; it deletes itself as its last act.
-pub const DEPART_TASK_NAME: &str = "JakeDepart";
+use crate::uninstall;
 
 /// The transient unit the Linux teardown runs under, so stopping the agent's unit cannot kill it.
 pub const DEPART_UNIT_NAME: &str = "jake-depart";
@@ -50,95 +45,67 @@ pub fn linux_depart_command(unit_path: &str, data_dir: &str) -> Vec<String> {
     .collect()
 }
 
-/// What the Windows cleanup runs once the agent has exited: it waits for the executable to become
-/// deletable, removes the install folder and the data directory, and last deletes its own task.
-pub fn windows_cleanup_script(install_dir: &str, data_dir: &str) -> String {
-  let mut lines = exe_released_lines(install_dir);
-  lines.extend([
-    format!(
-      "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
-      ps_single_quote(install_dir)
-    ),
-    format!(
-      "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
-      ps_single_quote(data_dir)
-    ),
-    format!("schtasks /delete /tn {DEPART_TASK_NAME} /f"),
-  ]);
-  lines.join("\n")
+/// The install's own uninstaller, asked to remove this agent's install whole and unattended: it is started
+/// detached once the agent has stopped its watchdog and ended the guard, and does the rest as a removal by
+/// hand does it, so no scheduled task and no long command line is needed (docs/architecture.md, 「Leaving」).
+pub fn windows_uninstall_command(install_dir: &str, agent_name: &str) -> Vec<String> {
+  let options = uninstall::Options {
+    name: Some(agent_name.to_owned()),
+    yes: true,
+    remove_config: true,
+  };
+  std::iter::once(Platform::Windows.join(install_dir, &[JAKE_BINARY]))
+    .chain(options.arguments())
+    .collect()
 }
 
-/// The lines of a Windows cleanup that wait for the install's executable to become deletable, once the
-/// process running it has exited, and delete it.
-pub(crate) fn exe_released_lines(install_dir: &str) -> Vec<String> {
-  let exe = Platform::Windows.join(install_dir, &[JAKE_BINARY]);
-  vec![
-    format!("$exe = {}", ps_single_quote(&exe)),
-    "for ($i = 0; $i -lt 100; $i++) {".to_owned(),
-    "  if (-not (Test-Path -LiteralPath $exe)) { break }".to_owned(),
-    "  try { Remove-Item -LiteralPath $exe -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 200 }"
-      .to_owned(),
-    "}".to_owned(),
-  ]
+/// The guard's tree ended by the id its lock holds, before the uninstaller starts, so it revives nothing meanwhile.
+pub fn windows_guard_stop_commands(guard_pid: Option<u64>) -> Vec<Vec<String>> {
+  guard_pid
+    .and_then(|pid| u32::try_from(pid).ok())
+    .map(tree_kill_command)
+    .into_iter()
+    .collect()
 }
 
-/// The one-shot cleanup task, registered like the anchors — per-user, no stored credential,
-/// non-elevated. It is run at once and deletes itself, so its logon trigger only fills the schedule
-/// schtasks demands.
-pub fn depart_task_create_command(install_dir: &str, data_dir: &str) -> Vec<String> {
-  let command = powershell_command(&windows_cleanup_script(install_dir, data_dir)).join(" ");
-  [
-    "schtasks",
-    "/create",
-    "/tn",
-    DEPART_TASK_NAME,
-    "/tr",
-    &command,
-    "/sc",
-    "onlogon",
-    "/rl",
-    "limited",
-    "/f",
-  ]
-  .map(str::to_owned)
-  .to_vec()
+/// What the agent removes itself where its uninstaller cannot be started: every anchor of both run modes, so
+/// nothing revives it; the files stay.
+pub fn windows_fallback_commands(install_dir: &str, env: &HashMap<String, String>) -> Vec<Vec<String>> {
+  install_targets(install_dir)
+    .iter()
+    .flat_map(|target| anchor_remove_commands(target, env))
+    .collect()
 }
 
-/// Every command of a Windows departure after the agent's own watchdog has stopped, in order: the
-/// guard's tree ended by the id its lock holds, every anchor of both run modes removed, and the
-/// cleanup task created and run.
-pub fn windows_depart_commands(
+/// Depart on a leave, the caller having already stopped its own reconnect loop and watchdog and given up its lock.
+/// Each step is guarded, since a removal that stopped halfway would leave a half-installed agent behind.
+pub async fn depart(
+  platform: Platform,
   install_dir: &str,
-  data_dir: &str,
-  guard_pid: Option<u64>,
+  agent_name: &str,
   env: &HashMap<String, String>,
-) -> Vec<Vec<String>> {
-  let mut commands = Vec::new();
-  if let Some(pid) = guard_pid.and_then(|pid| u32::try_from(pid).ok()) {
-    commands.push(tree_kill_command(pid));
-  }
-  for target in install_targets(install_dir) {
-    commands.extend(anchor_remove_commands(&target, env));
-  }
-  commands.push(depart_task_create_command(install_dir, data_dir));
-  commands.push(task_run_command(DEPART_TASK_NAME));
-  commands
-}
-
-/// Depart on a leave, the caller having already stopped its own reconnect loop and watchdog. Each step
-/// is guarded, since a removal that stopped halfway would leave a half-installed agent behind.
-pub async fn depart(platform: Platform, install_dir: &str, env: &HashMap<String, String>, log: &Log) {
+  log: &Log,
+) {
   let data_dir = platform.data_dir(env);
   log.warn("departing", json!({ "installDir": install_dir, "dataDir": data_dir }));
-  let commands = match platform {
-    Platform::Linux => vec![linux_depart_command(&crate::platform::systemd_unit_path(env), &data_dir)],
+  match platform {
+    Platform::Linux => {
+      run_all(&[linux_depart_command(&crate::platform::systemd_unit_path(env), &data_dir)], log).await;
+    }
     Platform::Windows => {
       let guard_pid = read_number(Path::new(&platform.lock_path(env, crate::platform::Role::Guard)));
-      windows_depart_commands(install_dir, &data_dir, guard_pid, env)
+      run_all(&windows_guard_stop_commands(guard_pid), log).await;
+      if let Err(error) = command::spawn_detached(&windows_uninstall_command(install_dir, agent_name)) {
+        log.warn("depart-uninstaller-unstarted", json!({ "error": error, "filesKept": install_dir }));
+        run_all(&windows_fallback_commands(install_dir, env), log).await;
+      }
     }
-  };
+  }
+}
+
+async fn run_all(commands: &[Vec<String>], log: &Log) {
   for argv in commands {
-    if let Err(error) = command::run(&argv, STEP_BOUND).await {
+    if let Err(error) = command::run(argv, STEP_BOUND).await {
       log.warn("depart-step-failed", json!({ "error": error }));
     }
   }
@@ -163,36 +130,50 @@ mod tests {
   }
 
   #[test]
-  fn the_windows_departure_ends_the_guard_then_the_anchors_then_hands_the_files_to_its_own_task() {
-    let env = HashMap::from([("APPDATA".to_owned(), "C:\\R".to_owned())]);
-    let commands = windows_depart_commands("C:\\P\\jake", "C:\\L\\jake", Some(77), &env);
-    let heads: Vec<String> = commands.iter().map(|command| command[..2].join(" ")).collect();
+  fn the_windows_departure_hands_the_removal_to_the_installs_own_uninstaller_by_name() {
+    let command = windows_uninstall_command("C:\\P\\jake", "u63");
     assert_eq!(
-      heads,
-      [
-        "taskkill /PID",
-        "reg delete",
-        "schtasks /delete",
-        "powershell.exe -NoProfile",
-        "reg delete",
-        "schtasks /delete",
-        "powershell.exe -NoProfile",
-        "schtasks /create",
-        "schtasks /run"
-      ]
+      command,
+      ["C:\\P\\jake\\jake.exe", "uninstall", "--name", "u63", "--yes", "--remove-config"]
     );
-    assert_eq!(commands[0], ["taskkill", "/PID", "77", "/T", "/F"]);
-    assert_eq!(commands[7][3], "JakeDepart");
-    assert_eq!(commands[8], ["schtasks", "/run", "/tn", "JakeDepart"]);
-    assert_eq!(windows_depart_commands("C:\\P\\jake", "C:\\L\\jake", None, &env).len(), 8);
+    let options =
+      uninstall::Options::parse(&command[2..]).expect("the uninstaller takes its own arguments");
+    assert_eq!(options.name.as_deref(), Some("u63"));
+    assert!(options.yes && options.remove_config);
   }
 
   #[test]
-  fn the_windows_cleanup_waits_for_the_executable_then_removes_everything_and_its_own_task() {
-    let script = windows_cleanup_script("C:\\P\\jake", "C:\\L\\jake");
-    assert!(script.starts_with("$exe = 'C:\\P\\jake\\jake.exe'\n"));
-    assert!(script.contains("Remove-Item -LiteralPath 'C:\\P\\jake' -Recurse"));
-    assert!(script.contains("Remove-Item -LiteralPath 'C:\\L\\jake' -Recurse"));
-    assert!(script.ends_with("schtasks /delete /tn JakeDepart /f"));
+  fn no_windows_departure_step_registers_a_task_or_carries_a_long_command_line() {
+    let env = HashMap::from([("APPDATA".to_owned(), "C:\\R".to_owned())]);
+    let mut every = windows_guard_stop_commands(Some(77));
+    every.push(windows_uninstall_command("C:\\P\\jake", "u63"));
+    every.extend(windows_fallback_commands("C:\\P\\jake", &env));
+    for command in &every {
+      assert!(!(command[0] == "schtasks" && command[1] == "/create"), "{command:?}");
+    }
+    // The uninstaller's whole command line stays short, whatever a task's 261-character limit would allow.
+    assert!(every[1].join(" ").len() < 261, "{:?}", every[1]);
+    assert_eq!(every[0], ["taskkill", "/PID", "77", "/T", "/F"]);
+    assert!(windows_guard_stop_commands(None).is_empty());
+  }
+
+  #[test]
+  fn where_the_uninstaller_cannot_start_the_agent_removes_every_anchor_itself() {
+    let env = HashMap::from([("APPDATA".to_owned(), "C:\\R".to_owned())]);
+    let heads: Vec<String> = windows_fallback_commands("C:\\P\\jake", &env)
+      .iter()
+      .map(|command| command[..2].join(" "))
+      .collect();
+    assert_eq!(
+      heads,
+      [
+        "reg delete",
+        "schtasks /delete",
+        "powershell.exe -NoProfile",
+        "reg delete",
+        "schtasks /delete",
+        "powershell.exe -NoProfile"
+      ]
+    );
   }
 }

@@ -199,7 +199,14 @@ async fn run_agent(start: Start) -> ExitCode {
     pair.stop().await;
   }
   if leave {
-    departure::depart(Platform::HOST, &start.install_dir.to_string_lossy(), &start.env, &log).await;
+    departure::depart(
+      Platform::HOST,
+      &start.install_dir.to_string_lossy(),
+      &start.config.agent_name,
+      &start.env,
+      &log,
+    )
+    .await;
   }
   log.info("agent-stopped", json!({ "left": leave }));
   ExitCode::SUCCESS

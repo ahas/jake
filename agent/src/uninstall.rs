@@ -7,10 +7,9 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::connection::{Agent, LeaveNotice};
-use crate::departure::exe_released_lines;
 use crate::log::Log;
 use crate::pair::{
-  anchor_remove_commands, install_targets, powershell_command, ps_single_quote, read_number,
+  JAKE_BINARY, anchor_remove_commands, install_targets, powershell_command, ps_single_quote, read_number,
 };
 use crate::platform::{Platform, Role, SYSTEMD_UNIT_NAME, systemd_unit_path};
 use crate::{VERSION, command, config, installed, instance, wsl};
@@ -195,7 +194,7 @@ pub async fn uninstall(
       stop_pair(&dir, &env).await;
       voice.step("deleting the install folder once this program has exited");
       let script = windows_cleanup_script(&dir, options.remove_config.then_some(data_dir.as_str()));
-      if let Err(error) = spawn_detached(&powershell_command(&script)) {
+      if let Err(error) = command::spawn_detached(&powershell_command(&script)) {
         voice.warn(&format!(
           "the install folder could not be handed to its cleanup, so delete {dir} by hand: {error}"
         ));
@@ -281,6 +280,20 @@ fn runs_from(_pid: u32, _dir: &str) -> bool {
   false
 }
 
+/// The lines of a Windows cleanup that wait for the install's executable to become deletable, once every process
+/// running it has exited, and delete it.
+fn exe_released_lines(install_dir: &str) -> Vec<String> {
+  let exe = Platform::Windows.join(install_dir, &[JAKE_BINARY]);
+  vec![
+    format!("$exe = {}", ps_single_quote(&exe)),
+    "for ($i = 0; $i -lt 100; $i++) {".to_owned(),
+    "  if (-not (Test-Path -LiteralPath $exe)) { break }".to_owned(),
+    "  try { Remove-Item -LiteralPath $exe -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 200 }"
+      .to_owned(),
+    "}".to_owned(),
+  ]
+}
+
 /// What the Windows cleanup runs once the uninstaller has exited: it waits for the executable to become
 /// deletable, then deletes the install folder, all of it where the data directory is given to go too, and
 /// otherwise all but the config.
@@ -301,29 +314,6 @@ pub fn windows_cleanup_script(install_dir: &str, data_dir: Option<&str>) -> Stri
     )),
   }
   lines.join("\n")
-}
-
-/// Start a program that outlives this one: with no window, in a process group of its own, and out of any
-/// job that would end it with this process where the job lets it leave.
-fn spawn_detached(argv: &[String]) -> Result<(), String> {
-  let (program, arguments) = argv.split_first().ok_or("an empty command")?;
-  let mut command = std::process::Command::new(program);
-  command
-    .args(arguments)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-  #[cfg(windows)]
-  {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    command.creation_flags(command::CHILD_CREATION_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
-    if command.spawn().is_ok() {
-      return Ok(());
-    }
-    command.creation_flags(command::CHILD_CREATION_FLAGS);
-  }
-  command.spawn().map(drop).map_err(|error| format!("{program}: {error}"))
 }
 
 /// Delete a Linux install's layout: the whole install folder and data directory, or the layout's files

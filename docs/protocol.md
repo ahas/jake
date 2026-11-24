@@ -150,7 +150,7 @@ Departure:
 - **leave** — hub to agent: uninstall jake from the machine and depart. It carries nothing beyond the
   envelope. On receiving it the agent stops whatever keeps it running — the guard on a Windows host,
   the service unit on a Linux host — removes its autostart registrations, deletes its executable,
-  config, log, and data, and exits; it sends no reply, and the hub reads the departure from the
+  config, log, and data (on Windows through its own uninstaller, started detached), and exits; it sends no reply, and the hub reads the departure from the
   connection dropping. The scheme it triggers is in docs/architecture.md.
 - **leave** — hub to agent, in answer to a hello: an agent presenting a credential of its own name
   says hello under a name the hub has revoked. The hub sends the leave in place of the welcome,
