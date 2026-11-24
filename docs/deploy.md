@@ -215,7 +215,7 @@ machines on top of it, in docs/recipes.md. With both in place:
 
 ```sh
 bun ~/repos/ahas/jake/src/console/main.ts status   # the agent lists stream:22 among its capabilities
-ssh jake_wsl true && echo reached                   # the login runs over the tunnel
+ssh lab_wsl true && echo reached                   # the login runs over the tunnel
 ```
 
 A hub restart drops every agent's connection, and every ssh session riding one ends with it; ssh

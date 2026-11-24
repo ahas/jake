@@ -101,18 +101,18 @@ $f = "$env:TEMP\jake-page.png"
   the account on that machine.
 
 ```sshconfig
-Host jake_wsl
-  HostName jake_wsl
+Host lab_wsl
+  HostName lab_wsl
   User ahas
-  ProxyCommand ~/.local/share/jake-hub/deploy/bin/jake-hub connect jake_wsl 22
+  ProxyCommand ~/.local/share/jake-hub/deploy/bin/jake-hub connect lab_wsl 22
   ServerAliveInterval 30
 ```
 
 - The proxy path is the hub's deployed binary (docs/deploy.md, step 7), so ssh runs the live commit.
-- Then `ssh jake_wsl` logs in, and `scp` and `rsync -e ssh` work the same way.
+- Then `ssh lab_wsl` logs in, and `scp` and `rsync -e ssh` work the same way.
 - herdr's saved SSH machines ride on the same entry, because herdr reaches a remote machine through
-  ssh. `herdr machine add jake_wsl` prepares the herdr server on the machine and saves it, and
-  `herdr --machine jake_wsl agent list` answers from it.
+  ssh. `herdr machine add lab_wsl` prepares the herdr server on the machine and saves it, and
+  `herdr --machine lab_wsl agent list` answers from it.
 - A refusal is written to standard error by the connect mode before ssh gives up: an agent that is
   not attached, a port the agent does not offer, or a port nothing answers on. When the agent's
   connection drops, ssh sees its connection close; once the agent has redialled, the next `ssh` gets

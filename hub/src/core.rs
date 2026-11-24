@@ -2040,9 +2040,9 @@ mod tests {
 
   #[test]
   fn agents_are_listed_by_name_lowercase_first_among_case_variants() {
-    let mut names = vec!["node2", "AB", "ab", "jake_wsl", "aB", "Ab"];
+    let mut names = vec!["node2", "AB", "ab", "lab_wsl", "aB", "Ab"];
     names.sort_by(|a, b| by_name(a, b));
-    assert_eq!(names, ["ab", "aB", "Ab", "AB", "jake_wsl", "node2"]);
+    assert_eq!(names, ["ab", "aB", "Ab", "AB", "lab_wsl", "node2"]);
   }
 
   #[tokio::test]

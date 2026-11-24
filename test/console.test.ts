@@ -237,7 +237,7 @@ describe("status", () => {
       },
       { name: "node2", agentVersion: "0.1.0", capabilities: ["exec:linux"], connectedAt: NOW - 5_000, lastPongAt: NOW, inFlight: [] },
     ],
-    departed: [{ name: "jungsu-wsl", departedAt: NOW - 120_000 }],
+    departed: [{ name: "lab-pc", departedAt: NOW - 120_000 }],
     revoked: [{ name: "u7-k2", revokedAt: NOW - 60_000 }],
   };
 
@@ -256,7 +256,7 @@ describe("status", () => {
     expect(text.match(/machine:/g)).toHaveLength(1);
     expect(text).toContain("node2 v0.1.0");
     expect(text).toContain("exec:linux");
-    expect(text).toContain("jungsu-wsl departed 2m 0s ago");
+    expect(text).toContain("lab-pc departed 2m 0s ago");
     expect(text).toContain("u7-k2 revoked 1m 0s ago");
   });
 

@@ -395,11 +395,11 @@ function execBody(command: string): RequestInit {
 describe("many agents", () => {
   test("agents under different names attach side by side and neither displaces the other", async () => {
     const hub = await launch();
-    const wsl = await attach(hub.agentPort, ["exec:wsl"], "jake_wsl");
+    const wsl = await attach(hub.agentPort, ["exec:wsl"], "lab_wsl");
     const node2 = await attach(hub.agentPort, ["exec:linux"], "node2");
 
     const status = await (await control(hub, "/status")).json();
-    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["jake_wsl", "node2"]);
+    expect(status.agents.map((a: { name: string }) => a.name)).toEqual(["lab_wsl", "node2"]);
     expect(status.agents[1]).toMatchObject({ capabilities: ["exec:linux"], inFlight: [] });
     expect(wsl.closeCode).toBeNull();
     expect(node2.closeCode).toBeNull();
@@ -497,7 +497,7 @@ describe("many agents", () => {
 
   test("a named command goes to that agent only, and its output comes back from it", async () => {
     const hub = await launch();
-    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const wsl = await attach(hub.agentPort, [], "lab_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
     const reader = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=node2`, execBody("hostname"));
@@ -515,12 +515,12 @@ describe("many agents", () => {
 
   test("with several attached, a request naming none or an absent one is refused", async () => {
     const hub = await launch();
-    await attach(hub.agentPort, [], "jake_wsl");
+    await attach(hub.agentPort, [], "lab_wsl");
     await attach(hub.agentPort, [], "node2");
 
     const unnamed = await control(hub, "/exec", execBody("hostname"));
     expect(unnamed.status).toBe(400);
-    expect(await unnamed.json()).toMatchObject({ code: "agent-required", error: expect.stringContaining("jake_wsl, node2") });
+    expect(await unnamed.json()).toMatchObject({ code: "agent-required", error: expect.stringContaining("lab_wsl, node2") });
 
     const absent = await control(hub, "/download?path=/x&agent=ghost", { method: "POST" });
     expect(absent.status).toBe(404);
@@ -532,10 +532,10 @@ describe("many agents", () => {
 
   test("an agent that drops ends only its own commands", async () => {
     const hub = await launch();
-    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const wsl = await attach(hub.agentPort, [], "lab_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
-    const onWsl = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=jake_wsl`, execBody("sleep 60"));
+    const onWsl = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=lab_wsl`, execBody("sleep 60"));
     const onNode2 = openSse(`http://127.0.0.1:${hub.controlPort}/exec?agent=node2`, execBody("sleep 60"));
     await Promise.all([onWsl.ready, onNode2.ready]);
     await wsl.waitFor((f) => f.type === "exec");
@@ -562,7 +562,7 @@ describe("many agents", () => {
 
   test("a leave reaches the named agent and leaves the others installed", async () => {
     const hub = await launch();
-    const wsl = await attach(hub.agentPort, [], "jake_wsl");
+    const wsl = await attach(hub.agentPort, [], "lab_wsl");
     const node2 = await attach(hub.agentPort, [], "node2");
 
     const response = await control(hub, "/leave?agent=node2", { method: "POST" });
@@ -573,7 +573,7 @@ describe("many agents", () => {
 
   test("the traffic log tags each frame with its agent", async () => {
     const hub = await launch();
-    await attach(hub.agentPort, [], "jake_wsl");
+    await attach(hub.agentPort, [], "lab_wsl");
     await attach(hub.agentPort, [], "node2");
 
     // The replay a console opening now catches up on carries every handshake frame, tagged.
@@ -582,8 +582,8 @@ describe("many agents", () => {
     const hellos: { agent: string; type: string }[] = [];
     for (let i = 0; i < 4; i += 1) hellos.push((await tail.waitFor(handshake)).data as { agent: string; type: string });
     expect(hellos.map((entry) => `${entry.agent} ${entry.type}`)).toEqual([
-      "jake_wsl hello",
-      "jake_wsl welcome",
+      "lab_wsl hello",
+      "lab_wsl welcome",
       "node2 hello",
       "node2 welcome",
     ]);
@@ -1145,7 +1145,7 @@ describe("leave", () => {
     const dataDir = mkdtempSync(join(tmpdir(), "jake-hub-data-"));
     dirs.push(dataDir);
     const first = await launch({ dataDir });
-    const uninstalled = await attach(first.agentPort, [], "jungsu-wsl");
+    const uninstalled = await attach(first.agentPort, [], "lab-pc");
     await attach(first.agentPort, [], "node2");
     uninstalled.send({ type: "leave", v: V });
     await uninstalled.waitClose();
@@ -1156,13 +1156,13 @@ describe("leave", () => {
     running.splice(running.indexOf(first), 1);
     const second = await launch({ dataDir });
     const after = await (await control(second, "/status")).json();
-    expect(after.departed.map((entry: { name: string }) => entry.name)).toEqual(["jungsu-wsl"]);
+    expect(after.departed.map((entry: { name: string }) => entry.name)).toEqual(["lab-pc"]);
     expect(after.agents).toEqual([]);
 
-    await attach(second.agentPort, [], "jungsu-wsl");
+    await attach(second.agentPort, [], "lab-pc");
     const back = await (await control(second, "/status")).json();
     expect(back.departed).toEqual([]);
-    expect(back.agents.map((agent: { name: string }) => agent.name)).toEqual(["jungsu-wsl"]);
+    expect(back.agents.map((agent: { name: string }) => agent.name)).toEqual(["lab-pc"]);
   });
 });
 

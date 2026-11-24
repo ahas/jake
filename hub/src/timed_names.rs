@@ -74,13 +74,13 @@ mod tests {
     let path = dir.join("departed.json");
     let mut departed = TimedNames::load(Some(path.clone()), "departedAt");
     departed.record("node3", 5);
-    departed.record("jungsu-wsl", 7);
+    departed.record("lab-pc", 7);
 
     let mut reloaded = TimedNames::load(Some(path.clone()), "departedAt");
     assert_eq!(
       reloaded.list(),
       [
-        json!({ "name": "jungsu-wsl", "departedAt": 7 }),
+        json!({ "name": "lab-pc", "departedAt": 7 }),
         json!({ "name": "node3", "departedAt": 5 })
       ]
     );
