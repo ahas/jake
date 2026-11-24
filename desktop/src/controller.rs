@@ -291,7 +291,7 @@ pub async fn switch_to_built_in<F, U>(
 /// Why a jake holding the machine cannot be stopped from the app: it is installed where the app does not see it.
 fn unseen_holder(holder: &str) -> String {
   format!(
-    "이 PC에서 jake 설치({holder})를 찾지 못했습니다. WSL 배포판 안에 설치되어 있다면 그 배포판에서 ~/.local/share/jake/uninstall.sh를 실행한 뒤 다시 확인해 주세요."
+    "이 PC에서 jake 설치({holder})를 찾지 못했습니다. WSL 배포판 안에 설치되어 있다면 그 배포판에서 ~/.local/share/jake/jake uninstall을 실행한 뒤 다시 확인해 주세요."
   )
 }
 
@@ -459,7 +459,7 @@ mod tests {
     match &status.borrow().agent {
       AgentState::SwitchFailed { name, reason } => {
         assert_eq!(name, "jake-wsl");
-        assert!(reason.contains("uninstall.sh"), "{reason}");
+        assert!(reason.contains("jake uninstall"), "{reason}");
       }
       other => panic!("{other:?}"),
     }

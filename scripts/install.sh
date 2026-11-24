@@ -304,15 +304,13 @@ find_other_installs() {
   fi
 }
 
-# Run a Windows install's own uninstaller through interop; it stops that install, tells the hub it left
-# and keeps its agent.env.
-uninstall_windows() { # folder
-  local powershell script answer
-  powershell="$(windows_powershell)"
-  [ -n "$powershell" ] || die "Windows interop is not reachable from here, so the Windows install in $1 cannot be removed: run its uninstall.ps1 on Windows, then run this install again"
-  script="try { & $(ps_quote "$(wslpath -w "$1/uninstall.ps1")") -InstallDir $(ps_quote "$(wslpath -w "$1")"); 'uninstalled' } catch { 'failed ' + \$_.Exception.Message }"
-  answer="$(run_powershell "$powershell" "$script")" || true
-  [ "$answer" = "uninstalled" ] || die "the Windows install in $1 could not be removed${answer:+: ${answer#failed }}"
+# Run a Windows install's own uninstaller, its jake.exe's uninstall command, through interop, naming the
+# agent found there so a folder another install has taken meanwhile is refused; it stops that install,
+# tells the hub it left and keeps its agent.env.
+uninstall_windows() { # folder name
+  local said
+  said="$("$1/jake.exe" uninstall --name "$2" --yes 2>&1 | tr -d '\r')" \
+    || die "the Windows install in $1 could not be removed${said:+: $(printf '%s\n' "$said" | tail -n 1)}"
 }
 
 settle_other_installs() {
@@ -332,10 +330,10 @@ settle_other_installs() {
   fi
   for i in "${!other_name[@]}"; do
     if [ -z "${other_dir[$i]}" ]; then
-      die "${other_name[$i]} holds this machine from where this install cannot reach it, another WSL distribution or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/uninstall.sh in that distribution), or quit the desktop app, then run this install again"
+      die "${other_name[$i]} holds this machine from where this install cannot reach it, another WSL distribution or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/jake uninstall in that distribution), or quit the desktop app, then run this install again"
     fi
     step "removing ${other_name[$i]} through its own uninstaller"
-    uninstall_windows "${other_dir[$i]}"
+    uninstall_windows "${other_dir[$i]}" "${other_name[$i]}"
     ok "removed"
   done
 }
@@ -604,4 +602,4 @@ else
   warn "Installed. The agent has not reported a connection yet; it keeps retrying on its own."
   warn "See: journalctl --user -u jake-agent -n 20, or $DATA_DIR/agent.log"
 fi
-echo "To remove it later, run $DATA_DIR/uninstall.sh"
+echo "To remove it later, run $DATA_DIR/jake uninstall"

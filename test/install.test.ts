@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { publishAgents } from "../scripts/publish-agents";
+import { AGENT_COMMAND, ensureAgentBuilt } from "./agent-process";
 
 const SCRIPT = join(import.meta.dir, "..", "scripts", "install.sh");
 const WINDOWS_SCRIPT = join(import.meta.dir, "..", "scripts", "install.ps1");
@@ -480,24 +481,41 @@ describe("install.sh on WSL", () => {
     expect(code).toBe(0);
   });
 
-  test("the uninstall stops and removes the task", async () => {
+  test("the uninstall, run through its script, stops and removes the task", async () => {
     const at = wslMachine(true);
+    ensureAgentBuilt();
+    copyFileSync(AGENT_COMMAND[0], at.bin);
+    writeFileSync(join(at.bin, "..", "agent.env"), "JAKE_HUB_URL=ws://127.0.0.1:1\nJAKE_SECRET=s\nJAKE_AGENT_NAME=n2\n");
     copyFileSync(join(import.meta.dir, "..", "scripts", "uninstall.sh"), join(at.folder, "uninstall.sh"));
-    const { code } = await runOnWsl(at, [join(at.folder, "uninstall.sh")]);
+    const { code, output } = await runOnWsl(at, [join(at.folder, "uninstall.sh"), "--name", "n2", "--yes"]);
+    expect(output).toContain("removing the Windows task that keeps Ubuntu-24.04 running");
     expect(code).toBe(0);
     expect(readFileSync(at.tasks, "utf8")).toBe("stopped JakeWsl-Ubuntu-24.04\nunregistered JakeWsl-Ubuntu-24.04\n");
+    expect(existsSync(at.bin)).toBe(false);
+  }, 60_000);
+
+  test("the uninstall script, named for another agent, refuses and removes nothing", async () => {
+    const at = wslMachine(true);
+    ensureAgentBuilt();
+    copyFileSync(AGENT_COMMAND[0], at.bin);
+    copyFileSync(join(import.meta.dir, "..", "scripts", "uninstall.sh"), join(at.folder, "uninstall.sh"));
+    const { code, output } = await runOnWsl(at, [join(at.folder, "uninstall.sh"), "--name", "u63", "--yes"]);
+    expect(code).toBe(1);
+    expect(output).toContain("is n2's, not u63's, so nothing is removed");
+    expect(readFileSync(at.tasks, "utf8")).toBe("");
+    expect(existsSync(at.bin)).toBe(true);
   }, 30_000);
 });
 
-// A Windows install of the same PC, as a WSL distribution sees it through /mnt/c: its executable, its agent.env
-// naming `name`, and an uninstall.ps1 that records the folder it was asked to remove.
-function windowsInstall(at: ReturnType<typeof wslMachine>, name: string): { dir: string; removed: string } {
+// A Windows install of the same PC, as a WSL distribution sees it through /mnt/c: its agent.env naming `name`,
+// and an executable that records the arguments it was run with, and refuses them where `refuse` is set.
+function windowsInstall(at: ReturnType<typeof wslMachine>, name: string, refuse = false): { dir: string; removed: string } {
   const dir = join(at.home, "windows", "users", "person", "AppData", "Local", "Programs", "jake");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "jake.exe"), "the windows build");
-  writeFileSync(join(dir, "agent.env"), `JAKE_HUB_URL=wss://example.test\nJAKE_SECRET=s\nJAKE_AGENT_NAME=${name}\n`);
   const removed = join(at.home, "windows", "removed");
-  writeFileSync(join(dir, "uninstall.ps1"), `param($InstallDir)\nSet-Content -LiteralPath '${removed}' -Value "removed $InstallDir"\n`);
+  const exe = ["#!/bin/sh", `echo "$*" > '${removed}'`, refuse ? "echo \"jake: the jake install is u64's, not u63's, so nothing is removed\" >&2; exit 1" : "exit 0"];
+  writeFileSync(join(dir, "jake.exe"), exe.join("\n"), { mode: 0o755 });
+  writeFileSync(join(dir, "agent.env"), `JAKE_HUB_URL=wss://example.test\nJAKE_SECRET=s\nJAKE_AGENT_NAME=${name}\n`);
   return { dir, removed };
 }
 
@@ -522,15 +540,25 @@ describe("install.sh: one jake per machine", () => {
     expect(unitStopped(at)).toBe(false);
   });
 
-  test("with --replace, runs the Windows install's own uninstaller first and then installs", async () => {
+  test("with --replace, runs the Windows install's own uninstaller first, naming the agent found there, and then installs", async () => {
     const at = wslMachine(true);
     const windows = windowsInstall(at, "u63");
     const { code, output } = await runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive", "--replace"]);
     expect(output).toContain("removing u63 through its own uninstaller");
     expect(code).toBe(0);
-    expect(readFileSync(windows.removed, "utf8").trim()).toBe(`removed ${windows.dir}`);
+    expect(readFileSync(windows.removed, "utf8").trim()).toBe("uninstall --name u63 --yes");
     expect(readFileSync(at.bin, "utf8")).toBe("new reaches");
   }, 60_000);
+
+  test("with --replace, an uninstaller that refuses stops the install before it changes anything, saying why", async () => {
+    const at = wslMachine(false);
+    windowsInstall(at, "u63", true);
+    const { code, output } = await runOnWsl(at, [join(at.folder, "install.sh"), "--non-interactive", "--replace"]);
+    expect(code).not.toBe(0);
+    expect(output).toContain("could not be removed: jake: the jake install is u64's, not u63's, so nothing is removed");
+    expect(readFileSync(at.bin, "utf8")).toBe("old reaches");
+    expect(unitStopped(at)).toBe(false);
+  });
 
   test("an agent of another name the hub says holds this machine refuses the install, and one out of reach refuses --replace too", async () => {
     const at = wslMachine(false);

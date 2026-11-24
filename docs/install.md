@@ -102,9 +102,10 @@ jake serving this machine, and refuses to add a second one.
   - **Join it:** do nothing more here. This machine is that install's node; the BMO administrator binds
     the account that wanted this install to that node as a shared node.
   - **Replace it:** run the install again with `--replace` (Linux/WSL) or `-Replace` (Windows). The
-    other install's own uninstaller runs first — a Windows install's `uninstall.ps1` from WSL through
-    interop, a WSL install's `uninstall.sh` from Windows through `wsl.exe` — which stops it, tells the
-    hub it left and keeps its `agent.env` (「Uninstall」); then this install goes on. A holder the hub
+    other install's own uninstaller runs first — a Windows install's `jake.exe uninstall` from WSL
+    through interop, a WSL install's `jake uninstall` from Windows through `wsl.exe`, each given the
+    name the install found there and `--yes` — which stops it, tells the hub it left and keeps its
+    `agent.env` (「Uninstall」); then this install goes on. A holder the hub
     names that the install cannot reach from here, another WSL distribution or the desktop app, is not
     removed: the install says to run that one's uninstaller where it is, or to quit the desktop app,
     and stops.
@@ -340,24 +341,37 @@ config is left as it is.
 
 ## Uninstall
 
-Run the uninstall script for the platform:
+The agent's own executable removes it: `jake uninstall` on Linux/WSL, `jake.exe uninstall` on Windows.
+It needs no script, so it works where a policy refuses every PowerShell script file.
 
-- Linux/WSL: `./uninstall.sh` (or from the install location). It stops and disables the user service,
-  tells the hub the agent has left, removes the unit, and deletes the install layout. Run from a WSL
-  shell, it also stops and removes the Windows task that keeps the distribution running, with the
-  hold's executable where the task had one.
-- Windows: `& "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1"`. It stops the programs, tells the hub
-  the agent has left, removes all three anchors for both run modes, and deletes the install folder.
+- Linux/WSL: `~/.local/share/jake/jake uninstall`. It stops and disables the user service, tells the
+  hub the agent has left, removes the unit, and deletes the install layout. Run from a WSL shell, it
+  also stops and removes the Windows task that keeps the distribution running, with the hold's
+  executable where the task had one.
+- Windows: `& "$env:LOCALAPPDATA\Programs\jake\jake.exe" uninstall`. It stops the agent and the
+  guard, tells the hub the agent has left, removes all three anchors for both run modes, and deletes
+  the install folder once it has exited. It opens no console, so it asks and answers in dialogs.
+
+Run with no name, it says which agent the install in its folder serves and asks you to confirm before
+it changes anything. Name the agent you mean to remove with `--name`, and it refuses, removing nothing,
+where that folder holds another agent's install, as it may once a newer install has taken the same
+folder:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\jake\jake.exe" uninstall --name u63
+```
+
+`--yes` removes without asking, for a removal run unattended; give `--name` with it.
 
 Telling the hub is what makes it list this agent as departed rather than disconnected. If the hub
 cannot be reached at that moment, the uninstall still completes and says the hub was not told.
 
 The config file (`agent.env`) and the log are kept by default, so a reinstall reuses the URL and
-secret. To leave nothing behind, pass `--remove-config` (Linux) or `-RemoveConfig` (Windows):
+secret. To leave nothing behind, pass `--remove-config`.
 
-```powershell
-& "$env:LOCALAPPDATA\Programs\jake\uninstall.ps1" -RemoveConfig
-```
+The uninstall scripts the install leaves beside the executable, `uninstall.sh` and `uninstall.ps1`, run
+the same command: `uninstall.sh` takes the same options, and `uninstall.ps1` takes `-Name`, `-Yes`,
+`-RemoveConfig` and `-InstallDir`.
 
 ## Removing it from the hub side
 
@@ -365,6 +379,6 @@ There is also a remote counterpart to the uninstaller, sent from main-host rathe
 machine: `jake leave --yes`. It tells the attached agent to uninstall itself — the binary, the
 config, the log, and every autostart registration — stop whatever keeps it running, and detach for
 good. On WSL the agent cannot reach Windows from its service, so the task that keeps the distribution
-running stays registered until the uninstall script is run from a WSL shell or the task is deleted in
+running stays registered until the uninstaller is run from a WSL shell or the task is deleted in
 Task Scheduler. It is irreversible and keeps no config, so the console refuses it without `--yes`, and it works
 only while the agent is attached.

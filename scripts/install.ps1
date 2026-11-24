@@ -379,10 +379,11 @@ if (-not $Update) {
     }
     foreach ($other in $others) {
       if (-not $other.Distribution) {
-        Stop-Install "$($other.Name) holds this machine from where this install cannot reach it, a WSL distribution other than the default or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/uninstall.sh in that distribution), or quit the desktop app, then run this install again."
+        Stop-Install "$($other.Name) holds this machine from where this install cannot reach it, a WSL distribution other than the default or the BMO desktop app: run its own uninstaller there (~/.local/share/jake/jake uninstall in that distribution), or quit the desktop app, then run this install again."
       }
       Write-Step "removing $($other.Name) through its own uninstaller"
-      & wsl.exe -d $other.Distribution -e bash -c 'bash "$HOME/.local/share/jake/uninstall.sh"'
+      # The name found there goes with it, so an install that has taken its place meanwhile is refused.
+      & wsl.exe -d $other.Distribution -e bash -c '"$HOME/.local/share/jake/jake" uninstall --name "$1" --yes' jake $other.Name
       if ($LASTEXITCODE -ne 0) { Stop-Install "$($other.Name) in $($other.Distribution) could not be removed: its uninstaller ended with $LASTEXITCODE." }
       Write-Ok "removed"
     }
@@ -602,4 +603,4 @@ if ($reached) {
   Write-Host "Installed. The agent has not reported a connection yet; it keeps retrying on its own." -ForegroundColor Yellow
   Write-Host "See the log at $LogPath" -ForegroundColor Yellow
 }
-Write-Host "To remove it later, run uninstall.ps1 from $InstallDir" -ForegroundColor White
+Write-Host "To remove it later, run: & '$InstallDir\jake.exe' uninstall" -ForegroundColor White

@@ -31,7 +31,8 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   and file transfers over the same connection. It listens for nothing and only dials. On a Windows
   host the same executable also runs as the **guard**, a small supervisor that carries no capability
   and only keeps the agent alive; the command line chooses which of the two a process is. Run with
-  the leave-notice flag it is neither: it tells the hub the agent was uninstalled, and exits. On a Linux
+  the leave-notice flag it is neither: it tells the hub the agent was uninstalled, and exits; run with
+  its uninstall command it removes the install it belongs to (「Leaving」). On a Linux
   host the agent needs no guard, because the platform's own service manager keeps it running. The
   staying-alive scheme below covers both. The same crate is also a library, whose entry runs the
   agent on a caller's own runtime from a configuration held in memory.
@@ -282,7 +283,7 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   a name no distribution has, so the name goes into the task's arguments bare.
 - The task is registered by the install through Windows interop, which only a WSL session started from
   Windows has; the agent's systemd service has none, so neither an unattended update nor a leave
-  reaches it, and the uninstall script, run from a WSL shell, removes it.
+  reaches it, and the uninstaller, run from a WSL shell, removes it.
 
 ### On a Windows host
 
@@ -381,9 +382,9 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   Only a process this user cannot read at all is left holding the lock.
 
 - The executable takes only the arguments of its run modes: none for the agent, the guard-mode flag,
-  the leave flag, the version flag, or the hold flag with a distribution's name. It refuses anything
-  else, since a start with a stray argument read as the agent would be a second agent under the
-  installed one's name, displacing its connection.
+  the leave flag, the version flag, the hold flag with a distribution's name, or the uninstall command
+  with its own options (「Leaving」). It refuses anything else, since a start with a stray argument read
+  as the agent would be a second agent under the installed one's name, displacing its connection.
 
 ## Leaving
 
@@ -418,14 +419,50 @@ after a fault, and returns at sign-in only where the person turned that on (docs
 - Leaving is the remote counterpart of the local uninstaller. The uninstaller is run by hand on the
   machine and can keep the config for a reinstall; a leave is sent from the hub, keeps nothing, and
   does not come back. It is deliberately guarded on the console side so a slip cannot trigger it.
-- The uninstaller tells the hub the agent has gone, so a removal by hand is recorded as a departure
-  just as a leave is. Once it has stopped the agent, and before it deletes the executable, it runs the
-  executable once in its leave-notice mode: that process dials the hub with the configured secret
-  and name, says hello, and once welcomed sends a leave frame of its own and exits. The agent is
-  already stopped, so this hello displaces no live connection. Under a revoked name the hub answers
-  that hello with a leave and has recorded the departure itself, so the notice sends nothing, says
-  the hub already holds the agent as left, and succeeds. A hub that cannot be reached does not
-  stop the uninstall; the uninstaller says the hub was not told and carries on.
+
+### The uninstaller
+
+- The uninstaller is the executable's own uninstall command, `jake uninstall` (`jake.exe uninstall`
+  on Windows), so removing an install needs nothing but the executable the install placed: a machine
+  whose policy refuses every PowerShell script file can still remove it. The uninstall scripts the
+  install leaves beside it only run that command with the options they were given, and the desktop
+  app's switch to its built-in agent and an install's replacement of another run it too.
+- It removes the install it belongs to, the folder its own executable stands in, and nothing else. It
+  takes three options: `--name` with the agent's name, `--yes`, and `--remove-config`.
+- **It checks whose install it is before it touches anything.** The agent an install serves is the
+  one its own `agent.env` names; the process environment is not read for it. A folder whose
+  `agent.env` names no agent holds no install, and the uninstaller refuses it. Given `--name`, it
+  refuses, changing nothing, where the install there is another agent's, naming the one it found:
+  a folder reused by a newer install is not the one the caller meant to remove. Given no name, it
+  says which agent it is about to remove and where, and goes on only once that is confirmed —
+  answered `y` on its standard input on Linux, and in a dialog on Windows, since the executable opens
+  no console there — or `--yes` was given. A caller that runs it unattended names the agent it means
+  and passes `--yes`.
+- It then stops what keeps the agent running. On Linux it stops and disables the `systemd --user`
+  unit. On Windows it ends the agent and the guard by the process ids their single-instance locks
+  hold, each with its whole tree and only where that process runs this install's own executable,
+  again until neither is left, since either may revive the other in between.
+- It tells the hub the agent has gone, so a removal by hand is recorded as a departure just as a
+  leave is. The agent is already stopped, so its hello displaces no live connection: it dials the hub
+  with the configured secret and name, says hello, and once welcomed sends a leave frame of its own.
+  Under a revoked name the hub answers that hello with a leave and has recorded the departure itself,
+  so the uninstaller sends nothing and says the hub already holds the agent as left. A hub that
+  cannot be reached does not stop the uninstall; it says the hub was not told and carries on. The
+  executable's leave-notice flag does this step alone.
+- It then removes every registration. On Linux it removes the unit file and has the user manager
+  forget it; run inside WSL, it also removes, through Windows interop, the Windows task that keeps
+  the distribution running and the hold's executable where the task had one. On Windows it removes
+  all three anchors of both run modes, then ends any process of the pair a trigger started meanwhile.
+- Last it deletes the files. By default it keeps `agent.env` and the log, so a reinstall reuses the
+  hub URL and secret; with `--remove-config` it deletes the whole install folder and the data
+  directory. On Linux it deletes them itself. On Windows a running executable cannot delete its own
+  file, so it starts a detached cleanup with no window, outside any job that would end it with the
+  uninstaller, which waits for the executable to become deletable, deletes the folder's contents (all
+  of it, or all but `agent.env`) and, with `--remove-config`, the data directory; the uninstaller exits
+  at once so the cleanup can finish.
+- It ends with status 0 once the install is removed, 1 where it refused or the removal was not
+  confirmed, and 2 for arguments it does not take. On Windows, where it asked in a dialog or nothing
+  reads its output, it shows its outcome in a dialog as well.
 
 ## Running commands
 

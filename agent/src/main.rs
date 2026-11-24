@@ -9,8 +9,9 @@ use std::process::ExitCode;
 
 use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
 use jake_agent::platform::{self, Platform, Role};
+use jake_agent::uninstall::{self, Outcome, UNINSTALL_COMMAND, Voice};
 use jake_agent::wsl::{self, HOLD_WSL_FLAG};
-use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure, instance, machine};
+use jake_agent::{Agent, Ended, Log, VERSION, config, departure, instance, machine};
 use serde_json::json;
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
@@ -27,6 +28,7 @@ const MACHINE_CHECK_FLAG: &str = "--machine-check";
 enum Invocation {
   Version,
   HoldWsl(String),
+  Uninstall(uninstall::Options),
   Configured(Mode),
 }
 
@@ -51,9 +53,13 @@ fn invocation(arguments: &[String]) -> Result<Invocation, String> {
     [flag, distribution] if flag == HOLD_WSL_FLAG && !distribution.is_empty() => {
       Ok(Invocation::HoldWsl(distribution.clone()))
     }
+    [command, options @ ..] if command == UNINSTALL_COMMAND => {
+      uninstall::Options::parse(options).map(Invocation::Uninstall)
+    }
     _ => Err(format!(
       "unknown arguments {arguments:?}; run with none for the agent, or with {GUARD_MODE_FLAG}, {LEAVE_FLAG}, \
-       {MACHINE_CHECK_FLAG}, {VERSION_FLAG} or {HOLD_WSL_FLAG} <distribution>"
+       {MACHINE_CHECK_FLAG}, {VERSION_FLAG}, {HOLD_WSL_FLAG} <distribution> or {UNINSTALL_COMMAND} \
+       [--name <agent>] [--yes] [--remove-config]"
     )),
   }
 }
@@ -216,17 +222,13 @@ async fn run_leave(start: Start) -> ExitCode {
   // The notice names no machine, so it is never refused for one another agent holds.
   let instance = start.instance();
   let agent = Agent::new(start.config, VERSION.to_owned(), start.log).instance(instance);
-  match agent.announce_leave().await {
-    Ok(LeaveNotice::Sent) => {
-      println!("the hub was told {} has left", agent.config.agent_name);
+  match uninstall::announce(&agent).await {
+    Ok(line) => {
+      println!("{line}");
       ExitCode::SUCCESS
     }
-    Ok(LeaveNotice::AlreadyRecorded) => {
-      println!("the hub had already recorded {} as left: its name is revoked", agent.config.agent_name);
-      ExitCode::SUCCESS
-    }
-    Err(error) => {
-      eprintln!("jake: the hub was not told of the leave: {error}");
+    Err(reason) => {
+      eprintln!("jake: {reason}");
       ExitCode::FAILURE
     }
   }
@@ -273,6 +275,155 @@ fn hold_wsl(distribution: &str) -> ExitCode {
   }
 }
 
+/// The uninstall's voice on a Linux host: each step on standard output, a question answered on standard input.
+#[cfg(not(windows))]
+struct Console;
+
+#[cfg(not(windows))]
+impl Voice for Console {
+  fn step(&mut self, line: &str) {
+    println!("· {line}");
+  }
+
+  fn warn(&mut self, line: &str) {
+    println!("  ! {line}");
+  }
+
+  fn confirm(&mut self, question: &str) -> bool {
+    use std::io::Write as _;
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let read = std::io::stdin().read_line(&mut answer).unwrap_or(0);
+    if read == 0 {
+      println!();
+    }
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+  }
+}
+
+#[cfg(not(windows))]
+impl Console {
+  /// The outcome is already on standard output and standard error.
+  #[allow(clippy::unused_self)]
+  fn finish(&mut self, _outcome: &str, _failed: bool) {}
+}
+
+/// The uninstall's voice on Windows, where the executable opens no console: each step on standard output
+/// for a caller that reads it, a question asked in a dialog, and the outcome shown in a dialog as well where
+/// the person was asked or nothing reads the output.
+#[cfg(windows)]
+struct Console {
+  asked: bool,
+}
+
+#[cfg(windows)]
+impl Console {
+  fn dialog(text: &str, style: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (text, caption) = (wide(text), wide("jake uninstall"));
+    // SAFETY: both strings are NUL-terminated UTF-16 that outlive the call, and no owner window is named.
+    unsafe {
+      MessageBoxW(
+        std::ptr::null_mut(),
+        text.as_ptr(),
+        caption.as_ptr(),
+        style | MB_SETFOREGROUND | MB_TOPMOST,
+      )
+    }
+  }
+
+  /// Whether anything reads this process's standard output: a caller that started it with its output taken.
+  fn output_read() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: GetStdHandle only reads this process's standard handle.
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    !handle.is_null() && handle != INVALID_HANDLE_VALUE
+  }
+}
+
+#[cfg(windows)]
+impl Voice for Console {
+  fn step(&mut self, line: &str) {
+    println!("· {line}");
+  }
+
+  fn warn(&mut self, line: &str) {
+    println!("  ! {line}");
+  }
+
+  fn confirm(&mut self, question: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO};
+    self.asked = true;
+    Self::dialog(question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
+  }
+}
+
+#[cfg(windows)]
+impl Console {
+  fn finish(&mut self, outcome: &str, failed: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+    if self.asked || !Self::output_read() {
+      Self::dialog(outcome, MB_OK | if failed { MB_ICONERROR } else { MB_ICONINFORMATION });
+    }
+  }
+}
+
+/// Remove the install this executable belongs to, as docs/architecture.md 「The uninstaller」 states: 0 once
+/// removed, 1 where refused or not confirmed.
+fn run_uninstall(options: &uninstall::Options) -> ExitCode {
+  let install_dir = match std::env::current_exe() {
+    Ok(exe) => exe.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+    Err(error) => {
+      eprintln!("jake: cannot find this executable: {error}");
+      return ExitCode::FAILURE;
+    }
+  };
+  let runtime = match runtime() {
+    Ok(runtime) => runtime,
+    Err(code) => return code,
+  };
+  #[cfg(windows)]
+  let mut console = Console { asked: false };
+  #[cfg(not(windows))]
+  let mut console = Console;
+  println!("jake agent uninstaller");
+  let outcome = runtime.block_on(uninstall::uninstall(
+    Platform::HOST,
+    &install_dir,
+    std::env::vars().collect(),
+    options,
+    &mut console,
+  ));
+  match outcome {
+    Outcome::Removed { name, kept: None } => {
+      let said = format!("Removed {name}. Nothing is left behind.");
+      println!("\n{said}");
+      console.finish(&said, false);
+      ExitCode::SUCCESS
+    }
+    Outcome::Removed {
+      name,
+      kept: Some((config, log)),
+    } => {
+      let said = format!(
+        "Removed {name}. Its config is kept at {config} and the log at {log}; uninstall with --remove-config to \
+         delete those too."
+      );
+      println!("\n{said}");
+      console.finish(&said, false);
+      ExitCode::SUCCESS
+    }
+    Outcome::Refused(reason) | Outcome::Declined(reason) => {
+      eprintln!("jake: {reason}");
+      console.finish(&reason, true);
+      ExitCode::FAILURE
+    }
+  }
+}
+
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   match invocation(&arguments) {
@@ -281,6 +432,7 @@ fn main() -> ExitCode {
       ExitCode::SUCCESS
     }
     Ok(Invocation::HoldWsl(distribution)) => hold_wsl(&distribution),
+    Ok(Invocation::Uninstall(options)) => run_uninstall(&options),
     Ok(Invocation::Configured(mode)) => run_configured(mode),
     Err(message) => {
       eprintln!("jake: {message}");
@@ -330,11 +482,27 @@ mod tests {
       invoked(&["--hold-wsl", "Ubuntu-24.04"]),
       Ok(Invocation::HoldWsl("Ubuntu-24.04".to_owned()))
     );
+    assert_eq!(invoked(&["uninstall"]), Ok(Invocation::Uninstall(uninstall::Options::default())));
+    assert_eq!(
+      invoked(&["uninstall", "--name", "u63", "--yes"]),
+      Ok(Invocation::Uninstall(uninstall::Options {
+        name: Some("u63".to_owned()),
+        yes: true,
+        remove_config: false
+      }))
+    );
   }
 
   #[test]
   fn anything_else_is_refused_rather_than_run_as_a_second_agent() {
-    for arguments in [&["status"][..], &["--hold-wsl"], &["--hold-wsl", ""], &["--guard", "--leave"]] {
+    for arguments in [
+      &["status"][..],
+      &["--hold-wsl"],
+      &["--hold-wsl", ""],
+      &["--guard", "--leave"],
+      &["uninstall", "--force"],
+      &["--yes", "uninstall"],
+    ] {
       assert!(invoked(arguments).is_err(), "{arguments:?}");
     }
   }

@@ -1,5 +1,5 @@
-// The installed agent on this machine, running or not, found by the footprint its install leaves, and the
-// uninstaller it left beside itself (docs/desktop.md, 「One agent per name」).
+// The installed agent on this machine, running or not, found by the footprint its install leaves, and removed
+// by its own executable's uninstall command (docs/desktop.md, 「One agent per name」).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,26 +39,26 @@ fn named(dir: PathBuf) -> Option<Installed> {
   name_beside(&dir).map(|name| Installed { name, dir })
 }
 
-/// The program and arguments that run an install's own uninstaller, which keeps its `agent.env` and its log.
+/// The executable and arguments that run an install's own uninstaller, which keeps its `agent.env` and its log
+/// and refuses where the install is no longer the named agent's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Uninstaller {
-  pub script: PathBuf,
-  pub program: String,
+  pub program: PathBuf,
   pub arguments: Vec<String>,
 }
 
 impl Installed {
-  /// The uninstaller the install left in its folder, for this machine's platform.
+  /// The uninstall command of the install's own executable, for this machine's platform.
   pub fn uninstaller(&self) -> Uninstaller {
-    uninstaller_for(Platform::HOST, &self.dir)
+    uninstaller_for(Platform::HOST, &self.dir, &self.name)
   }
 
   /// Stop and unregister the installed agent through its own uninstaller, waiting for it to end. Nothing is
   /// deleted here: the uninstaller removes what the install placed and keeps the config and the log.
   pub fn uninstall(&self) -> Result<(), String> {
     let uninstaller = self.uninstaller();
-    if !uninstaller.script.is_file() {
-      return Err(format!("{} is missing", uninstaller.script.display()));
+    if !uninstaller.program.is_file() {
+      return Err(format!("{} is missing", uninstaller.program.display()));
     }
     let mut command = std::process::Command::new(&uninstaller.program);
     command.args(&uninstaller.arguments).stdin(std::process::Stdio::null());
@@ -69,9 +69,19 @@ impl Installed {
       const CREATE_NO_WINDOW: u32 = 0x0800_0000;
       command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output().map_err(|error| format!("{}: {error}", uninstaller.program))?;
+    let output = command
+      .output()
+      .map_err(|error| format!("{}: {error}", uninstaller.program.display()))?;
     if output.status.success() {
       return Ok(());
+    }
+    // An executable that refuses its arguments was built before the uninstall command.
+    if output.status.code() == Some(2) {
+      return Err(format!(
+        "the jake installed in {} is older than its uninstall command: update it, or remove it with the uninstall \
+         script beside it",
+        self.dir.display()
+      ));
     }
     let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Err(if said.is_empty() {
@@ -82,35 +92,19 @@ impl Installed {
   }
 }
 
-fn uninstaller_for(platform: Platform, dir: &Path) -> Uninstaller {
-  let folder = dir.to_string_lossy();
-  match platform {
-    Platform::Linux => {
-      let script = platform.join(&folder, &["uninstall.sh"]);
-      Uninstaller {
-        script: PathBuf::from(&script),
-        program: "bash".to_owned(),
-        arguments: vec![script],
-      }
-    }
-    Platform::Windows => {
-      let script = platform.join(&folder, &["uninstall.ps1"]);
-      let arguments = [
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &script,
-        "-InstallDir",
-        &folder,
-      ];
-      Uninstaller {
-        script: PathBuf::from(&script),
-        program: "powershell.exe".to_owned(),
-        arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
-      }
-    }
+fn uninstaller_for(platform: Platform, dir: &Path, name: &str) -> Uninstaller {
+  let binary = match platform {
+    Platform::Linux => "jake",
+    Platform::Windows => crate::pair::JAKE_BINARY,
+  };
+  let options = crate::uninstall::Options {
+    name: Some(name.to_owned()),
+    yes: true,
+    remove_config: false,
+  };
+  Uninstaller {
+    program: PathBuf::from(platform.join(&dir.to_string_lossy(), &[binary])),
+    arguments: options.arguments(),
   }
 }
 
@@ -132,7 +126,8 @@ fn default_install(env: &HashMap<String, String>) -> Option<DefaultInstall> {
   Some(DefaultInstall { dir, registered })
 }
 
-fn name_beside(dir: &Path) -> Option<String> {
+/// The agent the install in `dir` serves: the one its own `agent.env` names, the process environment unread.
+pub fn name_beside(dir: &Path) -> Option<String> {
   let env = config::merged(dir, HashMap::new()).ok()?;
   env.get("JAKE_AGENT_NAME").filter(|name| !name.is_empty()).cloned()
 }
@@ -257,30 +252,21 @@ mod tests {
   }
 
   #[test]
-  fn the_uninstaller_is_the_one_the_install_left_run_with_no_option() {
-    let linux = uninstaller_for(Platform::Linux, Path::new("/home/person/.local/share/jake"));
-    assert_eq!(linux.script, PathBuf::from("/home/person/.local/share/jake/uninstall.sh"));
-    assert_eq!(
-      (linux.program.as_str(), linux.arguments.as_slice()),
-      ("bash", &["/home/person/.local/share/jake/uninstall.sh".to_owned()][..])
-    );
+  fn the_uninstaller_is_the_installs_own_executable_naming_its_agent_and_keeping_the_config() {
+    let linux = uninstaller_for(Platform::Linux, Path::new("/home/person/.local/share/jake"), "u63");
+    assert_eq!(linux.program, PathBuf::from("/home/person/.local/share/jake/jake"));
+    assert_eq!(linux.arguments, ["uninstall", "--name", "u63", "--yes"]);
 
-    let windows =
-      uninstaller_for(Platform::Windows, Path::new("C:\\Users\\person\\AppData\\Local\\Programs\\jake"));
-    let script = "C:\\Users\\person\\AppData\\Local\\Programs\\jake\\uninstall.ps1";
-    assert_eq!(windows.script, PathBuf::from(script));
-    assert_eq!(windows.program, "powershell.exe");
-    assert!(windows.arguments.windows(2).any(|pair| pair == ["-File", script]));
-    assert!(
-      windows
-        .arguments
-        .windows(2)
-        .any(|pair| pair[0] == "-InstallDir" && pair[1].ends_with("Programs\\jake"))
+    let windows = uninstaller_for(
+      Platform::Windows,
+      Path::new("C:\\Users\\person\\AppData\\Local\\Programs\\jake"),
+      "u63",
     );
-    assert!(
-      !windows.arguments.iter().any(|argument| argument == "-RemoveConfig"),
-      "the config is kept"
+    assert_eq!(
+      windows.program,
+      PathBuf::from("C:\\Users\\person\\AppData\\Local\\Programs\\jake\\jake.exe")
     );
+    assert_eq!(windows.arguments, ["uninstall", "--name", "u63", "--yes"]);
   }
 
   #[test]

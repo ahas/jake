@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -610,5 +610,90 @@ describe("leaving", () => {
     const refused = notice("wrong-secret");
     expect(await refused.exited).not.toBe(0);
     expect(await new Response(refused.stderr).text()).toContain("refused");
+  });
+});
+
+// An installed agent in a temporary home: the built executable copied where the install puts it, beside an
+// agent.env naming `name`, its user unit file, and a stand-in service manager that records every call.
+function installedAgent(hubUrl: string, name: string): { home: string; data: string; unit: string; calls: string; env: Record<string, string> } {
+  ensureAgentBuilt();
+  const home = tempDir();
+  const data = join(home, ".local", "share", "jake");
+  mkdirSync(data, { recursive: true });
+  copyFileSync(AGENT_COMMAND[0], join(data, "jake"));
+  chmodSync(join(data, "jake"), 0o755);
+  writeFileSync(join(data, "agent.env"), `JAKE_HUB_URL=${hubUrl}\nJAKE_SECRET=${SECRET}\nJAKE_AGENT_NAME=${name}\n`);
+  writeFileSync(join(data, "uninstall.sh"), "#!/bin/sh\n");
+  const unit = join(home, ".config", "systemd", "user", "jake-agent.service");
+  mkdirSync(join(unit, ".."), { recursive: true });
+  writeFileSync(unit, "[Unit]\n");
+  const stubs = join(home, "stubs");
+  mkdirSync(stubs);
+  const calls = join(home, "systemctl.calls");
+  writeFileSync(join(stubs, "systemctl"), `#!/bin/sh\necho "$*" >> "${calls}"\n`, { mode: 0o755 });
+  return { home, data, unit, calls, env: { PATH: `${stubs}:${process.env.PATH ?? ""}`, HOME: home } };
+}
+
+async function uninstallAt(at: ReturnType<typeof installedAgent>, args: string[], input = ""): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn([join(at.data, "jake"), "uninstall", ...args], {
+    cwd: at.home,
+    env: at.env,
+    stdin: new Blob([input]),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code: await proc.exited, stdout, stderr };
+}
+
+describe("the agent's uninstall command", () => {
+  test("named for another agent than the install's own, it refuses naming the one found and touches nothing", async () => {
+    const at = installedAgent("ws://127.0.0.1:1", "u64");
+    const { code, stderr } = await uninstallAt(at, ["--name", "u63", "--yes"]);
+    expect(code).toBe(1);
+    expect(stderr).toContain(`the jake install in ${at.data} is u64's, not u63's, so nothing is removed`);
+    expect(existsSync(join(at.data, "jake"))).toBe(true);
+    expect(existsSync(at.unit)).toBe(true);
+    expect(existsSync(at.calls)).toBe(false);
+  });
+
+  test("named for no agent, it says which it is about to remove and goes on only once that is confirmed", async () => {
+    const at = installedAgent("ws://127.0.0.1:1", "u64");
+    const declined = await uninstallAt(at, [], "n\n");
+    expect(declined.code).toBe(1);
+    expect(declined.stdout).toContain(`Remove the jake agent u64, installed in ${at.data}? [y/N]`);
+    expect(declined.stderr).toContain("u64 was not removed");
+    const unanswered = await uninstallAt(at, []);
+    expect(unanswered.code).toBe(1);
+    expect(existsSync(join(at.data, "jake"))).toBe(true);
+    expect(existsSync(at.calls)).toBe(false);
+
+    const confirmed = await uninstallAt(at, [], "y\n");
+    expect(confirmed.code).toBe(0);
+    expect(confirmed.stdout).toContain("! the hub was not told of the leave");
+    expect(confirmed.stdout).toContain("Removed u64.");
+    expect(existsSync(join(at.data, "jake"))).toBe(false);
+  });
+
+  test("its own agent's, it stops the unit, tells the hub, removes the unit and the layout, and keeps the config", async () => {
+    const hub = standInHub();
+    const at = installedAgent(hub.url, "u63");
+    const running = uninstallAt(at, ["--name", "u63"]);
+    const connection = await hub.welcomed(0);
+    await connection.next((f) => f.type === "leave", "the leave notice");
+    const { code, stdout } = await running;
+    expect(code).toBe(0);
+    expect(stdout).toContain("the hub was told u63 has left");
+    expect(readFileSync(at.calls, "utf8")).toBe("--user disable --now jake-agent.service\n--user daemon-reload\n");
+    expect(existsSync(at.unit)).toBe(false);
+    expect(readdirSync(at.data).sort()).toEqual(["agent.env", "agent.log", "instance"]);
+  });
+
+  test("with --remove-config, it leaves nothing behind", async () => {
+    const at = installedAgent("ws://127.0.0.1:1", "u63");
+    const { code, stdout } = await uninstallAt(at, ["--yes", "--remove-config"]);
+    expect(code).toBe(0);
+    expect(stdout).toContain("Removed u63. Nothing is left behind.");
+    expect(existsSync(at.data)).toBe(false);
   });
 });

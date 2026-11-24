@@ -14,6 +14,7 @@ pub mod pair;
 pub mod platform;
 mod stream;
 mod transfer;
+pub mod uninstall;
 pub mod wsl;
 
 pub use config::AgentConfig;

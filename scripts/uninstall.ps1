@@ -1,15 +1,21 @@
 <#
 .SYNOPSIS
-  Remove the jake agent for the current user, non-elevated.
+  Remove the jake agent for the current user, non-elevated, through its own jake.exe uninstall.
 
 .DESCRIPTION
-  Stops the agent/guard pair, removes all three autostart anchors for both run modes, and deletes the
-  install folder. The config file (agent.env) is kept by default so a reinstall keeps your hub URL
-  and secret; pass -RemoveConfig to delete it too. The rolling log under %LOCALAPPDATA%\jake is left
-  in place unless -RemoveConfig is given.
+  Runs `jake.exe uninstall` in the install folder, which does the whole removal (docs/install.md,
+  Uninstall); where a policy refuses PowerShell scripts, run that command directly. It says which agent
+  the install serves and asks before removing it, in a dialog. The config file (agent.env) and the log
+  are kept unless -RemoveConfig is given.
 
 .PARAMETER InstallDir
   Where jake was installed. Defaults to %LOCALAPPDATA%\Programs\jake.
+
+.PARAMETER Name
+  The agent to remove; where the install in InstallDir is another agent's, nothing is removed.
+
+.PARAMETER Yes
+  Remove without asking.
 
 .PARAMETER RemoveConfig
   Also delete agent.env and the log/data directory, leaving nothing behind.
@@ -17,80 +23,29 @@
 [CmdletBinding()]
 param(
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\jake",
+  [string]$Name,
+  [switch]$Yes,
   [switch]$RemoveConfig
 )
 
 $ErrorActionPreference = 'Stop'
 
-$AgentAnchor = 'JakeAgent'
-$GuardAnchor = 'JakeGuard'
-$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$StartupDir = [Environment]::GetFolderPath('Startup')
-$DataDir = Join-Path $env:LOCALAPPDATA 'jake'
-
-function Write-Step($msg) { Write-Host "· $msg" -ForegroundColor Cyan }
-
-# Remove all three anchors for one run mode, mirroring the remove commands the agent's watchdog keeps.
-# Absence of any one anchor is not an error — the point is that none remains afterwards.
-function Unregister-Anchor($name) {
-  try { Remove-ItemProperty -Path $RunKey -Name $name -ErrorAction Stop } catch { }
-  try { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop } catch { }
-  $lnk = Join-Path $StartupDir "$name.lnk"
-  Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
-}
-
-Write-Host "jake agent uninstaller" -ForegroundColor White
-
-Write-Step "stopping the agent and guard"
-Get-Process -Name 'jake' -ErrorAction SilentlyContinue | ForEach-Object {
-  try { $_ | Stop-Process -Force } catch { }
-}
-Start-Sleep -Milliseconds 500
-
-# Tell the hub this agent is gone, so it is recorded as departed rather than shown as disconnected.
-# The pair is already stopped, so the notice's own hello displaces no live connection. A hub that
-# cannot be reached does not stop the removal.
-# jake.exe opens no console, so PowerShell would not wait on it run as a command: it is started and
-# waited on, and what it printed is read back from files.
 $Exe = Join-Path $InstallDir 'jake.exe'
-if (Test-Path $Exe) {
-  Write-Step "telling the hub this agent has left"
-  $said = Join-Path ([System.IO.Path]::GetTempPath()) ('jake-leave-' + [System.Guid]::NewGuid().ToString('N'))
-  $leave = Start-Process -FilePath $Exe -ArgumentList '--leave' -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$said.out" -RedirectStandardError "$said.err"
-  foreach ($file in @("$said.out", "$said.err")) {
-    if (Test-Path -LiteralPath $file) {
-      Get-Content -LiteralPath $file | ForEach-Object { Write-Host "  $_" }
-      Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-    }
-  }
-  if ($leave.ExitCode -ne 0) { Write-Host "  ! the hub was not told; it will show this agent as disconnected" -ForegroundColor Yellow }
-}
+if (-not (Test-Path -LiteralPath $Exe)) { throw "no jake is installed in $InstallDir" }
 
-Write-Step "removing autostart anchors"
-Unregister-Anchor $AgentAnchor
-Unregister-Anchor $GuardAnchor
+$arguments = @('uninstall')
+if ($Name) { $arguments += @('--name', $Name) }
+if ($Yes) { $arguments += '--yes' }
+if ($RemoveConfig) { $arguments += '--remove-config' }
 
-Write-Step "deleting the install folder"
-if (Test-Path $InstallDir) {
-  if ($RemoveConfig) {
-    Remove-Item -LiteralPath $InstallDir -Recurse -Force
-  } else {
-    # Delete everything but the config, so a later reinstall keeps the hub URL and secret.
-    Get-ChildItem -LiteralPath $InstallDir -Force | Where-Object { $_.Name -ne 'agent.env' } | ForEach-Object {
-      Remove-Item -LiteralPath $_.FullName -Recurse -Force
-    }
+# jake.exe opens no console, so PowerShell would not wait on it run as a command: it is started and waited
+# on, and what it printed is read back from files.
+$said = Join-Path ([System.IO.Path]::GetTempPath()) ('jake-uninstall-' + [System.Guid]::NewGuid().ToString('N'))
+$run = Start-Process -FilePath $Exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$said.out" -RedirectStandardError "$said.err"
+foreach ($file in @("$said.out", "$said.err")) {
+  if (Test-Path -LiteralPath $file) {
+    Get-Content -LiteralPath $file | ForEach-Object { Write-Host $_ }
+    Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
   }
 }
-
-if ($RemoveConfig) {
-  Write-Step "removing the log and data directory"
-  Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-Write-Host ""
-if ($RemoveConfig) {
-  Write-Host "Removed. Nothing is left behind." -ForegroundColor Green
-} else {
-  Write-Host "Removed. Your config is kept at $InstallDir\agent.env and the log at $DataDir." -ForegroundColor Green
-  Write-Host "Pass -RemoveConfig to delete those too." -ForegroundColor White
-}
+if ($run.ExitCode -ne 0) { throw "jake.exe uninstall ended with $($run.ExitCode)" }

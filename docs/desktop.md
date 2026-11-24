@@ -214,11 +214,13 @@ before the hub has to.
     machine works as that install's node, which the BMO administrator declares shared with this
     account; or replace it with 내장 에이전트로 전환.
 - **Switching stops the installed agent through its own uninstaller.** 내장 에이전트로 전환 runs the
-  uninstaller the install left beside it — `uninstall.sh` on Linux, `uninstall.ps1` on Windows — with no
-  option, which stops and unregisters the installed agent, tells the hub it left, and removes its
-  executable while keeping its `agent.env` and its log (docs/install.md, 「Uninstall」); the app deletes
-  nothing itself. Once the uninstaller has ended, the app looks again and starts the built-in agent; an
-  uninstaller that is missing or fails leaves the installed agent serving, and the local page says why.
+  installed executable's uninstall command — `jake uninstall` on Linux, `jake.exe uninstall` on
+  Windows — naming the agent the app found there and with `--yes`, which stops and unregisters the
+  installed agent, tells the hub it left, and removes its executable while keeping its `agent.env` and
+  its log (docs/install.md, 「Uninstall」); the app deletes nothing itself. The name makes the
+  uninstaller refuse where the folder by then holds another agent's install. Once the uninstaller has
+  ended, the app looks again and starts the built-in agent; an executable that is missing, or an
+  uninstaller that refuses or fails, leaves the installed agent serving, and the local page says why.
   An install the app cannot see from where it runs, one inside a WSL distribution of the same PC, is
   not uninstalled from the app: the page says to run its own uninstaller in that distribution.
 - **It yields to any agent that holds its name or its machine.** When the hub closes the built-in

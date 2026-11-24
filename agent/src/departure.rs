@@ -53,19 +53,33 @@ pub fn linux_depart_command(unit_path: &str, data_dir: &str) -> Vec<String> {
 /// What the Windows cleanup runs once the agent has exited: it waits for the executable to become
 /// deletable, removes the install folder and the data directory, and last deletes its own task.
 pub fn windows_cleanup_script(install_dir: &str, data_dir: &str) -> String {
+  let mut lines = exe_released_lines(install_dir);
+  lines.extend([
+    format!(
+      "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
+      ps_single_quote(install_dir)
+    ),
+    format!(
+      "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
+      ps_single_quote(data_dir)
+    ),
+    format!("schtasks /delete /tn {DEPART_TASK_NAME} /f"),
+  ]);
+  lines.join("\n")
+}
+
+/// The lines of a Windows cleanup that wait for the install's executable to become deletable, once the
+/// process running it has exited, and delete it.
+pub(crate) fn exe_released_lines(install_dir: &str) -> Vec<String> {
   let exe = Platform::Windows.join(install_dir, &[JAKE_BINARY]);
-  [
+  vec![
     format!("$exe = {}", ps_single_quote(&exe)),
     "for ($i = 0; $i -lt 100; $i++) {".to_owned(),
     "  if (-not (Test-Path -LiteralPath $exe)) { break }".to_owned(),
     "  try { Remove-Item -LiteralPath $exe -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 200 }"
       .to_owned(),
     "}".to_owned(),
-    format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue", ps_single_quote(install_dir)),
-    format!("Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue", ps_single_quote(data_dir)),
-    format!("schtasks /delete /tn {DEPART_TASK_NAME} /f"),
   ]
-  .join("\n")
 }
 
 /// The one-shot cleanup task, registered like the anchors — per-user, no stored credential,
