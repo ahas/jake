@@ -1,7 +1,10 @@
 // The remote controller: a BMO server's hosted console in a window of its own, carrying a built-in jake
 // agent (docs/desktop.md).
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use jake_agent::Log;
 use jake_agent::installed::Installed;
@@ -10,12 +13,14 @@ use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem}
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
 use tauri::{App, AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
-use tokio::sync::{mpsc, watch};
+use tauri_plugin_deep_link::DeepLinkExt;
+use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
 use crate::channel::{Channel, Feeds};
 use crate::controller::{Controller, show_console};
 use crate::follow::follow;
+use crate::link::{Invitation, Invited};
 use crate::navigation::Navigation;
 use crate::pairing::Console;
 use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch, Switches};
@@ -23,7 +28,7 @@ use crate::sign_in::{Alignment, Registration};
 use crate::status::{AgentState, Status, View};
 use crate::updates::{Moment, Updates};
 use crate::vault::Vault;
-use crate::{awake, bridge, controller, navigation, pause, server, session, sign_in, updates, vault};
+use crate::{awake, bridge, controller, link, navigation, pause, server, session, sign_in, updates, vault};
 
 const MAIN_WINDOW: &str = "main";
 const TRAY: &str = "tray";
@@ -51,6 +56,12 @@ struct Shared {
   carrying: watch::Sender<usize>,
   /// The app's quiet updates, where its build checks for any.
   updates: Option<Arc<Updates>>,
+  /// The invitation a link hands the course for its pairing (docs/desktop.md, 「Opening from a link」).
+  invitations: watch::Sender<Option<Invited>>,
+  /// Whether a link's question to change the server stands, so a second link is not asked over it.
+  asking: AtomicBool,
+  /// The app's config directory, where the settings and the pending invitation are kept.
+  config_dir: PathBuf,
 }
 
 /// The main window, as the controller asks things of it.
@@ -66,6 +77,48 @@ impl controller::Window for MainWindow {
   fn open_local(&self) {
     self.open(&navigation::local_page());
   }
+
+  fn tell(&self, message: String) {
+    let app = self.0.clone();
+    tauri::async_runtime::spawn(async move {
+      message_box(&app, message, Buttons::Ok).await;
+    });
+  }
+}
+
+/// The answers a message box offers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Buttons {
+  Ok,
+  YesNo,
+}
+
+/// Show a native message box over the main window, made on the main thread as the system's toolkit asks and
+/// waited on apart from it; whether the person answered yes.
+async fn message_box(app: &AppHandle, message: String, buttons: Buttons) -> bool {
+  let (answer, answered) = oneshot::channel();
+  let handle = app.clone();
+  let shown = app.run_on_main_thread(move || {
+    let mut dialog = rfd::AsyncMessageDialog::new()
+      .set_title("BMO")
+      .set_description(message)
+      .set_level(match buttons {
+        Buttons::Ok => rfd::MessageLevel::Warning,
+        Buttons::YesNo => rfd::MessageLevel::Info,
+      })
+      .set_buttons(match buttons {
+        Buttons::Ok => rfd::MessageButtons::Ok,
+        Buttons::YesNo => rfd::MessageButtons::YesNo,
+      });
+    if let Some(window) = handle.get_webview_window(MAIN_WINDOW) {
+      dialog = dialog.set_parent(&window);
+    }
+    let shown = dialog.show();
+    std::thread::spawn(move || {
+      let _ = answer.send(tauri::async_runtime::block_on(shown));
+    });
+  });
+  shown.is_ok() && answered.await == Ok(rfd::MessageDialogResult::Yes)
 }
 
 /// The status as the bundled page draws it.
@@ -155,7 +208,12 @@ fn settings_view(shared: &Shared) -> SettingsView {
 /// origin cannot be withdrawn while it runs. The same address changes nothing; whether the app starts
 /// again is the answer.
 async fn change_console(app: &AppHandle, address: &str) -> Result<bool, String> {
-  let console = server::entered(address)?;
+  move_to(app, server::entered(address)?, None).await
+}
+
+/// Move to the server at `console`, as a change of server does; an invitation a link carried is kept for the new
+/// start, which pairs with it.
+async fn move_to(app: &AppHandle, console: Url, invitation: Option<&Invitation>) -> Result<bool, String> {
   let shared = app.state::<Shared>();
   let before = shared.console.as_ref().map(|before| before.base().clone());
   if before.as_ref() == Some(&console) {
@@ -179,8 +237,112 @@ async fn change_console(app: &AppHandle, address: &str) -> Result<bool, String> 
       shared.log.warn("credential-not-forgotten", json!({ "reason": reason }));
     }
   }
-  stop_then(app, |app| app.restart());
+  // An invitation that cannot be kept leaves the new start to pair as any first start does.
+  if let Some(invitation) = invitation
+    && let Err(error) = link::keep_pending(&shared.config_dir, invitation, SystemTime::now())
+  {
+    shared.log.warn("invitation-not-kept", json!({ "error": error.to_string() }));
+  }
+  stop_then(app, restart);
   Ok(true)
+}
+
+/// Start the app again with the arguments it was started with but a link, which the new start must not act on
+/// again: what it carries crosses in the pending file alone.
+fn restart(app: &AppHandle) {
+  let mut env = app.env();
+  env.args_os = env
+    .args_os
+    .into_iter()
+    .enumerate()
+    .filter(|(at, arg)| *at == 0 || !link::is_link(arg))
+    .map(|(_, arg)| arg)
+    .collect();
+  let handle = app.clone();
+  // The runtime's own restart frees what the app holds, the single-instance lock among it, on the main thread
+  // before it starts the new process; this does the same with the arguments it is given.
+  if app
+    .run_on_main_thread(move || {
+      handle.cleanup_before_exit();
+      tauri::process::restart(&env);
+    })
+    .is_err()
+  {
+    app.restart();
+  }
+}
+
+/// Act on a link the app was handed (docs/desktop.md, 「Opening from a link」): one refused is logged and said; one
+/// to the server the app runs on hands its invitation to the course; one to another server asks the person, once,
+/// before the app moves to it.
+async fn open_link(app: AppHandle, link: String) {
+  let shared = app.state::<Shared>();
+  reveal(&app);
+  let invitation = match link::read(&link) {
+    Ok(invitation) => invitation,
+    Err(reason) => {
+      shared.log.warn("link-refused", json!({ "reason": reason }));
+      message_box(&app, format!("이 링크를 열 수 없습니다.\n{reason}"), Buttons::Ok).await;
+      return;
+    }
+  };
+  let before = shared.console.as_ref().map(|console| console.base().clone());
+  if before.as_ref() == Some(&invitation.server) {
+    hand_to_course(&shared, invitation);
+    return;
+  }
+  if shared.asking.swap(true, Ordering::SeqCst) {
+    shared
+      .log
+      .info("link-ignored-while-asking", json!({ "server": invitation.server.as_str() }));
+    return;
+  }
+  let mut question = format!("이 서버에 연결할까요?\n{}", authority(&invitation.server));
+  if let Some(before) = &before {
+    question.push_str(&format!(
+      "\n\n지금 연결된 서버({})의 연결 정보는 이 앱에서 삭제됩니다.",
+      authority(before)
+    ));
+  }
+  let yes = message_box(&app, question, Buttons::YesNo).await;
+  shared
+    .log
+    .info("link-asked", json!({ "server": invitation.server.as_str(), "yes": yes }));
+  if yes && let Err(reason) = move_to(&app, invitation.server.clone(), Some(&invitation)).await {
+    shared
+      .log
+      .warn("link-server-refused", json!({ "server": invitation.server.as_str(), "reason": reason }));
+    message_box(&app, format!("이 서버에 연결하지 못했습니다.\n{reason}"), Buttons::Ok).await;
+  }
+  shared.asking.store(false, Ordering::SeqCst);
+}
+
+/// A server's host and port, as the person is shown it.
+fn authority(server: &Url) -> String {
+  match (server.host_str(), server.port()) {
+    (Some(host), Some(port)) => format!("{host}:{port}"),
+    (Some(host), None) => host.to_owned(),
+    (None, _) => server.to_string(),
+  }
+}
+
+/// Hand an invitation for the server the app runs on to the course: a pairing open or opening is approved with
+/// it, and a course stopped on a failed pairing pairs again. A machine already paired has nothing to pair.
+fn hand_to_course(shared: &Shared, invitation: Invitation) {
+  let agent = shared.status.borrow().agent.clone();
+  match agent {
+    AgentState::Starting | AgentState::Pairing { .. } | AgentState::PairingFailed(_) => {
+      shared.log.info("invitation-handed", json!({ "server": invitation.server.as_str() }));
+      shared.invitations.send_replace(Some(Invited::new(invitation.invite)));
+      if matches!(agent, AgentState::PairingFailed(_)) {
+        let _ = shared.retries.try_send(());
+      }
+    }
+    state => shared.log.info(
+      "link-nothing-to-pair",
+      json!({ "server": invitation.server.as_str(), "state": format!("{state:?}") }),
+    ),
+  }
 }
 
 /// Write the update channel and hand it to the updates, which ask its feed at once.
@@ -471,6 +633,19 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
   if console.is_none() {
     status.send_modify(|status| status.agent = AgentState::NoServer);
   }
+  // An invitation carried across the start that moved the app to this server pairs it (docs/desktop.md,
+  // 「Opening from a link」); the file is taken whatever it holds, so it is acted on once at most.
+  let config_dir = app.path().app_config_dir()?;
+  let invitations = watch::Sender::new(None);
+  match link::take_pending(&config_dir, SystemTime::now()) {
+    Ok(Some(pending)) if Some(&pending.server) == base.as_ref() => {
+      log.info("invitation-carried", json!({ "server": pending.server.as_str() }));
+      invitations.send_replace(Some(Invited::new(pending.invite)));
+    }
+    Ok(Some(pending)) => log.warn("invitation-dropped", json!({ "server": pending.server.as_str() })),
+    Ok(None) => {}
+    Err(reason) => log.warn("invitation-unreadable", json!({ "reason": reason })),
+  }
   let (retries, retried) = mpsc::channel(1);
   let (quit, quitting) = watch::channel(false);
   let kept = app.path().app_local_data_dir()?.join("update");
@@ -560,6 +735,7 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
         carrying: carrying.clone(),
         instance: instance.clone(),
         machine: machine.fingerprint.clone(),
+        invitations: invitations.clone(),
       }
       .run(),
     )
@@ -604,8 +780,42 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     registration,
     carrying,
     updates,
+    invitations,
+    asking: AtomicBool::new(false),
+    config_dir,
   });
+  links(app, started.hidden);
   Ok(())
+}
+
+/// Take the app's links (docs/desktop.md, 「Opening from a link」): those a running app is handed, and the one it was
+/// started with, unless a quiet update started it again with its first start's arguments. An AppImage, which no
+/// installer registers, and a development build register the scheme themselves.
+fn links(app: &App, updated_quietly: bool) {
+  let deep_link = app.deep_link();
+  let handle = app.handle().clone();
+  deep_link.on_open_url(move |event| {
+    for url in event.urls() {
+      tauri::async_runtime::spawn(open_link(handle.clone(), url.to_string()));
+    }
+  });
+  let started_with = deep_link.get_current().ok().flatten().unwrap_or_default();
+  if !updated_quietly {
+    for url in started_with {
+      tauri::async_runtime::spawn(open_link(app.handle().clone(), url.to_string()));
+    }
+  }
+  #[cfg(target_os = "linux")]
+  let appimage = app.env().appimage.is_some();
+  #[cfg(not(target_os = "linux"))]
+  let appimage = false;
+  let unregistered = cfg!(debug_assertions) || appimage;
+  if unregistered && let Err(error) = deep_link.register_all() {
+    app
+      .state::<Shared>()
+      .log
+      .warn("link-scheme-not-registered", json!({ "error": error.to_string() }));
+  }
 }
 
 pub fn main() {
@@ -614,8 +824,11 @@ pub fn main() {
   // feed of the channel the settings name beside the endpoint it gives (docs/desktop.md, 「The update
   // channel」).
   let updates = context.config().plugins.0.get("updater").map(Feeds::from_updater_config);
-  let mut builder =
-    tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)));
+  // The single instance comes first, and hands a link a second launch carries to the deep links before it shows
+  // the window (docs/desktop.md, 「Opening from a link」).
+  let mut builder = tauri::Builder::default()
+    .plugin(tauri_plugin_single_instance::init(|app, _, _| reveal(app)))
+    .plugin(tauri_plugin_deep_link::init());
   if updates.is_some() {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }

@@ -160,6 +160,58 @@ flowchart TD
 - **A pairing that fails is offered again,** by a button on the local page; the app never asks the
   console for pairings in a loop of its own.
 
+## Opening from a link
+
+The console's join page, the page a newly invited person opens, offers 「앱에서 열기」, a link that opens the
+installed app on the inviting server and pairs it to the invitation's account with no code typed and no
+sign-in (bmo-web's `docs/web.md`). The link carries no secret but the invitation, which is good for one
+account's joining once, and the app accepts no other.
+
+- **The link's form** is `bmo://connect?server=<console address>&invite=<invitation token>`, both values
+  URL-encoded. The app reads it strictly and refuses anything else, with nothing done: a scheme other than
+  `bmo`, an action other than `connect`, a port, a user, a path or a fragment beside it, and any parameter but
+  exactly one `server` and one `invite`. The server must be an `https://` address, or plain HTTP on this
+  machine alone, as the server page allows (「The server」), with no user or password in it; it is taken as the
+  same base the server page keeps, ending in a slash, with no query or fragment. The invitation is exactly 48
+  lowercase hexadecimal characters. A refused link is written to the log, without the invitation, and the
+  person is told in a native message box that the link cannot be opened, and why.
+- **The scheme is the remote controller's alone.** The installer registers `bmo` for the person: the NSIS
+  installer under the person's own classes in the registry, the deb's desktop entry as the handler of
+  `x-scheme-handler/bmo`. An AppImage is installed by no one, so the app registers itself as the handler each
+  time it starts as one, and a development build does the same on Windows and Linux. The all-in-one registers
+  no scheme: it runs a BMO set of its own and joins no other server, and two apps claiming one scheme would
+  leave the system to pick either.
+- **A running app takes the link itself.** The system starts a new copy with the link as its one argument;
+  that copy hands it to the running one and exits (「What it is」, one copy at a time), and the running one
+  brings its window forward and acts on it. An app the link starts acts on it as it starts. An app started
+  again by a quiet update (「Updating quietly」) is handed its first start's arguments again, and ignores a link
+  among them, since that link was acted on before.
+- **A link to the server the app runs on pairs at once.** The invitation is handed to the app's course: a
+  pairing open or opening is approved with it, and a course stopped on a failed pairing pairs again with it.
+  Where the app holds a credential for that server already, there is nothing to pair and the link only brings
+  the window forward.
+- **A link to another server asks first.** A native message box asks 「이 서버에 연결할까요?」 with the server's
+  host under it, with the system's own Yes and No, and says where a server is already set that its connection
+  is forgotten. No changes nothing. Yes changes the server as the server page does (「The server」): the address
+  is checked to be a BMO console, written, the old server's credential forgotten, and the app starts again on
+  it; a check that fails says why in a message box and changes nothing. One question stands at a time; a link
+  to another server pressed while it is asked is ignored.
+- **The invitation outlives that start in a pending file** beside `settings.json`, `pending-invitation.json`,
+  written just before the app starts again and holding the server, the invitation and when it expires, ten
+  minutes on. The new start reads it and deletes it before anything else, so it is acted on once at most, and
+  takes the invitation only where it is not expired and names the server the app now runs on. The new start is
+  given none of the link's arguments, so nothing but the file carries it. On Unix the file is readable by the
+  person alone.
+- **Pairing bound to the invitation.** The app asks for a pairing as always (「Pairing」) and, holding an
+  invitation fresh within ten minutes of its link, does not show the approval page: it approves the pairing
+  itself, with an unauthenticated `POST /api/join/<invitation>/pair` under the console's address whose JSON body
+  names the pairing's `code`. The console answers 200 with the machine's name, and the app's own poll then
+  takes the credential as for any approved pairing. The invitation is used once and then dropped.
+- **A refused invitation falls back to the approval page.** The console refuses with a 4xx whose JSON body's
+  `message` is already in the person's words: the invitation's account already active, the pairing closed, the
+  invitation not found. The app then opens the approval page in its window as any pairing does, and shows that
+  message in a message box, so the person signs in and approves by hand.
+
 ## The credential's storage
 
 - **The credential is kept in the operating system's credential store**, through the `keyring` crate:
@@ -491,6 +543,9 @@ processes and its network stay as they were.
   administrator rights. It is unsigned until an Authenticode certificate exists, which is the owner's
   decision, so Windows SmartScreen warns on first run until then.
 - **Linux second:** an AppImage and a deb package.
+- **The NSIS installer and the deb register the `bmo` scheme,** from the deep-link plugin's
+  `plugins.deep-link.desktop.schemes` in the app's Tauri configuration, which the all-in-one's configuration
+  removes (「Opening from a link」).
 - **Updates go through Tauri's updater plugin with its signature check, quietly** (「Updating quietly」). The app
   checks its channel's feed (「The update channel」) at start, every six hours and when the channel changes, and
   installs an update only once its signature verifies against the public key built into the app.

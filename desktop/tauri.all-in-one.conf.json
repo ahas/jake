@@ -7,6 +7,7 @@
     "shortDescription": "BMO installed and run on this computer, with its console"
   },
   "plugins": {
+    "deep-link": null,
     "updater": {
       "endpoints": ["https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json"]
     }

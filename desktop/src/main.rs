@@ -23,6 +23,8 @@ mod controller;
 #[cfg(not(feature = "all-in-one"))]
 mod follow;
 #[cfg(not(feature = "all-in-one"))]
+mod link;
+#[cfg(not(feature = "all-in-one"))]
 mod pairing;
 #[cfg(not(feature = "all-in-one"))]
 mod pause;

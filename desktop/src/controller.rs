@@ -8,6 +8,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use url::Url;
 
+use crate::link::Invited;
 use crate::pairing::{Console, Machine, PairingError};
 use crate::pause::serve_unpaused;
 use crate::status::{AgentState, ConsoleState, PairingFailure, Status};
@@ -20,6 +21,8 @@ pub trait Window: Send + Sync + 'static {
   fn open(&self, url: &Url);
   /// Show the bundled page in the main window.
   fn open_local(&self);
+  /// Tell the person something they must read, in a native message box.
+  fn tell(&self, message: String);
 }
 
 /// Everything the course runs with.
@@ -40,6 +43,9 @@ pub struct Controller<W: Window> {
   pub instance: String,
   /// This machine's fingerprint, which the built-in agent's hello names; none where it could not be read.
   pub machine: Option<String>,
+  /// An invitation a link handed over, which approves the next pairing in place of the person (docs/desktop.md,
+  /// 「Opening from a link」).
+  pub invitations: watch::Sender<Option<Invited>>,
 }
 
 /// How long a quit waits for the built-in agent to close its connection.
@@ -148,17 +154,25 @@ impl<W: Window> Controller<W> {
         return Err(AgentState::NoStore(reason));
       }
     }
-    let paired = self
-      .console
-      .pair(|pairing| {
-        self.log.info("pairing-opened", json!({ "code": pairing.code }));
-        self.set_agent(AgentState::Pairing {
-          code: pairing.code.clone(),
-          approve_url: pairing.approve_url.clone(),
-        });
+    let (opened, opening) = watch::channel(None);
+    let pairing = self.console.pair(|pairing| {
+      self.log.info("pairing-opened", json!({ "code": pairing.code }));
+      self.set_agent(AgentState::Pairing {
+        code: pairing.code.clone(),
+        approve_url: pairing.approve_url.clone(),
+      });
+      // Holding an invitation, the app approves the pairing itself, and shows the approval page only if the
+      // invitation is refused.
+      let invited = self.invitations.borrow().as_ref().is_some_and(|invited| invited.fresh().is_some());
+      if !invited {
         self.window.open(&pairing.approve_url);
-      })
-      .await;
+      }
+      opened.send_replace(Some((pairing.code.clone(), pairing.approve_url.clone())));
+    });
+    let paired = tokio::select! {
+      paired = pairing => paired,
+      never = self.approve_by_invitation(opening) => match never {},
+    };
     let machine = match paired {
       Ok(machine) => machine,
       Err(error) => {
@@ -183,6 +197,44 @@ impl<W: Window> Controller<W> {
       Err(NoStore(reason)) => {
         self.log.warn("credential-not-kept", json!({ "reason": reason }));
         Err(AgentState::PairingFailed(PairingFailure::NotKept))
+      }
+    }
+  }
+
+  /// Approve the pairing once it opens with each fresh invitation handed over while it is open, each used once;
+  /// one refused opens the approval page and tells the person the console's reason. It runs until the pairing ends
+  /// and drops it.
+  async fn approve_by_invitation(
+    &self,
+    mut opening: watch::Receiver<Option<(String, Url)>>,
+  ) -> std::convert::Infallible {
+    let mut handed = self.invitations.subscribe();
+    let opened = opening.wait_for(Option::is_some).await.ok().and_then(|opened| opened.clone());
+    let Some((code, approve_url)) = opened else {
+      return std::future::pending().await;
+    };
+    loop {
+      // Taking one tells the watch, and taking none leaves it quiet, so the wait below sees only a new hand-over.
+      let mut taken = None;
+      self.invitations.send_if_modified(|handed| {
+        taken = handed.take();
+        taken.is_some()
+      });
+      let invite = taken.and_then(|invited| invited.fresh().map(str::to_owned));
+      if let Some(invite) = invite {
+        match self.console.approve(&invite, &code).await {
+          Ok(()) => self.log.info("pairing-approved-by-invitation", json!({ "code": code })),
+          Err(reason) => {
+            self.log.warn("invitation-refused", json!({ "code": code, "reason": reason }));
+            self.window.open(&approve_url);
+            self.window.tell(format!(
+              "초대로 이 기기를 연결하지 못했습니다.\n{reason}\n열린 승인 페이지에서 로그인해 연결해 주세요."
+            ));
+          }
+        }
+      }
+      if handed.changed().await.is_err() {
+        return std::future::pending().await;
       }
     }
   }

@@ -165,6 +165,37 @@ impl Console {
     }
   }
 
+  /// Approve the open pairing of `code` with an invitation, which needs no sign-in and binds the machine to the
+  /// invitation's account (docs/desktop.md, 「Opening from a link」). A refusal is the console's message, already in
+  /// the person's words, or says the console could not be asked.
+  pub async fn approve(&self, invite: &str, code: &str) -> Result<(), String> {
+    let mut url = self.base.clone();
+    url
+      .path_segments_mut()
+      .map_err(|()| "the console's address cannot take a path".to_owned())?
+      .pop_if_empty()
+      .extend(["api", "join", invite, "pair"]);
+    let response = self
+      .http
+      .post(url)
+      .json(&serde_json::json!({ "code": code }))
+      .send()
+      .await
+      .map_err(|error| format!("서버에 연결할 수 없습니다. {error}"))?;
+    let status = response.status();
+    if status.is_success() {
+      return Ok(());
+    }
+    #[derive(Deserialize)]
+    struct Refusal {
+      message: String,
+    }
+    match response.json::<Refusal>().await {
+      Ok(refusal) if !refusal.message.trim().is_empty() => Err(refusal.message),
+      _ => Err(format!("초대를 확인하지 못했습니다. (HTTP {})", status.as_u16())),
+    }
+  }
+
   fn pairings(&self) -> Url {
     self
       .base
@@ -250,6 +281,7 @@ mod tests {
         .route("/bmo/api/desktop/pairings", post(open))
         .route("/bmo/api/desktop/pairings/{pairing}", get(poll))
         .route("/bmo/api/desktop/release", get(|| async { Json(json!({ "release": null })) }))
+        .route("/bmo/api/join/{invite}/pair", post(approve))
         .with_state(self);
       let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
       let address = listener.local_addr().unwrap();
@@ -297,6 +329,43 @@ mod tests {
     assert_eq!(code, "K3-9Q");
     assert_eq!(approve_url.path(), "/bmo/desktop/pair");
     assert_eq!(approve_url.query(), Some("code=K3-9Q"));
+  }
+
+  const INVITE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  /// The stand-in's join route: the one invitation it knows approves the code K3-9Q; any other code is a
+  /// closed pairing, and any other invitation one already used, refused with the console's own message.
+  async fn approve(Path(invite): Path<String>, Json(body): Json<serde_json::Value>) -> Response {
+    let refused = |status: Status, message: &str| {
+      (status, Json(json!({ "statusCode": status.as_u16(), "message": message }))).into_response()
+    };
+    if invite != INVITE {
+      return refused(Status::CONFLICT, "이미 가입이 끝난 초대입니다.");
+    }
+    if body["code"] != "K3-9Q" {
+      return refused(Status::GONE, "연결 요청이 끝났습니다.");
+    }
+    Json(json!({ "machine": "u7" })).into_response()
+  }
+
+  #[tokio::test]
+  async fn an_invitation_approves_the_open_pairing() {
+    let console = StandIn::approving(&[Status::OK]).serve().await;
+    assert_eq!(console.approve(INVITE, "K3-9Q").await, Ok(()));
+  }
+
+  #[tokio::test]
+  async fn a_refused_invitation_answers_with_the_consoles_message() {
+    let console = StandIn::approving(&[Status::OK]).serve().await;
+    let used = "f".repeat(48);
+    assert_eq!(console.approve(&used, "K3-9Q").await, Err("이미 가입이 끝난 초대입니다.".to_owned()));
+    assert_eq!(console.approve(INVITE, "Z9-9Z").await, Err("연결 요청이 끝났습니다.".to_owned()));
+  }
+
+  #[tokio::test]
+  async fn a_refusal_with_no_message_says_the_status() {
+    let refused = other_server(Status::NOT_FOUND.into_response()).await.approve(INVITE, "K3-9Q").await;
+    assert_eq!(refused, Err("초대를 확인하지 못했습니다. (HTTP 404)".to_owned()));
   }
 
   #[tokio::test]

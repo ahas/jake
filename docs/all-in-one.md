@@ -36,7 +36,8 @@ the canonical statement of the all-in-one; the `desktop` crate built with its `a
 - **What they share** stands in the crate once: the settings file and its switches, where the window may
   navigate, starting at sign-in and the update channel. Each builds its own frameless window, tray and console
   bridge from them, the all-in-one's bridge giving the console the same window commands and settings' read.
-- **What each has of its own:** the remote controller's agent, pairing, credential store and server page are
+- **What each has of its own:** the remote controller's agent, pairing, credential store, server page and `bmo`
+  link (docs/desktop.md, 「Opening from a link」), whose scheme the all-in-one's configuration leaves unregistered, are
   built only without the feature; the all-in-one's first run, its runner of the installer, the set's manager and
   WSL's bootstrap are built only with it, under `src/all_in_one/`, with bundled pages under `ui/all-in-one/` and
   capabilities under `capabilities/all-in-one/`.

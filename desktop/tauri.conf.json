@@ -27,6 +27,11 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["bmo"]
+      }
+    },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJFN0UwN0RFMzkwMjM2OTIKUldTU05nSTUzZ2QrTHJ0VmQyZlhpQzR5UWc5R0c4TGxxMUc5eE9JWTVjUko5WmZqbzdXQXpWVnAK",
       "endpoints": ["https://github.com/ahas/jake/releases/latest/download/latest.json"],
