@@ -524,36 +524,45 @@ esac
   }
 
   const PRIVATE = { visibility: "PRIVATE", published: "", nightly: false };
+  const PUBLIC = { visibility: "PUBLIC", published: "", nightly: false };
   const onlyReads = (calls: string[]): boolean =>
     calls.every((call) => call.startsWith("repo view") || call.startsWith("release view") || call.startsWith("release download"));
   const onlyServerReads = (): boolean => asked.every((request) => request.startsWith("GET "));
 
-  test("a first stable release of a private repository names the update server alone, and reads alone", async () => {
-    onServer.stable = null;
-    onServer.nightly = null;
+  test("an official release of a private repository names GitHub's feeds alone, and a run would refuse", async () => {
     const { status, out, calls } = await release("stable", PRIVATE);
 
     expect(status).toBe(0);
-    expect(out).toContain("desktop release 0.2.1 on stable → the update server https://updates.example/bmo-update/");
-    expect(out).toContain(
-      "endpoint       https://updates.example/bmo-update/updates/bmo-desktop/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}} (remote controller)",
-    );
-    expect(out).toContain("/updates/bmo-all-in-one/stable/");
-    expect(out).toContain("download read  https://updates.example/bmo-update/products/bmo-desktop/download");
-    expect(out).toContain("GitHub         ahas/jake is private, so nothing is published there");
-    expect(out).toContain("would call     PUT products/bmo-desktop/releases/0.2.1/files/BMO_0.2.1_x64-setup.exe/content <installer bytes>");
-    expect(out).toContain('would call     PATCH products/bmo-desktop/releases/0.2.1 {"state":"live"}');
-    expect(out).not.toContain("would run      gh");
+    expect(out).toContain("desktop official release 0.2.1 on stable → GitHub ahas/jake");
+    expect(out).toContain("endpoint       https://github.com/ahas/jake/releases/latest/download/latest.json (remote controller)");
+    expect(out).toContain("endpoint       https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json (all-in-one)");
+    expect(out).toContain("release read   https://github.com/ahas/jake/releases/latest/download/release.json");
+    expect(out).toContain("a release run refuses: ahas/jake is private");
+    expect(out).not.toContain("updates.example");
+    expect(out).not.toContain("would call");
     expect(out).toContain("dry run: nothing built, uploaded or written");
-    expect(out).not.toContain("not a token");
-    expect(calls).toEqual(["repo view ahas/jake --json visibility"]);
-    expect(asked).toContain("GET /products/bmo-desktop/releases?channel=stable&limit=1");
-    expect(onlyServerReads()).toBe(true);
+    expect(onlyReads(calls)).toBe(true);
+    expect(asked).toEqual([]);
   });
 
-  test("a public repository is published on GitHub as well", async () => {
-    onServer.stable = null;
-    const { status, out, calls } = await release("stable", { visibility: "PUBLIC", published: "", nightly: false });
+  test("an official release run of a private repository is refused before anything is built", async () => {
+    const { status, out, calls } = await release("stable", PRIVATE, []);
+
+    expect(status).toBe(1);
+    expect(out).toContain("ahas/jake is private");
+    expect(out).toContain("1.0.0");
+    expect(out).not.toContain("building");
+    expect(onlyReads(calls)).toBe(true);
+  });
+
+  test("an official release never reads the publisher's file", async () => {
+    const { status } = await release("stable", PRIVATE, ["--dry-run", "--publisher", join(root, "missing.env")]);
+
+    expect(status).toBe(0);
+  });
+
+  test("a public repository's official stable release is published on GitHub", async () => {
+    const { status, out, calls } = await release("stable", PUBLIC);
 
     expect(status).toBe(0);
     expect(out).toContain("GitHub         ahas/jake, tag desktop-v0.2.1");
@@ -562,40 +571,95 @@ esac
     expect(out).toContain("'<staging>/latest.json' '<staging>/all-in-one-latest.json' '<staging>/console/release.json'");
     expect(out).toContain("would run      gh release create desktop-v0.2.1 --repo ahas/jake --target ");
     expect(out).toContain("would run      gh release edit desktop-v0.2.1 --repo ahas/jake --draft=false --latest");
+    expect(out).not.toContain("a release run refuses");
     expect(onlyReads(calls)).toBe(true);
+    expect(asked).toEqual([]);
   });
 
-  test("a stable version not above the update server's is refused", async () => {
-    onServer.stable = "0.2.1";
-    const { status, out } = await release("stable", PRIVATE);
+  test("an official stable version not above GitHub's is refused", async () => {
+    const { status, out } = await release("stable", { visibility: "PUBLIC", published: "0.2.1", nightly: false });
 
     expect(status).toBe(1);
     expect(out).toContain("not higher than the published 0.2.1");
   });
 
-  test("a nightly counts above the update server's nightly and replaces GitHub's pre-release where public", async () => {
-    onServer.stable = "0.2.1";
-    onServer.nightly = null;
+  test("an official nightly counts above GitHub's and replaces its pre-release", async () => {
     const { status, out, calls } = await release("nightly", { visibility: "PUBLIC", published: "0.2.1", nightly: true });
 
     expect(status).toBe(0);
-    expect(out).toMatch(/desktop release 0\.3\.0-nightly\.\d{8} on nightly → the update server/);
+    expect(out).toMatch(/desktop official release 0\.3\.0-nightly\.\d{8} on nightly → GitHub ahas\/jake/);
+    expect(out).toContain("endpoint       https://github.com/ahas/jake/releases/latest/download/latest.json (remote controller)");
     expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/download/desktop-nightly/latest.json");
     expect(out).toContain("would run      gh release delete-asset desktop-nightly BMO_0.3.0-nightly.20261101_amd64.deb --repo ahas/jake --yes");
     expect(out).toContain("would run      gh release upload desktop-v0.2.1 --repo ahas/jake --clobber");
-    expect(out).toMatch(/would call {5}PUT products\/bmo-desktop\/releases\/0\.3\.0-nightly\.\d{8} \{"channel":"nightly"/);
     expect(calls).toContain("release view desktop-nightly --repo ahas/jake --json assets");
     expect(onlyReads(calls)).toBe(true);
+    expect(asked).toEqual([]);
+  });
+
+  test("an official nightly before the first stable release on GitHub is refused", async () => {
+    const { status, out } = await release("nightly", PUBLIC);
+
+    expect(status).toBe(1);
+    expect(out).toContain("follows a release");
+  });
+
+  test("a test release names the update server alone, and never GitHub", async () => {
+    onServer.stable = null;
+    onServer.nightly = null;
+    const { status, out, calls } = await release("stable", PRIVATE, ["--test", "--dry-run"]);
+
+    expect(status).toBe(0);
+    expect(out).toContain("desktop test release 0.2.1 on stable → the update server https://updates.example/bmo-update/");
+    expect(out).toContain(
+      "endpoint       https://updates.example/bmo-update/updates/bmo-desktop/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}} (remote controller)",
+    );
+    expect(out).toContain("/updates/bmo-all-in-one/stable/");
+    expect(out).toContain("download read  https://updates.example/bmo-update/products/bmo-desktop/download");
+    expect(out).toContain("would call     PUT products/bmo-desktop/releases/0.2.1/files/BMO_0.2.1_x64-setup.exe/content <installer bytes>");
+    expect(out).toContain('would call     PATCH products/bmo-desktop/releases/0.2.1 {"state":"live"}');
+    expect(out).not.toContain("github.com");
+    expect(out).not.toContain("would run");
+    expect(out).not.toContain("not a token");
+    expect(calls).toEqual([]);
+    expect(asked).toContain("GET /products/bmo-desktop/releases?channel=stable&limit=1");
+    expect(onlyServerReads()).toBe(true);
+  });
+
+  test("a test stable version not above the update server's is refused", async () => {
+    onServer.stable = "0.2.1";
+    const { status, out } = await release("stable", PRIVATE, ["--test", "--dry-run"]);
+
+    expect(status).toBe(1);
+    expect(out).toContain("not higher than the published 0.2.1");
+  });
+
+  test("a test nightly counts above the update server's nightly", async () => {
+    onServer.stable = "0.2.1";
+    onServer.nightly = null;
+    const { status, out, calls } = await release("nightly", PRIVATE, ["--test", "--dry-run"]);
+
+    expect(status).toBe(0);
+    expect(out).toMatch(/desktop test release 0\.3\.0-nightly\.\d{8} on nightly → the update server/);
+    expect(out).toMatch(/would call {5}PUT products\/bmo-desktop\/releases\/0\.3\.0-nightly\.\d{8} \{"channel":"nightly"/);
+    expect(calls).toEqual([]);
     expect(asked).toContain("GET /products/bmo-desktop/releases?channel=nightly&limit=1");
   });
 
-  test("a public repository with no stable release on GitHub takes no nightly there", async () => {
-    onServer.stable = "0.2.1";
-    const { status, out } = await release("nightly", { visibility: "PUBLIC", published: "", nightly: false });
+  test("a test nightly before the first stable release on the update server is refused", async () => {
+    onServer.stable = null;
+    onServer.nightly = null;
+    const { status, out } = await release("nightly", PRIVATE, ["--test", "--dry-run"]);
 
-    expect(status).toBe(0);
-    expect(out).toContain("holds no stable release, so no nightly is published there");
-    expect(out).not.toContain("would run      gh");
+    expect(status).toBe(1);
+    expect(out).toContain("follows a release");
+  });
+
+  test("a test release with no publisher's file stops before anything", async () => {
+    const { status, out } = await release("stable", PRIVATE, ["--test", "--dry-run", "--publisher", join(root, "missing.env")]);
+
+    expect(status).toBe(1);
+    expect(out).toContain("publisher's file");
   });
 
   test("--no-publish takes neither --dry-run nor a mirror", async () => {
@@ -604,21 +668,5 @@ esac
       expect(status).toBe(1);
       expect(out).toContain("usage:");
     }
-  });
-
-  test("a nightly before the first stable release is refused", async () => {
-    onServer.stable = null;
-    onServer.nightly = null;
-    const { status, out } = await release("nightly", PRIVATE);
-
-    expect(status).toBe(1);
-    expect(out).toContain("follows a release");
-  });
-
-  test("a release with no publisher's file stops before anything", async () => {
-    const { status, out } = await release("stable", PRIVATE, ["--dry-run", "--publisher", join(root, "missing.env")]);
-
-    expect(status).toBe(1);
-    expect(out).toContain("publisher's file");
   });
 });

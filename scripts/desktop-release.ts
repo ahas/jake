@@ -1,4 +1,5 @@
-// Builds the desktop apps' signed installers and publishes them to the update server, and to GitHub while public.
+// Builds the desktop apps' signed installers and publishes them: an official release to GitHub, a test release to
+// the test update server.
 
 import { spawnSync } from "node:child_process";
 import {
@@ -35,6 +36,7 @@ import {
   NIGHTLY_TAG,
   NSIS,
   PLATFORM_TIME_ZONE,
+  type ReleaseRead,
   type Repository,
   type UpdateApp,
   type UpdateCall,
@@ -68,7 +70,7 @@ const desktopDir = join(dirname(fileURLToPath(import.meta.url)), "..", "desktop"
 /** The update key's two files in the deployment's secret store (docs/desktop.md, 「Making a release」). */
 const KEY_FILE = "jake-desktop-updater.key";
 const PASSWORD_FILE = "jake-desktop-updater.password";
-/** The update server's publisher's file in the deployment's secret store, which bmo-update's install writes. */
+/** The test update server's publisher's file in the deployment's secret store, which bmo-update's install writes. */
 const PUBLISHER_FILE = "update-publisher.env";
 
 /** One `cargo tauri build` of the release: the target it builds for and the formats it bundles. */
@@ -305,8 +307,8 @@ type BuiltInstaller = Installer & { readonly path: string };
 /** What one release builds: the version and the configuration the CLI merges over each app's. */
 interface Release {
   readonly version: string;
-  /** The CLI's configuration arguments for an app: its update server's endpoint and a nightly's version, handed to
-   * its build alone and never written. */
+  /** The CLI's configuration arguments for an app: a test build's update server endpoint and a nightly's version,
+   * handed to its build alone and never written. */
   override(config: AppConfig): readonly string[];
 }
 
@@ -416,6 +418,7 @@ async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       channel: { type: "string" },
+      test: { type: "boolean", default: false },
       keys: { type: "string" },
       publisher: { type: "string" },
       mirror: { type: "string" },
@@ -434,91 +437,53 @@ async function main(): Promise<void> {
     (keep !== undefined && (values["dry-run"] || values.mirror !== undefined))
   ) {
     throw new Error(
-      `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> --keys <secret store folder> ` +
+      `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> [--test] --keys <secret store folder> ` +
         "[--publisher <file>] [--mirror <folder> --mirror-url <its served address>] [--dry-run | --no-publish <folder>]",
     );
   }
 
   const { configs, version: configured, repository } = readAppConfigs();
   const commit = headCommit();
-  const server = readUpdateServer(values.publisher ?? join(values.keys, PUBLISHER_FILE));
-  const remote = configs[0]?.app.product ?? "";
-  const onServer = {
-    stable: await newestOnServer(server, remote, "stable"),
-    nightly: await newestOnServer(server, remote, "nightly"),
-  };
-  const github = repositoryIsPublic(repository);
-  const published = github ? publishedRead(repository) : null;
-  const assetsNow = github && channel === "nightly" ? nightlyAssets(repository) : null;
-  const toGitHub = github && (channel === "stable" || published !== null);
   const mirror =
     values.mirror === undefined ? null : openMirror(values.mirror, values["mirror-url"] ?? "", channel);
-  const version = channelVersion(channel, configured, onServer, mirror === null ? [] : versionFolders(mirror.channelDir));
+  const mirrored = mirror === null ? [] : versionFolders(mirror.channelDir);
+  const target: Target = values.test
+    ? await testTarget(readUpdateServer(values.publisher ?? join(values.keys, PUBLISHER_FILE)), configs, channel, commit)
+    : officialTarget(repository, configs, channel, commit);
+  const version = channelVersion(channel, configured, target.published, mirrored);
   if (mirror !== null && existsSync(join(mirror.channelDir, version))) {
     throw new Error(`${join(mirror.channelDir, version)} already exists; a published version is never written again`);
   }
   keyFiles(values.keys);
+  if (target.refusal !== null && !values["dry-run"] && keep === undefined) {
+    throw new Error(target.refusal);
+  }
 
-  const tag = channelTag(channel, version);
   const files = configs.flatMap((config) =>
     BUILDS.flatMap((build) => build.formats.map((kind) => assetName(kind.fileName(config.product, version)))),
   );
   const staging = values["dry-run"] ? "<staging>" : keep ?? mkdtempSync(join(tmpdir(), "jake-desktop-release-"));
-  const publication: GitHubPublication = {
-    repository,
-    channel,
-    version,
-    commit,
-    assets: files.flatMap((file) => [file, `${file}.sig`]).map((file) => join(staging, file)),
-    ownRead: join(staging, "release.json"),
-    feeds: configs.map((config) => join(staging, config.feed.file)),
-    consoleRead: join(staging, "console", "release.json"),
-    stableVersion: published?.version ?? null,
-    nightlyAssets: assetsNow,
-  };
-  const calls = toGitHub ? githubCalls(publication) : [];
-  const updateApps: UpdateApp[] = configs.map((config) => ({
-    app: config.app,
-    title: config.product,
-    files: BUILDS.flatMap((build) => build.formats.map((kind) => assetName(kind.fileName(config.product, version)))),
-  }));
-  const updateCalls = updateServerCalls(channel, version, commit, updateApps);
-  console.log(`desktop release ${version} on ${channel} → the update server ${server.address.href}, from ${commit}`);
+  const plan = target.plan(version, files, staging);
+  console.log(`desktop ${target.kind} release ${version} on ${channel} → ${target.destination}, from ${commit}`);
   for (const config of configs) {
-    console.log(`  endpoint       ${updateEndpoint(server, config.app)} (${config.app.name})`);
+    console.log(`  endpoint       ${target.endpoint(config)} (${config.app.name})`);
   }
-  console.log(`  download read  ${new URL(`products/${remote}/download`, server.address).href}`);
-  if (!github) {
-    console.log(`  GitHub         ${repository.slug} is private, so nothing is published there`);
-  } else if (!toGitHub) {
-    console.log(`  GitHub         ${repository.slug} holds no stable release, so no nightly is published there`);
-  } else {
-    console.log(`  GitHub         ${repository.slug}, tag ${tag}`);
-  }
-  for (const config of configs) {
-    const feedUrl =
-      channel === "stable"
-        ? latestAssetUrl(repository, config.feed.file)
-        : new URL(config.feed.file, assetBaseUrl(repository, tag));
-    console.log(`  updater feed   ${feedUrl.href} (${config.app.name})`);
-  }
-  console.log(`  console read   ${latestAssetUrl(repository, "release.json").href}`);
-  for (const file of files) {
-    console.log(`  installer      ${new URL(encodeURIComponent(file), assetBaseUrl(repository, tag)).href}`);
+  for (const line of plan.lines) {
+    console.log(`  ${line}`);
   }
   if (mirror !== null) {
     console.log(`  mirror         ${mirror.channelDir}, served at ${channelBaseUrl(mirror.base, channel).href}`);
   }
   const printCalls = (): void => {
-    for (const call of updateCalls) {
-      console.log(`  would call     ${shownCall(call)}`);
-    }
-    for (const call of calls) {
-      console.log(`  would run      ${shown(call)}`);
+    for (const call of plan.calls) {
+      console.log(`  would ${call.verb.padEnd(9)}${call.line}`);
     }
   };
   if (values["dry-run"]) {
     printCalls();
+    if (target.refusal !== null) {
+      console.log(`a release run refuses: ${target.refusal}`);
+    }
     console.log("dry run: nothing built, uploaded or written");
     return;
   }
@@ -526,13 +491,13 @@ async function main(): Promise<void> {
 
   const release: Release = {
     version,
-    override: (config) => [
-      "--config",
-      JSON.stringify({
+    override: (config) => {
+      const over = {
         ...(channel === "nightly" ? { version } : {}),
-        plugins: { updater: { endpoints: [updateEndpoint(server, config.app)] } },
-      }),
-    ],
+        ...target.configOverride(config),
+      };
+      return Object.keys(over).length === 0 ? [] : ["--config", JSON.stringify(over)];
+    },
   };
   const targetDir = cargoTargetDir();
   mkdirSync(staging, { recursive: true });
@@ -543,31 +508,16 @@ async function main(): Promise<void> {
   }));
 
   const date = new Date();
-  const { release: read, feeds } = releaseReads(version, date, assetBaseUrl(repository, tag), built);
-  writeFileSync(publication.ownRead, json(read));
-  for (const { file, feed } of feeds) {
-    writeFileSync(join(staging, file), json(feed));
-  }
-  if (channel === "stable" || published !== null) {
-    mkdirSync(dirname(publication.consoleRead), { recursive: true });
-    writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
-  }
+  const read = plan.write(date, built);
   if (keep !== undefined) {
     printCalls();
-    console.log(`not published: the installers, their signatures and the reads stand in ${keep}`);
+    console.log(`not published: the installers, their signatures and what is published with them stand in ${keep}`);
     return;
   }
   const installers = new Map(everyInstaller(built).map((installer) => [installer.file, installer]));
-  for (const call of updateCalls) {
-    console.log(shownCall(call));
-    await callUpdateServer(server, call, installers);
-  }
-  for (const call of calls) {
-    console.log(shown(call));
-    const result = spawnSync("gh", call, { stdio: "inherit" });
-    if (result.status !== 0) {
-      throw new Error(`gh failed (exit ${result.status ?? "signal"}); the release stands as far as the calls above it went`);
-    }
+  for (const call of plan.calls) {
+    console.log(call.line);
+    await call.run(installers);
   }
   if (mirror !== null) {
     publishMirror(mirror, channel, version, date, built);
@@ -580,21 +530,173 @@ async function main(): Promise<void> {
   }
 }
 
-/** The version a channel's release takes, refused where the updater would not take it over what the update server
- * holds. */
-function channelVersion(
-  channel: Channel,
-  configured: string,
-  onServer: { readonly stable: string | null; readonly nightly: string | null },
-  mirrored: readonly string[],
-): string {
+/** The versions published where a release goes: its stable channel's newest and its nightly channel's. */
+interface Published {
+  readonly stable: string | null;
+  readonly nightly: string | null;
+}
+
+/** One call a release's publication makes, as its line names it and as it is made. */
+interface PublishCall {
+  /** How it is made: a `gh` command run, or a call of the update server. */
+  readonly verb: "run" | "call";
+  /** The call as a line names it. */
+  readonly line: string;
+  run(installers: ReadonlyMap<string, BuiltInstaller>): Promise<void>;
+}
+
+/** What a release does once its version is known: the lines it prints, the calls it makes and what it writes. */
+interface Plan {
+  readonly lines: readonly string[];
+  readonly calls: readonly PublishCall[];
+  /** Writes into the staging folder what is published beside the installers, and returns the read naming them. */
+  write(date: Date, built: readonly AppBuilt[]): ReleaseRead;
+}
+
+/** Where a release goes: GitHub for an official one, the test update server for a test one (docs/desktop.md,
+ * 「Releases」). */
+interface Target {
+  readonly kind: "official" | "test";
+  readonly destination: string;
+  readonly published: Published;
+  /** Why a release run would not publish, or null where it would; a dry run and a build kept unpublished go on. */
+  readonly refusal: string | null;
+  /** The stable endpoint an app of this release is built with. */
+  endpoint(config: AppConfig): string;
+  /** What is laid over an app's configuration besides a nightly's version. */
+  configOverride(config: AppConfig): Record<string, unknown>;
+  plan(version: string, files: readonly string[], staging: string): Plan;
+}
+
+/** An official release: built with the configuration's own GitHub feed and published as a GitHub release. */
+function officialTarget(repository: Repository, configs: readonly AppConfig[], channel: Channel, commit: string): Target {
+  const isPublic = repositoryIsPublic(repository);
+  const published = publishedRead(repository);
+  const assetsNow = channel === "nightly" ? nightlyAssets(repository) : null;
+  return {
+    kind: "official",
+    destination: `GitHub ${repository.slug}`,
+    published: { stable: published?.version ?? null, nightly: published?.nightly?.version ?? null },
+    refusal: isPublic
+      ? null
+      : `${repository.slug} is private, and GitHub answers a private repository's releases to its members alone; ` +
+        "official releases are published once it is public, at the set's 1.0.0, and a test release (--test) goes to the test update server meanwhile",
+    endpoint: (config) => latestAssetUrl(repository, config.feed.file).href,
+    configOverride: () => ({}),
+    plan: (version, files, staging) => {
+      const tag = channelTag(channel, version);
+      const publication: GitHubPublication = {
+        repository,
+        channel,
+        version,
+        commit,
+        assets: files.flatMap((file) => [file, `${file}.sig`]).map((file) => join(staging, file)),
+        ownRead: join(staging, "release.json"),
+        feeds: configs.map((config) => join(staging, config.feed.file)),
+        consoleRead: join(staging, "console", "release.json"),
+        stableVersion: published?.version ?? null,
+        nightlyAssets: assetsNow,
+      };
+      const lines = [
+        isPublic ? `GitHub         ${repository.slug}, tag ${tag}` : `GitHub         ${repository.slug} is private, tag ${tag}`,
+        ...configs.map((config) => {
+          const feedUrl =
+            channel === "stable" ? latestAssetUrl(repository, config.feed.file) : new URL(config.feed.file, assetBaseUrl(repository, tag));
+          return `updater feed   ${feedUrl.href} (${config.app.name})`;
+        }),
+        `release read   ${latestAssetUrl(repository, "release.json").href}`,
+        ...files.map((file) => `installer      ${new URL(encodeURIComponent(file), assetBaseUrl(repository, tag)).href}`),
+      ];
+      return {
+        lines,
+        calls: githubCalls(publication).map((call) => ({ verb: "run", line: shown(call), run: async () => runGh(call) })),
+        write: (date, built) => {
+          const { release: read, feeds } = releaseReads(version, date, assetBaseUrl(repository, tag), built);
+          writeFileSync(publication.ownRead, json(read));
+          for (const { file, feed } of feeds) {
+            writeFileSync(join(staging, file), json(feed));
+          }
+          mkdirSync(dirname(publication.consoleRead), { recursive: true });
+          writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
+          return read;
+        },
+      };
+    },
+  };
+}
+
+/** A test release: built to ask the test update server, and published there alone. */
+async function testTarget(server: UpdateServer, configs: readonly AppConfig[], channel: Channel, commit: string): Promise<Target> {
+  const remote = configs[0]?.app.product ?? "";
+  const published = {
+    stable: await newestOnServer(server, remote, "stable"),
+    nightly: await newestOnServer(server, remote, "nightly"),
+  };
+  return {
+    kind: "test",
+    destination: `the update server ${server.address.href}`,
+    published,
+    refusal: null,
+    endpoint: (config) => updateEndpoint(server, config.app),
+    configOverride: (config) => ({ plugins: { updater: { endpoints: [updateEndpoint(server, config.app)] } } }),
+    plan: (version) => {
+      const updateApps: UpdateApp[] = configs.map((config) => ({
+        app: config.app,
+        title: config.product,
+        files: BUILDS.flatMap((build) => build.formats.map((kind) => assetName(kind.fileName(config.product, version)))),
+      }));
+      return {
+        lines: [`download read  ${new URL(`products/${remote}/download`, server.address).href}`],
+        calls: updateServerCalls(channel, version, commit, updateApps).map((call) => ({
+          verb: "call",
+          line: shownCall(call),
+          run: (installers) => callUpdateServer(server, call, installers),
+        })),
+        write: (date, built) => releaseReadOnServer(server, version, date, built),
+      };
+    },
+  };
+}
+
+/** Runs one `gh` call of a publication, stopping the release where it fails. */
+function runGh(call: GhCall): void {
+  const result = spawnSync("gh", call, { stdio: "inherit" });
+  if (result.status !== 0) {
+    throw new Error(`gh failed (exit ${result.status ?? "signal"}); the release stands as far as the calls above it went`);
+  }
+}
+
+/** The read of a test release, its installers named at the update server's addresses of their bytes. */
+function releaseReadOnServer(server: UpdateServer, version: string, date: Date, built: readonly AppBuilt[]): ReleaseRead {
+  const read: ReleaseRead = { version, date: date.toISOString(), files: [] };
+  for (const { app, installers } of built) {
+    const base = new URL(`products/${encodeURIComponent(app.product)}/releases/${encodeURIComponent(version)}/files/`, server.address);
+    app.place(
+      read,
+      installers.map(({ kind, file, size, sha256 }) => ({
+        platform: kind.platform,
+        arch: kind.arch,
+        format: kind.format,
+        file,
+        size,
+        sha256,
+        url: new URL(`${encodeURIComponent(file)}/content`, base).href,
+      })),
+    );
+  }
+  return read;
+}
+
+/** The version a channel's release takes, refused where the updater would not take it over what is published where
+ * the release goes. */
+function channelVersion(channel: Channel, configured: string, published: Published, mirrored: readonly string[]): string {
   if (channel === "stable") {
-    assertNewerVersion(configured, onServer.stable);
+    assertNewerVersion(configured, published.stable);
     return configured;
   }
-  const taken = [...(onServer.nightly === null ? [] : [onServer.nightly]), ...mirrored];
+  const taken = [...(published.nightly === null ? [] : [published.nightly]), ...mirrored];
   const version = nightlyVersion(configured, dayOf(new Date(), PLATFORM_TIME_ZONE), taken);
-  assertNightlyVersion(version, onServer.stable, onServer.nightly);
+  assertNightlyVersion(version, published.stable, published.nightly);
   return version;
 }
 

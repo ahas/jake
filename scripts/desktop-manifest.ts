@@ -399,7 +399,7 @@ export function githubCalls(publication: GitHubPublication): GhCall[] {
   return [...calls, ["release", "upload", stableTag(publication.stableVersion), ...repo, "--clobber", consoleRead]];
 }
 
-/** The update server a release publishes to, as the publisher's file names it (docs/desktop.md, 「Making a release」). */
+/** The update server a test release publishes to, as the publisher's file names it (docs/desktop.md, 「Making a release」). */
 export interface UpdateServer {
   /** The public address every app is built to ask, with its closing slash. */
   readonly address: URL;
@@ -444,7 +444,7 @@ export const PRODUCT_CHANNELS = [
   { name: "nightly", includes: ["stable"] },
 ] as const;
 
-/** The stable endpoint an app is built to ask on the update server; the app works out the nightly one from it. */
+/** The stable endpoint a test app is built to ask on the update server; the app works out the nightly one from it. */
 export function updateEndpoint(server: UpdateServer, app: DesktopApp): string {
   return `${server.address.href}updates/${app.product}/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}`;
 }
