@@ -641,6 +641,13 @@ section.
   it, and the site at build time. GitHub answers the address with a redirect to the file, and sends no CORS header,
   so it is read by a server or a build, never by a page in a browser. While the repository is private it answers
   404, which reads as no release published.
+- **Before the first stable release, a reader that wants the newest preview reads the release list.** GitHub's
+  latest-release address never names a pre-release, so it answers 404 until a stable version is published. A
+  server-side reader then asks GitHub's REST API for the repository's releases,
+  `https://api.github.com/repos/ahas/jake/releases`, newest first, takes the newest one that is no draft, is marked
+  pre-release and carries a `release.json` asset, and reads that asset: the pre-release's own `release.json`, whose
+  top level is that version's object (below). The console reads it this way, says the build it offers is a preview,
+  and keeps the answer a few minutes, since GitHub limits how often an unsigned-in reader may ask.
 - **The test update server answers the same contract** at `<update server>/products/bmo-desktop/download`
   (bmo-update's `docs/api.md`, 「Download read」), worked out from what is live there, for a reader that wants the
   test builds.
@@ -662,7 +669,8 @@ section.
   the file's bytes in the update server's, so a link to it downloads the installer and a stable version's link
   never changes once published.
 - **No release yet reads as not found:** until the first stable release is published the address answers
-  404, and the console and the site show that the app is not yet available. The read stands on the latest stable
+  404; the console then offers the newest preview where one stands (above), and the site and a console that finds
+  none show that the app is not yet available. The read stands on the latest stable
   release, so its top level is always there once the read is.
 - **A field may be added and none is removed or renamed,** so a console built against this contract
   reads every later release.
