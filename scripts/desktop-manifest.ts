@@ -93,6 +93,10 @@ export interface ReleaseRead {
 export interface DesktopApp {
   /** How the release's lines name it. */
   readonly name: string;
+  /** Its product on the update server (bmo-update's docs/design.md). */
+  readonly product: string;
+  /** The key the remote controller's download read names it under as a companion, or null for none. */
+  readonly companionKey: string | null;
   /** The Tauri configuration laid over the crate's own, a file of the `desktop` folder, or null for none. */
   readonly overlay: string | null;
   /** The crate's features it is built with. */
@@ -103,6 +107,8 @@ export interface DesktopApp {
 
 export const REMOTE_CONTROLLER: DesktopApp = {
   name: "remote controller",
+  product: "bmo-desktop",
+  companionKey: null,
   overlay: null,
   features: [],
   place: (read, files) => {
@@ -112,6 +118,8 @@ export const REMOTE_CONTROLLER: DesktopApp = {
 
 export const ALL_IN_ONE: DesktopApp = {
   name: "all-in-one",
+  product: "bmo-all-in-one",
+  companionKey: "allInOne",
   overlay: "tauri.all-in-one.conf.json",
   features: ["all-in-one"],
   place: (read, files) => {
@@ -256,12 +264,12 @@ export function nightlyVersion(release: string, day: string, taken: Iterable<str
 }
 
 /** Refuses a nightly before the first release, and one the updater would not take over either published channel. */
-export function assertNightlyVersion(version: string, published: ConsoleRead | null): void {
-  if (published === null) {
+export function assertNightlyVersion(version: string, stable: string | null, nightly: string | null): void {
+  if (stable === null) {
     throw new Error("no stable release is published yet; a nightly follows a release");
   }
-  assertNewerVersion(version, published.nightly?.version ?? null);
-  assertNewerVersion(version, published.version);
+  assertNewerVersion(version, nightly);
+  assertNewerVersion(version, stable);
 }
 
 /** The console's read with one channel's release put in, the other channel's kept as it stood. */
@@ -389,4 +397,111 @@ export function githubCalls(publication: GitHubPublication): GhCall[] {
           ["release", "edit", NIGHTLY_TAG, ...repo, "--prerelease", ...title, ...notes],
         ];
   return [...calls, ["release", "upload", stableTag(publication.stableVersion), ...repo, "--clobber", consoleRead]];
+}
+
+/** The update server a release publishes to, as the publisher's file names it (docs/desktop.md, 「Making a release」). */
+export interface UpdateServer {
+  /** The public address every app is built to ask, with its closing slash. */
+  readonly address: URL;
+  /** The address the release reads and publishes at, with its closing slash. */
+  readonly publishAddress: URL;
+  /** The publishing token. */
+  readonly token: string;
+}
+
+const withSlash = (address: string): URL => new URL(address.endsWith("/") ? address : `${address}/`);
+
+/**
+ * The update server the publisher's file names: `BMO_UPDATE_ADDRESS`, `BMO_UPDATE_PUBLISH_ADDRESS` and
+ * `BMO_UPDATE_TOKEN`, each line read by its key before its first `=` and its value verbatim after it. A missing
+ * line, or a public address that is not HTTPS, is refused, naming the key and never a value.
+ */
+export function updateServerOf(text: string, file: string): UpdateServer {
+  const values = new Map<string, string>();
+  for (const line of text.split(/\r?\n/)) {
+    const at = line.indexOf("=");
+    if (at > 0) {
+      values.set(line.slice(0, at).trim(), line.slice(at + 1));
+    }
+  }
+  const value = (key: string): string => {
+    const found = values.get(key);
+    if (found === undefined || found === "") {
+      throw new Error(`the publisher's file ${file} holds no ${key}`);
+    }
+    return found;
+  };
+  const address = withSlash(value("BMO_UPDATE_ADDRESS"));
+  if (address.protocol !== "https:") {
+    throw new Error(`the publisher's file ${file} names a BMO_UPDATE_ADDRESS that is not HTTPS, which a release build's updater refuses`);
+  }
+  return { address, publishAddress: withSlash(value("BMO_UPDATE_PUBLISH_ADDRESS")), token: value("BMO_UPDATE_TOKEN") };
+}
+
+/** The channels every app's product declares: stable, and nightly offering stable's releases as well. */
+export const PRODUCT_CHANNELS = [
+  { name: "stable", includes: [] },
+  { name: "nightly", includes: ["stable"] },
+] as const;
+
+/** The stable endpoint an app is built to ask on the update server; the app works out the nightly one from it. */
+export function updateEndpoint(server: UpdateServer, app: DesktopApp): string {
+  return `${server.address.href}updates/${app.product}/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}`;
+}
+
+/** One call of the update server's publication: a JSON body, an installer's bytes, or none. */
+export interface UpdateCall {
+  readonly method: "PUT" | "PATCH";
+  /** The path under the publishing address. */
+  readonly path: string;
+  readonly json?: unknown;
+  /** The installer whose declaration or bytes the call carries, by its published name. */
+  readonly installer?: { readonly file: string; readonly part: "declaration" | "content" };
+}
+
+/** One app of a release as the update server is told of it: its title and its installers' published names, in order. */
+export interface UpdateApp {
+  readonly app: DesktopApp;
+  readonly title: string;
+  readonly files: readonly string[];
+}
+
+const segment = (text: string): string => encodeURIComponent(text);
+
+/**
+ * The calls that publish a release to the update server: both products declared, the remote controller naming every
+ * other app its companion; each app's release made a draft with its installers declared and uploaded, in the order
+ * they are built; then each put live, the companions before the remote controller, so its download read names them.
+ */
+export function updateServerCalls(channel: Channel, version: string, commit: string, apps: readonly UpdateApp[]): UpdateCall[] {
+  const companions = Object.fromEntries(
+    apps.flatMap(({ app }) => (app.companionKey === null ? [] : [[app.companionKey, app.product]])),
+  );
+  const releasePath = (app: DesktopApp): string => `products/${segment(app.product)}/releases/${segment(version)}`;
+  const declarations: UpdateCall[] = apps.map(({ app, title }) => ({
+    method: "PUT",
+    path: `products/${segment(app.product)}`,
+    json: { title, channels: PRODUCT_CHANNELS, companions: app.companionKey === null ? companions : {} },
+  }));
+  const drafts: UpdateCall[] = apps.flatMap(({ app, files }) => [
+    {
+      method: "PUT",
+      path: releasePath(app),
+      json: { channel, notes: `BMO desktop app ${version}, built from ${commit}.`, commit },
+    } satisfies UpdateCall,
+    ...files.flatMap((file): UpdateCall[] => [
+      { method: "PUT", path: `${releasePath(app)}/files/${segment(file)}`, installer: { file, part: "declaration" } },
+      { method: "PUT", path: `${releasePath(app)}/files/${segment(file)}/content`, installer: { file, part: "content" } },
+    ]),
+  ]);
+  const live: UpdateCall[] = [...apps]
+    .sort((a, b) => Number(a.app.companionKey === null) - Number(b.app.companionKey === null))
+    .map(({ app }) => ({ method: "PATCH", path: releasePath(app), json: { state: "live" } }));
+  return [...declarations, ...drafts, ...live];
+}
+
+/** A call of the update server as a line names it. */
+export function shownCall(call: UpdateCall): string {
+  const part = call.installer === undefined ? "" : call.installer.part === "content" ? " <installer bytes>" : " <installer declaration>";
+  return `${call.method} ${call.path}${call.json === undefined ? part : ` ${JSON.stringify(call.json)}`}`;
 }

@@ -1,5 +1,4 @@
-// Builds the desktop apps' signed installers, the remote controller's and the all-in-one's, and publishes them as one
-// release (docs/desktop.md, 「Releases」).
+// Builds the desktop apps' signed installers and publishes them to the update server, and to GitHub while public.
 
 import { spawnSync } from "node:child_process";
 import {
@@ -37,6 +36,9 @@ import {
   NSIS,
   PLATFORM_TIME_ZONE,
   type Repository,
+  type UpdateApp,
+  type UpdateCall,
+  type UpdateServer,
   assertNewerVersion,
   assertNightlyVersion,
   assetBaseUrl,
@@ -52,7 +54,11 @@ import {
   nightlyVersion,
   releaseReads,
   repositoryOf,
+  shownCall,
   stableTag,
+  updateEndpoint,
+  updateServerCalls,
+  updateServerOf,
   versionBaseUrl,
   withChannelRelease,
 } from "./desktop-manifest";
@@ -62,6 +68,8 @@ const desktopDir = join(dirname(fileURLToPath(import.meta.url)), "..", "desktop"
 /** The update key's two files in the deployment's secret store (docs/desktop.md, 「Making a release」). */
 const KEY_FILE = "jake-desktop-updater.key";
 const PASSWORD_FILE = "jake-desktop-updater.password";
+/** The update server's publisher's file in the deployment's secret store, which bmo-update's install writes. */
+const PUBLISHER_FILE = "update-publisher.env";
 
 /** One `cargo tauri build` of the release: the target it builds for and the formats it bundles. */
 interface Build {
@@ -160,6 +168,64 @@ function nightlyAssets(repository: Repository): string[] | null {
   return (JSON.parse(nightly.stdout) as { assets: { name: string }[] }).assets.map((asset) => asset.name);
 }
 
+/** Whether the repository is public: GitHub's releases of a private one answer no one outside it. */
+function repositoryIsPublic(repository: Repository): boolean {
+  const view = gh(["repo", "view", repository.slug, "--json", "visibility"]);
+  if (view.status !== 0) {
+    throw new Error(`gh could not read ${repository.slug}'s visibility: ${view.stderr.trim()}`);
+  }
+  return (JSON.parse(view.stdout) as { visibility: string }).visibility === "PUBLIC";
+}
+
+/** The update server the publisher's file names, read without printing a value. */
+function readUpdateServer(file: string): UpdateServer {
+  if (!existsSync(file)) {
+    throw new Error(`the update server's publisher's file ${file} is missing; bmo-update's install writes it`);
+  }
+  return updateServerOf(readFileSync(file, "utf8"), file);
+}
+
+/** The newest live or withdrawn version of a product on a channel of the update server, or null where none stands. */
+async function newestOnServer(server: UpdateServer, product: string, channel: Channel): Promise<string | null> {
+  const address = new URL(`products/${encodeURIComponent(product)}/releases?channel=${channel}&limit=1`, server.publishAddress);
+  const answer = await fetch(address);
+  if (answer.status === 404) {
+    return null;
+  }
+  if (!answer.ok) {
+    throw new Error(`the update server answered ${answer.status} to ${address.href}: ${await answer.text()}`);
+  }
+  const page = (await answer.json()) as { items: { version: string }[] };
+  return page.items[0]?.version ?? null;
+}
+
+/** Makes one call of the update server's publication, an installer's declaration or bytes read from what was built. */
+async function callUpdateServer(server: UpdateServer, call: UpdateCall, installers: ReadonlyMap<string, BuiltInstaller>): Promise<void> {
+  const headers: Record<string, string> = { authorization: `Bearer ${server.token}` };
+  let body: BodyInit | undefined;
+  if (call.installer !== undefined) {
+    const installer = installers.get(call.installer.file);
+    if (installer === undefined) {
+      throw new Error(`no installer ${call.installer.file} was built`);
+    }
+    if (call.installer.part === "content") {
+      headers["content-type"] = "application/octet-stream";
+      body = Bun.file(installer.path);
+    } else {
+      headers["content-type"] = "application/json";
+      const { platform, arch, format } = installer.kind;
+      body = JSON.stringify({ platform, arch, format, size: installer.size, sha256: installer.sha256, signature: installer.signature });
+    }
+  } else if (call.json !== undefined) {
+    headers["content-type"] = "application/json";
+    body = JSON.stringify(call.json);
+  }
+  const answer = await fetch(new URL(call.path, server.publishAddress), { method: call.method, headers, body });
+  if (!answer.ok) {
+    throw new Error(`the update server answered ${answer.status} to ${call.method} ${call.path}: ${await answer.text()}`);
+  }
+}
+
 /** The commit the checkout stands on, which a new release's tag points at. */
 function headCommit(): string {
   const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: desktopDir, encoding: "utf8" });
@@ -239,8 +305,9 @@ type BuiltInstaller = Installer & { readonly path: string };
 /** What one release builds: the version and the configuration the CLI merges over each app's. */
 interface Release {
   readonly version: string;
-  /** The CLI's configuration arguments: a nightly's version, handed to its build alone and never written. */
-  readonly override: readonly string[];
+  /** The CLI's configuration arguments for an app: its update server's endpoint and a nightly's version, handed to
+   * its build alone and never written. */
+  override(config: AppConfig): readonly string[];
 }
 
 /**
@@ -262,7 +329,7 @@ function runBuild(
   const bundles = build.formats.map((kind) => kind.format).join(",");
   const overlay = config.app.overlay === null ? [] : ["--config", config.app.overlay];
   const features = config.app.features.length === 0 ? [] : ["--features", config.app.features.join(",")];
-  const args = ["tauri", "build", "--ci", ...overlay, ...release.override, ...features, ...cross, "--bundles", bundles];
+  const args = ["tauri", "build", "--ci", ...overlay, ...release.override(config), ...features, ...cross, "--bundles", bundles];
   const result = spawnSync("cargo", args, {
     cwd: desktopDir,
     stdio: "inherit",
@@ -345,11 +412,12 @@ function publishMirror(mirror: Mirror, channel: Channel, version: string, date: 
   console.log(`mirrored ${version} on ${channel} into ${mirror.channelDir}, served at ${channelBase.href}`);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       channel: { type: "string" },
       keys: { type: "string" },
+      publisher: { type: "string" },
       mirror: { type: "string" },
       "mirror-url": { type: "string" },
       "dry-run": { type: "boolean", default: false },
@@ -367,17 +435,25 @@ function main(): void {
   ) {
     throw new Error(
       `usage: bun scripts/desktop-release.ts --channel <${CHANNELS.join("|")}> --keys <secret store folder> ` +
-        "[--mirror <folder> --mirror-url <its served address>] [--dry-run | --no-publish <folder>]",
+        "[--publisher <file>] [--mirror <folder> --mirror-url <its served address>] [--dry-run | --no-publish <folder>]",
     );
   }
 
   const { configs, version: configured, repository } = readAppConfigs();
   const commit = headCommit();
-  const published = publishedRead(repository);
-  const assetsNow = channel === "nightly" ? nightlyAssets(repository) : null;
+  const server = readUpdateServer(values.publisher ?? join(values.keys, PUBLISHER_FILE));
+  const remote = configs[0]?.app.product ?? "";
+  const onServer = {
+    stable: await newestOnServer(server, remote, "stable"),
+    nightly: await newestOnServer(server, remote, "nightly"),
+  };
+  const github = repositoryIsPublic(repository);
+  const published = github ? publishedRead(repository) : null;
+  const assetsNow = github && channel === "nightly" ? nightlyAssets(repository) : null;
+  const toGitHub = github && (channel === "stable" || published !== null);
   const mirror =
     values.mirror === undefined ? null : openMirror(values.mirror, values["mirror-url"] ?? "", channel);
-  const version = channelVersion(channel, configured, published, mirror === null ? [] : versionFolders(mirror.channelDir));
+  const version = channelVersion(channel, configured, onServer, mirror === null ? [] : versionFolders(mirror.channelDir));
   if (mirror !== null && existsSync(join(mirror.channelDir, version))) {
     throw new Error(`${join(mirror.channelDir, version)} already exists; a published version is never written again`);
   }
@@ -400,8 +476,25 @@ function main(): void {
     stableVersion: published?.version ?? null,
     nightlyAssets: assetsNow,
   };
-  const calls = githubCalls(publication);
-  console.log(`desktop release ${version} on ${channel} → ${repository.slug}, tag ${tag}, from ${commit}`);
+  const calls = toGitHub ? githubCalls(publication) : [];
+  const updateApps: UpdateApp[] = configs.map((config) => ({
+    app: config.app,
+    title: config.product,
+    files: BUILDS.flatMap((build) => build.formats.map((kind) => assetName(kind.fileName(config.product, version)))),
+  }));
+  const updateCalls = updateServerCalls(channel, version, commit, updateApps);
+  console.log(`desktop release ${version} on ${channel} → the update server ${server.address.href}, from ${commit}`);
+  for (const config of configs) {
+    console.log(`  endpoint       ${updateEndpoint(server, config.app)} (${config.app.name})`);
+  }
+  console.log(`  download read  ${new URL(`products/${remote}/download`, server.address).href}`);
+  if (!github) {
+    console.log(`  GitHub         ${repository.slug} is private, so nothing is published there`);
+  } else if (!toGitHub) {
+    console.log(`  GitHub         ${repository.slug} holds no stable release, so no nightly is published there`);
+  } else {
+    console.log(`  GitHub         ${repository.slug}, tag ${tag}`);
+  }
   for (const config of configs) {
     const feedUrl =
       channel === "stable"
@@ -416,10 +509,16 @@ function main(): void {
   if (mirror !== null) {
     console.log(`  mirror         ${mirror.channelDir}, served at ${channelBaseUrl(mirror.base, channel).href}`);
   }
-  if (values["dry-run"]) {
+  const printCalls = (): void => {
+    for (const call of updateCalls) {
+      console.log(`  would call     ${shownCall(call)}`);
+    }
     for (const call of calls) {
       console.log(`  would run      ${shown(call)}`);
     }
+  };
+  if (values["dry-run"]) {
+    printCalls();
     console.log("dry run: nothing built, uploaded or written");
     return;
   }
@@ -427,7 +526,13 @@ function main(): void {
 
   const release: Release = {
     version,
-    override: channel === "nightly" ? ["--config", JSON.stringify({ version })] : [],
+    override: (config) => [
+      "--config",
+      JSON.stringify({
+        ...(channel === "nightly" ? { version } : {}),
+        plugins: { updater: { endpoints: [updateEndpoint(server, config.app)] } },
+      }),
+    ],
   };
   const targetDir = cargoTargetDir();
   mkdirSync(staging, { recursive: true });
@@ -443,14 +548,19 @@ function main(): void {
   for (const { file, feed } of feeds) {
     writeFileSync(join(staging, file), json(feed));
   }
-  mkdirSync(dirname(publication.consoleRead), { recursive: true });
-  writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
+  if (channel === "stable" || published !== null) {
+    mkdirSync(dirname(publication.consoleRead), { recursive: true });
+    writeFileSync(publication.consoleRead, json(withChannelRelease(published, channel, read)));
+  }
   if (keep !== undefined) {
-    for (const call of calls) {
-      console.log(`  would run      ${shown(call)}`);
-    }
+    printCalls();
     console.log(`not published: the installers, their signatures and the reads stand in ${keep}`);
     return;
+  }
+  const installers = new Map(everyInstaller(built).map((installer) => [installer.file, installer]));
+  for (const call of updateCalls) {
+    console.log(shownCall(call));
+    await callUpdateServer(server, call, installers);
   }
   for (const call of calls) {
     console.log(shown(call));
@@ -470,20 +580,26 @@ function main(): void {
   }
 }
 
-/** The version a channel's release takes, refused where the updater would not take it over what is published. */
-function channelVersion(channel: Channel, configured: string, published: ConsoleRead | null, mirrored: readonly string[]): string {
+/** The version a channel's release takes, refused where the updater would not take it over what the update server
+ * holds. */
+function channelVersion(
+  channel: Channel,
+  configured: string,
+  onServer: { readonly stable: string | null; readonly nightly: string | null },
+  mirrored: readonly string[],
+): string {
   if (channel === "stable") {
-    assertNewerVersion(configured, published?.version ?? null);
+    assertNewerVersion(configured, onServer.stable);
     return configured;
   }
-  const taken = [...(published?.nightly === undefined ? [] : [published.nightly.version]), ...mirrored];
+  const taken = [...(onServer.nightly === null ? [] : [onServer.nightly]), ...mirrored];
   const version = nightlyVersion(configured, dayOf(new Date(), PLATFORM_TIME_ZONE), taken);
-  assertNightlyVersion(version, published);
+  assertNightlyVersion(version, onServer.stable, onServer.nightly);
   return version;
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);

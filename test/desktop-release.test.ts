@@ -11,7 +11,6 @@ import {
   DEB,
   NSIS,
   REMOTE_CONTROLLER,
-  type ConsoleRead,
   type Installer,
   type ReleaseRead,
   type GitHubPublication,
@@ -30,6 +29,10 @@ import {
   nightlyVersion,
   releaseReads,
   repositoryOf,
+  shownCall,
+  updateEndpoint,
+  updateServerCalls,
+  updateServerOf,
   versionBaseUrl,
   withChannelRelease,
 } from "../scripts/desktop-manifest";
@@ -338,19 +341,68 @@ describe("nightlyVersion", () => {
 });
 
 describe("assertNightlyVersion", () => {
-  const stable: ConsoleRead = { version: "1.0.0", date: "2026-11-23T00:00:00.000Z", files: [] };
-  const nightly: ReleaseRead = { version: "1.1.0-nightly.20261124", date: "2026-11-24T00:00:00.000Z", files: [] };
+  const stable = "1.0.0";
+  const nightly = "1.1.0-nightly.20261124";
 
   test("takes a nightly above both channels", () => {
-    expect(() => assertNightlyVersion("1.1.0-nightly.20261125", { ...stable, nightly })).not.toThrow();
-    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", stable)).not.toThrow();
+    expect(() => assertNightlyVersion("1.1.0-nightly.20261125", stable, nightly)).not.toThrow();
+    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", stable, null)).not.toThrow();
   });
 
   test("refuses one before the first release, not above the nightly, or behind the stable", () => {
-    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", null)).toThrow("follows a release");
-    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", { ...stable, nightly })).toThrow("not higher");
-    expect(() => assertNightlyVersion("1.1.0-nightly.20261123", { ...stable, nightly })).toThrow("not higher");
-    expect(() => assertNightlyVersion("1.0.0-nightly.20261126", stable)).toThrow("not higher");
+    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", null, null)).toThrow("follows a release");
+    expect(() => assertNightlyVersion("1.1.0-nightly.20261124", stable, nightly)).toThrow("not higher");
+    expect(() => assertNightlyVersion("1.1.0-nightly.20261123", stable, nightly)).toThrow("not higher");
+    expect(() => assertNightlyVersion("1.0.0-nightly.20261126", stable, null)).toThrow("not higher");
+  });
+});
+
+describe("the update server", () => {
+  const publisher = (address: string): string =>
+    `BMO_UPDATE_ADDRESS=${address}\nBMO_UPDATE_PUBLISH_ADDRESS=http://127.0.0.1:9/\nBMO_UPDATE_TOKEN=a=b\n`;
+
+  test("is named by the publisher's file, each value read verbatim after its key", () => {
+    const server = updateServerOf(publisher("https://updates.example/bmo-update"), "file");
+
+    expect(server.address.href).toBe("https://updates.example/bmo-update/");
+    expect(server.publishAddress.href).toBe("http://127.0.0.1:9/");
+    expect(server.token).toBe("a=b");
+  });
+
+  test("refuses a file missing a line, and a public address that is not HTTPS", () => {
+    expect(() => updateServerOf("BMO_UPDATE_ADDRESS=https://updates.example/\n", "file")).toThrow("BMO_UPDATE_PUBLISH_ADDRESS");
+    expect(() => updateServerOf(publisher("http://updates.example/"), "file")).toThrow("not HTTPS");
+  });
+
+  test("every app is built to ask its own product's stable endpoint", () => {
+    const server = updateServerOf(publisher("https://updates.example/u/"), "file");
+
+    expect(updateEndpoint(server, REMOTE_CONTROLLER)).toBe(
+      "https://updates.example/u/updates/bmo-desktop/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}",
+    );
+    expect(updateEndpoint(server, ALL_IN_ONE)).toContain("/updates/bmo-all-in-one/stable/");
+  });
+
+  test("a release declares both products, drafts each with its installers, then puts the companion live first", () => {
+    const calls = updateServerCalls("nightly", "1.1.0-nightly.20261124", "abc", [
+      { app: REMOTE_CONTROLLER, title: "BMO", files: ["BMO.exe", "BMO.AppImage"] },
+      { app: ALL_IN_ONE, title: "BMO All-in-One", files: ["BMO-All-in-One.exe"] },
+    ]).map(shownCall);
+
+    expect(calls).toEqual([
+      'PUT products/bmo-desktop {"title":"BMO","channels":[{"name":"stable","includes":[]},{"name":"nightly","includes":["stable"]}],"companions":{"allInOne":"bmo-all-in-one"}}',
+      'PUT products/bmo-all-in-one {"title":"BMO All-in-One","channels":[{"name":"stable","includes":[]},{"name":"nightly","includes":["stable"]}],"companions":{}}',
+      'PUT products/bmo-desktop/releases/1.1.0-nightly.20261124 {"channel":"nightly","notes":"BMO desktop app 1.1.0-nightly.20261124, built from abc.","commit":"abc"}',
+      "PUT products/bmo-desktop/releases/1.1.0-nightly.20261124/files/BMO.exe <installer declaration>",
+      "PUT products/bmo-desktop/releases/1.1.0-nightly.20261124/files/BMO.exe/content <installer bytes>",
+      "PUT products/bmo-desktop/releases/1.1.0-nightly.20261124/files/BMO.AppImage <installer declaration>",
+      "PUT products/bmo-desktop/releases/1.1.0-nightly.20261124/files/BMO.AppImage/content <installer bytes>",
+      'PUT products/bmo-all-in-one/releases/1.1.0-nightly.20261124 {"channel":"nightly","notes":"BMO desktop app 1.1.0-nightly.20261124, built from abc.","commit":"abc"}',
+      "PUT products/bmo-all-in-one/releases/1.1.0-nightly.20261124/files/BMO-All-in-One.exe <installer declaration>",
+      "PUT products/bmo-all-in-one/releases/1.1.0-nightly.20261124/files/BMO-All-in-One.exe/content <installer bytes>",
+      'PATCH products/bmo-all-in-one/releases/1.1.0-nightly.20261124 {"state":"live"}',
+      'PATCH products/bmo-desktop/releases/1.1.0-nightly.20261124 {"state":"live"}',
+    ]);
   });
 });
 
@@ -392,22 +444,45 @@ describe("nightliesPastKept", () => {
   });
 });
 
-describe("the release's GitHub dry run", () => {
-  // A stand-in `gh` on the PATH: it answers the reads of the published releases from FAKE_GH_PUBLISHED (a stable
-  // version, or nothing) and FAKE_GH_NIGHTLY (whether the nightly pre-release stands), logs every call it is given,
-  // and refuses anything else, so a dry run that would write is seen.
+describe("the release's dry run", () => {
+  // A stand-in `gh` on the PATH: it answers the repository's visibility from FAKE_GH_VISIBILITY and the reads of the
+  // published releases from FAKE_GH_PUBLISHED (a stable version, or nothing) and FAKE_GH_NIGHTLY (whether the nightly
+  // pre-release stands), logs every call it is given, and refuses anything else, so a dry run that would write is
+  // seen. A stand-in update server answers each channel's newest version from `onServer` and logs every request.
   const root = mkdtempSync(join(tmpdir(), "jake-desktop-release-dry-"));
   const bin = join(root, "bin");
   const keys = join(root, "keys");
   const log = join(root, "gh.log");
+  const onServer: Record<string, string | null> = { stable: null, nightly: null };
+  const asked: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(request) {
+      const url = new URL(request.url);
+      asked.push(`${request.method} ${url.pathname}${url.search}`);
+      const channel = url.searchParams.get("channel") ?? "";
+      if (request.method !== "GET" || url.pathname !== "/products/bmo-desktop/releases") {
+        return new Response("unexpected", { status: 500 });
+      }
+      const version = onServer[channel] ?? null;
+      return Response.json({ items: version === null ? [] : [{ version }], more: false });
+    },
+  });
   spawnSync("mkdir", ["-p", bin, keys]);
   writeFileSync(join(keys, "jake-desktop-updater.key"), "not a key");
   writeFileSync(join(keys, "jake-desktop-updater.password"), "not a password");
+  writeFileSync(
+    join(keys, "update-publisher.env"),
+    `BMO_UPDATE_ADDRESS=https://updates.example/bmo-update/\nBMO_UPDATE_PUBLISH_ADDRESS=http://127.0.0.1:${server.port}/\nBMO_UPDATE_TOKEN=not a token\n`,
+  );
   writeFileSync(
     join(bin, "gh"),
     `#!/bin/sh
 echo "$*" >> "${log}"
 case "$*" in
+  "repo view ahas/jake --json visibility")
+    echo "{\\"visibility\\":\\"\${FAKE_GH_VISIBILITY:-PRIVATE}\\"}" ;;
   "release view --repo ahas/jake --json tagName")
     [ -z "$FAKE_GH_PUBLISHED" ] && { echo "release not found" >&2; exit 1; }
     echo "{\\"tagName\\":\\"desktop-v$FAKE_GH_PUBLISHED\\"}" ;;
@@ -422,76 +497,128 @@ esac
   );
   chmodSync(join(bin, "gh"), 0o755);
 
-  function dryRun(channel: string, published: string, nightly: boolean): { status: number | null; out: string; calls: string[] } {
-    rmSync(log, { force: true });
-    const result = spawnSync("bun", ["scripts/desktop-release.ts", "--channel", channel, "--keys", keys, "--dry-run"], {
-      cwd: join(import.meta.dir, ".."),
-      encoding: "utf8",
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_GH_PUBLISHED: published, FAKE_GH_NIGHTLY: nightly ? "1" : "" },
-    });
-    const calls = spawnSync("cat", [log], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
-    return { status: result.status, out: `${result.stdout}${result.stderr}`, calls };
+  interface Run {
+    status: number | null;
+    out: string;
+    calls: string[];
   }
 
-  const onlyReads = (calls: string[]): boolean => calls.every((call) => call.startsWith("release view") || call.startsWith("release download"));
+  async function release(channel: string, github: { visibility: string; published: string; nightly: boolean }, extra: string[] = ["--dry-run"]): Promise<Run> {
+    rmSync(log, { force: true });
+    asked.length = 0;
+    const run = Bun.spawn(["bun", "scripts/desktop-release.ts", "--channel", channel, "--keys", keys, ...extra], {
+      cwd: join(import.meta.dir, ".."),
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        FAKE_GH_VISIBILITY: github.visibility,
+        FAKE_GH_PUBLISHED: github.published,
+        FAKE_GH_NIGHTLY: github.nightly ? "1" : "",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, status] = await Promise.all([new Response(run.stdout).text(), new Response(run.stderr).text(), run.exited]);
+    const calls = spawnSync("cat", [log], { encoding: "utf8" }).stdout.split("\n").filter(Boolean);
+    return { status, out: `${stdout}${stderr}`, calls };
+  }
 
-  test("a first stable release prints its tag, its addresses and the calls it would make, and reads alone", () => {
-    const { status, out, calls } = dryRun("stable", "", false);
+  const PRIVATE = { visibility: "PRIVATE", published: "", nightly: false };
+  const onlyReads = (calls: string[]): boolean =>
+    calls.every((call) => call.startsWith("repo view") || call.startsWith("release view") || call.startsWith("release download"));
+  const onlyServerReads = (): boolean => asked.every((request) => request.startsWith("GET "));
+
+  test("a first stable release of a private repository names the update server alone, and reads alone", async () => {
+    onServer.stable = null;
+    onServer.nightly = null;
+    const { status, out, calls } = await release("stable", PRIVATE);
 
     expect(status).toBe(0);
-    expect(out).toContain("desktop release 0.2.1 on stable → ahas/jake, tag desktop-v0.2.1");
+    expect(out).toContain("desktop release 0.2.1 on stable → the update server https://updates.example/bmo-update/");
+    expect(out).toContain(
+      "endpoint       https://updates.example/bmo-update/updates/bmo-desktop/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}} (remote controller)",
+    );
+    expect(out).toContain("/updates/bmo-all-in-one/stable/");
+    expect(out).toContain("download read  https://updates.example/bmo-update/products/bmo-desktop/download");
+    expect(out).toContain("GitHub         ahas/jake is private, so nothing is published there");
+    expect(out).toContain("would call     PUT products/bmo-desktop/releases/0.2.1/files/BMO_0.2.1_x64-setup.exe/content <installer bytes>");
+    expect(out).toContain('would call     PATCH products/bmo-desktop/releases/0.2.1 {"state":"live"}');
+    expect(out).not.toContain("would run      gh");
+    expect(out).toContain("dry run: nothing built, uploaded or written");
+    expect(out).not.toContain("not a token");
+    expect(calls).toEqual(["repo view ahas/jake --json visibility"]);
+    expect(asked).toContain("GET /products/bmo-desktop/releases?channel=stable&limit=1");
+    expect(onlyServerReads()).toBe(true);
+  });
+
+  test("a public repository is published on GitHub as well", async () => {
+    onServer.stable = null;
+    const { status, out, calls } = await release("stable", { visibility: "PUBLIC", published: "", nightly: false });
+
+    expect(status).toBe(0);
+    expect(out).toContain("GitHub         ahas/jake, tag desktop-v0.2.1");
     expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/latest/download/latest.json (remote controller)");
-    expect(out).toContain(
-      "updater feed   https://github.com/ahas/jake/releases/latest/download/all-in-one-latest.json (all-in-one)",
-    );
-    expect(out).toContain("console read   https://github.com/ahas/jake/releases/latest/download/release.json");
     expect(out).toContain("installer      https://github.com/ahas/jake/releases/download/desktop-v0.2.1/BMO_0.2.1_x64-setup.exe");
-    expect(out).toContain(
-      "installer      https://github.com/ahas/jake/releases/download/desktop-v0.2.1/BMO-All-in-One_0.2.1_amd64.AppImage",
-    );
     expect(out).toContain("'<staging>/latest.json' '<staging>/all-in-one-latest.json' '<staging>/console/release.json'");
     expect(out).toContain("would run      gh release create desktop-v0.2.1 --repo ahas/jake --target ");
     expect(out).toContain("would run      gh release edit desktop-v0.2.1 --repo ahas/jake --draft=false --latest");
-    expect(out).toContain("dry run: nothing built, uploaded or written");
     expect(onlyReads(calls)).toBe(true);
   });
 
-  test("a stable version not above the published one is refused", () => {
-    const { status, out } = dryRun("stable", "0.2.1", false);
+  test("a stable version not above the update server's is refused", async () => {
+    onServer.stable = "0.2.1";
+    const { status, out } = await release("stable", PRIVATE);
 
     expect(status).toBe(1);
     expect(out).toContain("not higher than the published 0.2.1");
   });
 
-  test("a nightly reads the nightly pre-release and would replace its assets and the stable's console read", () => {
-    const { status, out, calls } = dryRun("nightly", "0.2.1", true);
+  test("a nightly counts above the update server's nightly and replaces GitHub's pre-release where public", async () => {
+    onServer.stable = "0.2.1";
+    onServer.nightly = null;
+    const { status, out, calls } = await release("nightly", { visibility: "PUBLIC", published: "0.2.1", nightly: true });
 
     expect(status).toBe(0);
-    expect(out).toMatch(/desktop release 0\.3\.0-nightly\.\d{8} on nightly → ahas\/jake, tag desktop-nightly/);
+    expect(out).toMatch(/desktop release 0\.3\.0-nightly\.\d{8} on nightly → the update server/);
     expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/download/desktop-nightly/latest.json");
-    expect(out).toContain("updater feed   https://github.com/ahas/jake/releases/download/desktop-nightly/all-in-one-latest.json");
     expect(out).toContain("would run      gh release delete-asset desktop-nightly BMO_0.3.0-nightly.20261101_amd64.deb --repo ahas/jake --yes");
     expect(out).toContain("would run      gh release upload desktop-v0.2.1 --repo ahas/jake --clobber");
+    expect(out).toMatch(/would call {5}PUT products\/bmo-desktop\/releases\/0\.3\.0-nightly\.\d{8} \{"channel":"nightly"/);
     expect(calls).toContain("release view desktop-nightly --repo ahas/jake --json assets");
     expect(onlyReads(calls)).toBe(true);
+    expect(asked).toContain("GET /products/bmo-desktop/releases?channel=nightly&limit=1");
   });
 
-  test("--no-publish takes neither --dry-run nor a mirror", () => {
+  test("a public repository with no stable release on GitHub takes no nightly there", async () => {
+    onServer.stable = "0.2.1";
+    const { status, out } = await release("nightly", { visibility: "PUBLIC", published: "", nightly: false });
+
+    expect(status).toBe(0);
+    expect(out).toContain("holds no stable release, so no nightly is published there");
+    expect(out).not.toContain("would run      gh");
+  });
+
+  test("--no-publish takes neither --dry-run nor a mirror", async () => {
     for (const extra of [["--dry-run"], ["--mirror", root, "--mirror-url", "https://mirror.example/"]]) {
-      const result = spawnSync(
-        "bun",
-        ["scripts/desktop-release.ts", "--channel", "stable", "--keys", keys, "--no-publish", join(root, "out"), ...extra],
-        { cwd: join(import.meta.dir, ".."), encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } },
-      );
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("usage:");
+      const { status, out } = await release("stable", PRIVATE, ["--no-publish", join(root, "out"), ...extra]);
+      expect(status).toBe(1);
+      expect(out).toContain("usage:");
     }
   });
 
-  test("a nightly before the first stable release is refused", () => {
-    const { status, out } = dryRun("nightly", "", false);
+  test("a nightly before the first stable release is refused", async () => {
+    onServer.stable = null;
+    onServer.nightly = null;
+    const { status, out } = await release("nightly", PRIVATE);
 
     expect(status).toBe(1);
     expect(out).toContain("follows a release");
+  });
+
+  test("a release with no publisher's file stops before anything", async () => {
+    const { status, out } = await release("stable", PRIVATE, ["--dry-run", "--publisher", join(root, "missing.env")]);
+
+    expect(status).toBe(1);
+    expect(out).toContain("publisher's file");
   });
 });

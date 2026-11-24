@@ -155,17 +155,21 @@ flowchart TD
 
 ## Updates
 
-- **The app updates itself through Tauri's updater,** as the remote controller does (docs/desktop.md,
-  「Distribution and updates」), from feeds of its own beside the remote controller's on the public repository's
-  GitHub releases: `all-in-one-latest.json` on the latest release for `stable`, and the same file of the nightly
-  pre-release for `nightly`. Each release carries both apps' installers, built from one commit by the same
-  `bun run release:desktop` (docs/desktop.md, 「Making a release」), and the read `release.json` names the
-  all-in-one's under `allInOne`.
+- **The app updates itself quietly through Tauri's updater,** as the remote controller does (docs/desktop.md,
+  「Distribution and updates」 and 「Updating quietly」), as the update server's product `bmo-all-in-one` beside the
+  remote controller's, and, for a build that names no update server, from feeds of its own beside the remote
+  controller's on the repository's GitHub releases: `all-in-one-latest.json` on the latest release for `stable`, and
+  the same file of the nightly pre-release for `nightly`. Each release carries both apps' installers, built from one
+  commit by the same `bun run release:desktop` (docs/desktop.md, 「Making a release」), and the download read names
+  the all-in-one's under `allInOne`.
+- **Its quiet moment is a quit, or no window shown while it installs nothing;** the set is stopped before the
+  installer starts, and the app started again on the new version starts the set again.
 - **The set's repositories update through the testbed's deployment,** as every install's do: each repository's
   later commits on GitHub go live by `bmo-testbed deploy` in its checkout. The app does not deploy; the set's own
   supervisor agent puts newer commits live, as on a server.
-- **No address in the app names any deployment.** The index, the repositories and the releases are the public
-  repositories on GitHub; the console is this machine's own.
+- **No address in the repository names any deployment.** The index and the repositories are the public
+  repositories on GitHub, the update server's address is laid over the app's configuration by the release that
+  builds it, and the console is this machine's own.
 
 ## Windows through WSL 2
 

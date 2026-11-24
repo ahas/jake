@@ -46,6 +46,7 @@ pub struct Agent {
   pub log: Log,
   when_superseded: WhenSuperseded,
   link: watch::Sender<Link>,
+  carrying: watch::Sender<usize>,
 }
 
 /// Where the agent's link to the hub stands, as a caller watching it reads it.
@@ -106,6 +107,7 @@ impl Agent {
       log,
       when_superseded: WhenSuperseded::Redial,
       link: watch::Sender::new(Link::Connecting),
+      carrying: watch::Sender::new(0),
     }
   }
 
@@ -120,6 +122,12 @@ impl Agent {
   /// A watch on the agent's link, current from the moment it is taken.
   pub fn link(&self) -> watch::Receiver<Link> {
     self.link.subscribe()
+  }
+
+  /// A watch on how much work the agent carries for the hub: the commands still running, the transfers under way
+  /// and the streams open. It reads 0 while no connection stands.
+  pub fn carrying(&self) -> watch::Receiver<usize> {
+    self.carrying.subscribe()
   }
 
   fn capabilities(&self) -> Vec<String> {
@@ -360,6 +368,7 @@ impl<'a> Session<'a> {
         Some(accepted) = self.accepted.recv() => self.streams.adopt(accepted).await,
         _ = &mut self.writer => break "a send failed: the socket is gone".to_owned(),
       }
+      self.report_carrying();
     };
     self.end().await;
     log.info("connection-ended", json!({ "reason": reason, "welcomed": self.welcomed }));
@@ -374,6 +383,13 @@ impl<'a> Session<'a> {
     }
   }
 
+  /// Tell the agent's watchers how much work the connection carries now.
+  fn report_carrying(&self) {
+    let runs = self.runs.values().filter(|run| !run.finished()).count();
+    let carrying = runs + self.transfers.in_flight() + self.streams.in_flight();
+    self.agent.carrying.send_if_modified(|now| std::mem::replace(now, carrying) != carrying);
+  }
+
   // Nothing in flight outlives the socket it streamed over: every run's tree is ended, every
   // transfer dropped and every stream's connection closed, and output a run produces afterwards
   // goes nowhere.
@@ -383,6 +399,7 @@ impl<'a> Session<'a> {
     }
     self.transfers.abandon().await;
     self.streams.abandon();
+    self.agent.carrying.send_replace(0);
     if let Some(close) = self.close.take() {
       let _ = close.send(());
     }

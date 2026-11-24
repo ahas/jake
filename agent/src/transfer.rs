@@ -66,6 +66,11 @@ fn temp_beside(path: &Path, id: &str) -> PathBuf {
 }
 
 impl Transfers {
+  /// How many transfers are under way: every upload not yet ended and every download still sending.
+  pub fn in_flight(&self) -> usize {
+    self.uploads.len() + self.downloads.values().filter(|task| !task.is_finished()).count()
+  }
+
   pub fn new(out: mpsc::Sender<Frame>, max_payload_bytes: usize, log: Log) -> Self {
     Self {
       out,

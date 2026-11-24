@@ -10,6 +10,7 @@ mod channel;
 mod navigation;
 mod settings;
 mod sign_in;
+mod updates;
 
 #[cfg(feature = "all-in-one")]
 mod all_in_one;

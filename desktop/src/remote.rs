@@ -2,15 +2,13 @@
 // agent (docs/desktop.md).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use jake_agent::Log;
 use serde_json::{Value, json};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
 use tauri::{App, AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
-use tauri_plugin_updater::UpdaterExt as _;
 use tokio::sync::{mpsc, watch};
 use url::Url;
 
@@ -22,13 +20,12 @@ use crate::pairing::Console;
 use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch, Switches};
 use crate::sign_in::{Alignment, Registration};
 use crate::status::{AgentState, Status, View};
+use crate::updates::{Moment, Updates};
 use crate::vault::Vault;
-use crate::{awake, bridge, controller, navigation, pause, server, session, sign_in, vault};
+use crate::{awake, bridge, controller, navigation, pause, server, session, sign_in, updates, vault};
 
 const MAIN_WINDOW: &str = "main";
 const TRAY: &str = "tray";
-/// How often a running app asks its channel's update feed.
-const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What the commands, the tray and the quit share.
 struct Shared {
@@ -49,6 +46,10 @@ struct Shared {
   autostart: CheckMenuItem<Wry>,
   /// The person's sign-in registration, or why it cannot be made.
   registration: Result<Registration, String>,
+  /// How much work the built-in agent carries for the hub.
+  carrying: watch::Sender<usize>,
+  /// The app's quiet updates, where its build checks for any.
+  updates: Option<Arc<Updates>>,
 }
 
 /// The main window, as the controller asks things of it.
@@ -255,16 +256,48 @@ fn open_in_browser(url: &Url, log: &Log) {
 
 /// Stop the built-in agent and wait for its course to end, then hand over to `then`.
 fn stop_then(app: &AppHandle, then: impl FnOnce(&AppHandle) + Send + 'static) {
-  let shared = app.state::<Shared>();
-  shared.quit.send_replace(true);
-  let course = shared.course.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
   let app = app.clone();
   tauri::async_runtime::spawn(async move {
-    if let Some(course) = course {
-      let _ = course.await;
-    }
+    stop_agent(&app).await;
     then(&app);
   });
+}
+
+/// Stop the built-in agent and wait for its course to end.
+async fn stop_agent(app: &AppHandle) {
+  let course = {
+    let shared = app.state::<Shared>();
+    shared.quit.send_replace(true);
+    shared.course.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+  };
+  if let Some(course) = course {
+    let _ = course.await;
+  }
+}
+
+/// Quit: the built-in agent stopped, an update kept for its moment installed, then the app ended.
+fn quit(app: &AppHandle) {
+  let app = app.clone();
+  tauri::async_runtime::spawn(async move {
+    stop_agent(&app).await;
+    let updates = app.state::<Shared>().updates.clone();
+    if let Some(updates) = updates {
+      updates.install(&app, Moment::Quit, || async {}).await;
+    }
+    app.exit(0);
+  });
+}
+
+/// Whether the app is quiet enough to be replaced: no window shown, no pairing open and nothing the agent carries.
+fn idle(app: &AppHandle) -> bool {
+  let Some(shared) = app.try_state::<Shared>() else {
+    return false;
+  };
+  let hidden = app
+    .get_webview_window(MAIN_WINDOW)
+    .is_none_or(|window| !window.is_visible().unwrap_or(true));
+  let pairing = matches!(shared.status.borrow().agent, AgentState::Pairing { .. });
+  hidden && !pairing && *shared.carrying.borrow() == 0
 }
 
 /// Act on an item of the tray's menu.
@@ -292,7 +325,7 @@ fn on_menu(app: &AppHandle, id: &str) {
         let _ = shared.autostart.set_checked(!wanted);
       }
     }
-    "quit" => stop_then(app, |app| app.exit(0)),
+    "quit" => quit(app),
     _ => {}
   }
 }
@@ -357,31 +390,32 @@ fn main_window(app: &App, console: Option<&Url>, log: &Log, visible: bool) -> ta
       if to_tray {
         let _ = closing.hide();
       } else {
-        stop_then(app, |app| app.exit(0));
+        quit(app);
       }
     }
   });
   Ok(())
 }
 
-/// The tray icon and its menu; the starting-at-sign-in item is handed back to be kept in step.
-fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
+/// The tray icon and its menu, opening with the quiet line of the version the app updated itself to where it did;
+/// the starting-at-sign-in item is handed back to be kept in step.
+fn tray(app: &App, starting: bool, updated: Option<&str>) -> tauri::Result<CheckMenuItem<Wry>> {
+  let updated = updated
+    .map(|version| MenuItem::with_id(app, "updated", updates::updated_line(version), false, None::<&str>))
+    .transpose()?;
   let open = MenuItem::with_id(app, "open", "콘솔 열기", true, None::<&str>)?;
   let server = MenuItem::with_id(app, "server", "서버 변경", true, None::<&str>)?;
   let autostart =
     CheckMenuItem::with_id(app, "autostart", "로그인할 때 시작", true, starting, None::<&str>)?;
   let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
-  let menu = Menu::with_items(
-    app,
-    &[
-      &open,
-      &server,
-      &PredefinedMenuItem::separator(app)?,
-      &autostart,
-      &PredefinedMenuItem::separator(app)?,
-      &quit,
-    ],
-  )?;
+  let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
+  let after_update = PredefinedMenuItem::separator(app)?;
+  let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
+  if let Some(updated) = &updated {
+    items.extend([updated as &dyn IsMenuItem<Wry>, &after_update]);
+  }
+  items.extend([&open as &dyn IsMenuItem<Wry>, &server, &first, &autostart, &second, &quit]);
+  let menu = Menu::with_items(app, &items)?;
   let icon = app
     .default_window_icon()
     .cloned()
@@ -406,45 +440,6 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
   Ok(autostart)
 }
 
-/// Ask the channel's update feed now, every few hours and whenever the channel changes; an update whose
-/// signature verifies is installed and the app starts again on it. An update is taken only above the
-/// running version, so a channel changed to stable waits for a release above the nightly it runs.
-async fn keep_updated(app: AppHandle, log: Log, feeds: Feeds, mut channel: watch::Receiver<Channel>) {
-  loop {
-    let following = *channel.borrow_and_update();
-    let found = match app
-      .updater_builder()
-      .endpoints(vec![feeds.of(following).clone()])
-      .and_then(|builder| builder.build())
-    {
-      Ok(updater) => updater.check().await.map_err(|error| error.to_string()),
-      Err(error) => Err(error.to_string()),
-    };
-    match found {
-      Ok(Some(update)) => {
-        log.info("update-found", json!({ "version": update.version, "channel": following }));
-        match update.download_and_install(|_, _| {}, || {}).await {
-          Ok(()) => {
-            stop_then(&app, |app| app.restart());
-            return;
-          }
-          Err(error) => log.warn("update-not-installed", json!({ "error": error.to_string() })),
-        }
-      }
-      Ok(None) => {}
-      Err(error) => log.warn("update-check-failed", json!({ "channel": following, "error": error })),
-    }
-    tokio::select! {
-      () = tokio::time::sleep(UPDATE_EVERY) => {}
-      changed = channel.changed() => {
-        if changed.is_err() {
-          return;
-        }
-      }
-    }
-  }
-}
-
 fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Box<dyn std::error::Error>> {
   let log = Log::open(app.path().app_local_data_dir()?.join("agent.log"));
   let mut file = SettingsFile::open(&app.path().app_config_dir()?);
@@ -462,19 +457,28 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
   }
   let (retries, retried) = mpsc::channel(1);
   let (quit, quitting) = watch::channel(false);
+  let kept = app.path().app_local_data_dir()?.join("update");
+  let updates = updates.map(|feeds| (Updates::new(kept, log.clone()), feeds));
+  let started = updates
+    .as_ref()
+    .map(|(updates, _)| updates.started(&app.package_info().version.to_string()))
+    .unwrap_or_default();
 
-  // With no server named the window always opens, since only the person can name one.
-  let visible = console.is_none() || sign_in::opens_window(std::env::args(), &switches);
+  // With no server named the window always opens, since only the person can name one; started again by a quiet
+  // update, the app opens none, as its window was hidden when it was replaced.
+  let visible =
+    console.is_none() || (!started.hidden && sign_in::opens_window(std::env::args(), &switches));
   main_window(app, base.as_ref(), &log, visible)?;
   // The console's pages get the bridge alone, scoped to the address the app opens, and no page any
   // while it names none (docs/desktop.md, 「The window and what the console may call」).
   if let Some(capability) = bridge::for_server(base.as_ref(), MAIN_WINDOW) {
     app.add_capability(capability)?;
   }
-  let autostart = tray(app, switches.on(Switch::StartAtSignIn))?;
+  let autostart = tray(app, switches.on(Switch::StartAtSignIn), started.updated.as_deref())?;
 
   let switches = watch::Sender::new(switches);
   let channel = watch::Sender::new(settings.channel);
+  let carrying = watch::Sender::new(0);
   let locked = watch::Sender::new(false);
   session::report(locked.clone(), log.clone());
   let paused = watch::Sender::new(false);
@@ -524,22 +528,36 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
         quit: quitting,
         paused: pausing,
         retries: retried,
+        carrying: carrying.clone(),
       }
       .run(),
     )
   });
-  match updates {
-    Some(Ok(feeds)) => {
-      tauri::async_runtime::spawn(keep_updated(
-        app.handle().clone(),
-        log.clone(),
+  let updates = match updates {
+    Some((updates, Ok(feeds))) => {
+      let handle = app.handle().clone();
+      tauri::async_runtime::spawn(updates::keep_updated(
+        handle.clone(),
+        updates.clone(),
         feeds,
         channel.subscribe(),
       ));
+      tauri::async_runtime::spawn(updates::install_when_idle(
+        handle,
+        updates.clone(),
+        idle,
+        |app| async move {
+          stop_agent(&app).await;
+        },
+      ));
+      Some(updates)
     }
-    Some(Err(reason)) => log.warn("update-feed-unreadable", json!({ "reason": reason })),
-    None => {}
-  }
+    Some((_, Err(reason))) => {
+      log.warn("update-feed-unreadable", json!({ "reason": reason }));
+      None
+    }
+    None => None,
+  };
   app.manage(Shared {
     console,
     log,
@@ -553,6 +571,8 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     _locked: locked,
     autostart,
     registration,
+    carrying,
+    updates,
   });
   Ok(())
 }

@@ -17,8 +17,9 @@ pub enum Channel {
   Nightly,
 }
 
-/// Each channel's updater feed: the configuration's own endpoint for stable, the feed of the repository's
-/// latest release, and the same file of the nightly pre-release for nightly.
+/// Each channel's updater feed: the configuration's own endpoint for stable, and for nightly the same address
+/// with its channel `nightly` where the endpoint is an update server's, or the same file of the nightly
+/// pre-release where it is a repository's latest release feed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feeds {
   stable: Url,
@@ -26,13 +27,43 @@ pub struct Feeds {
 }
 
 impl Feeds {
+  /// The feeds beside the stable one: an update server's, or a repository's latest release's.
+  pub fn beside(stable: Url) -> Result<Self, String> {
+    Self::of_update_server(&stable).map_or_else(|| Self::of_repository(stable), Ok)
+  }
+
+  /// The feeds of an update server whose stable endpoint `stable` is, as
+  /// `<address>/updates/<product>/stable/{{target}}/{{arch}}/{{current_version}}`, a query after it kept: the
+  /// nightly feed names the channel `nightly` instead.
+  fn of_update_server(stable: &Url) -> Option<Self> {
+    let segments: Vec<&str> = stable.path_segments()?.collect();
+    let at = segments.len().checked_sub(6)?;
+    let [updates, product, "stable", target, arch, version] = segments[at..] else {
+      return None;
+    };
+    let templates = ["%7B%7Btarget%7D%7D", "%7B%7Barch%7D%7D", "%7B%7Bcurrent_version%7D%7D"];
+    if updates != "updates" || product.is_empty() || [target, arch, version] != templates {
+      return None;
+    }
+    let mut nightly_segments = segments.clone();
+    nightly_segments[at + 2] = "nightly";
+    let mut nightly = stable.clone();
+    nightly.set_path(&nightly_segments.join("/"));
+    Some(Self {
+      stable: stable.clone(),
+      nightly,
+    })
+  }
+
   /// The feeds of the repository whose latest release's asset `stable` names, as
   /// `https://github.com/<owner>/<repository>/releases/latest/download/<file>`; the nightly feed is that
   /// file of the nightly pre-release.
-  pub fn beside(stable: Url) -> Result<Self, String> {
+  fn of_repository(stable: Url) -> Result<Self, String> {
     let segments: Vec<&str> = stable.path_segments().map(Iterator::collect).unwrap_or_default();
     let [owner, repository, "releases", "latest", "download", file] = segments[..] else {
-      return Err(format!("the stable feed {stable} is not a latest release's asset"));
+      return Err(format!(
+        "the stable feed {stable} is neither an update server's nor a latest release's asset"
+      ));
     };
     if file.is_empty() {
       return Err(format!("the stable feed {stable} names no file"));
@@ -85,8 +116,22 @@ mod tests {
   }
 
   #[test]
+  fn an_update_servers_nightly_feed_names_the_nightly_channel() {
+    let stable = "https://updates.example/bmo-update/updates/bmo-desktop/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}";
+    let feeds = Feeds::beside(Url::parse(stable).unwrap()).unwrap();
+
+    assert_eq!(
+      feeds.of(Channel::Nightly).as_str(),
+      "https://updates.example/bmo-update/updates/bmo-desktop/nightly/%7B%7Btarget%7D%7D/%7B%7Barch%7D%7D/%7B%7Bcurrent_version%7D%7D?bundleType={{bundle_type}}"
+    );
+    assert_eq!(feeds.of(Channel::Stable), &Url::parse(stable).unwrap());
+  }
+
+  #[test]
   fn a_stable_feed_that_is_no_latest_releases_asset_names_no_feeds() {
     for endpoint in [
+      "https://updates.example/updates/bmo-desktop/nightly/{{target}}/{{arch}}/{{current_version}}",
+      "https://updates.example/updates/bmo-desktop/stable/{{target}}/{{arch}}",
       "https://ai.example/bmo/desktop/latest.json",
       "https://github.com/owner/app/releases/download/desktop-v1.0.0/latest.json",
       "https://github.com/owner/app/releases/latest/download/",

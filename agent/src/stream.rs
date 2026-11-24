@@ -103,6 +103,13 @@ pub struct Streams {
 }
 
 impl Streams {
+  /// How many streams are open or still writing what the hub sent them; a listened port waiting for a connection
+  /// carries nothing.
+  pub fn in_flight(&self) -> usize {
+    self.open.values().filter(|stream| !stream.is_finished()).count()
+      + self.closing.iter().filter(|task| !task.0.is_finished()).count()
+  }
+
   pub fn new(
     out: mpsc::Sender<Frame>,
     allowed: Vec<u16>,

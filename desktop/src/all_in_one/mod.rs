@@ -14,23 +14,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use jake_agent::Log;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::CapabilityBuilder;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::NewWindowResponse;
 use tauri::{
   App, AppHandle, Manager as _, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
-use tauri_plugin_updater::UpdaterExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use url::Url;
 
-use crate::channel::Feeds;
+use crate::channel::{Channel, Feeds};
 use crate::navigation::{self, Navigation};
 use crate::settings::{Change, Key, SettingsFile, SettingsView, Switch};
 use crate::sign_in::{self, Alignment, Registration};
+use crate::updates::{self, Moment, Updates};
 
 use self::flow::{Chat, Event, Flow, Manager, Screen, Work};
 use self::host::{As, Host, run};
@@ -40,8 +41,6 @@ const MAIN_WINDOW: &str = "main";
 const TRAY: &str = "tray";
 /// How often the tray reads the set's health once it runs.
 const HEALTH_EVERY: Duration = Duration::from_secs(30);
-/// How often a running app asks its channel's update feed.
-const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// How many of the work's last lines the page shows.
 const SHOWN_LINES: usize = 40;
 
@@ -63,6 +62,10 @@ struct Shared {
   settings: Mutex<SettingsFile>,
   registration: Result<Registration, String>,
   autostart: CheckMenuItem<Wry>,
+  /// The update channel, which the updates follow.
+  channel: watch::Sender<Channel>,
+  /// The app's quiet updates, where its build checks for any.
+  updates: Option<Arc<Updates>>,
 }
 
 impl Shared {
@@ -175,7 +178,10 @@ fn change_setting(
       }
       file.set(switch, on)?;
     }
-    Change::Channel(channel) => file.set_channel(channel)?,
+    Change::Channel(channel) => {
+      file.set_channel(channel)?;
+      shared.channel.send_replace(channel);
+    }
     Change::Console(_) => return Err("이 앱의 서버는 이 컴퓨터에서 실행되는 BMO입니다.".to_owned()),
   }
   drop(file);
@@ -570,6 +576,9 @@ fn quit(app: &AppHandle) {
     }
     let shared = app.state::<Arc<Shared>>().inner().clone();
     stop_set(&shared).await;
+    if let Some(updates) = &shared.updates {
+      updates.install(&app, Moment::Quit, || async {}).await;
+    }
     app.exit(0);
   });
 }
@@ -660,21 +669,23 @@ fn main_window(app: &App, visible: bool) -> tauri::Result<()> {
   Ok(())
 }
 
-fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
+/// The tray icon and its menu, opening with the quiet line of the version the app updated itself to where it did.
+fn tray(app: &App, starting: bool, updated: Option<&str>) -> tauri::Result<CheckMenuItem<Wry>> {
+  let updated = updated
+    .map(|version| MenuItem::with_id(app, "updated", updates::updated_line(version), false, None::<&str>))
+    .transpose()?;
   let open = MenuItem::with_id(app, "open", "콘솔 열기", true, None::<&str>)?;
   let autostart =
     CheckMenuItem::with_id(app, "autostart", "로그인할 때 시작", true, starting, None::<&str>)?;
   let quit = MenuItem::with_id(app, "quit", "종료 (BMO 멈춤)", true, None::<&str>)?;
-  let menu = Menu::with_items(
-    app,
-    &[
-      &open,
-      &PredefinedMenuItem::separator(app)?,
-      &autostart,
-      &PredefinedMenuItem::separator(app)?,
-      &quit,
-    ],
-  )?;
+  let (first, second) = (PredefinedMenuItem::separator(app)?, PredefinedMenuItem::separator(app)?);
+  let after_update = PredefinedMenuItem::separator(app)?;
+  let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::new();
+  if let Some(updated) = &updated {
+    items.extend([updated as &dyn IsMenuItem<Wry>, &after_update]);
+  }
+  items.extend([&open as &dyn IsMenuItem<Wry>, &first, &autostart, &second, &quit]);
+  let menu = Menu::with_items(app, &items)?;
   let icon = app
     .default_window_icon()
     .cloned()
@@ -699,34 +710,15 @@ fn tray(app: &App, starting: bool) -> tauri::Result<CheckMenuItem<Wry>> {
   Ok(autostart)
 }
 
-/// The channel's feed asked now and every few hours; an update whose signature verifies is installed once the
-/// set has stopped, and the app starts again on it, which starts the set again.
-async fn keep_updated(app: AppHandle, feeds: Feeds) {
-  loop {
-    let channel = app
-      .state::<Arc<Shared>>()
-      .settings
-      .lock()
-      .unwrap_or_else(std::sync::PoisonError::into_inner)
-      .settings()
-      .channel;
-    let found = match app
-      .updater_builder()
-      .endpoints(vec![feeds.of(channel).clone()])
-      .and_then(|builder| builder.build())
-    {
-      Ok(updater) => updater.check().await.ok().flatten(),
-      Err(_) => None,
-    };
-    if let Some(update) = found {
-      let shared = app.state::<Arc<Shared>>().inner().clone();
-      stop_set(&shared).await;
-      if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
-        app.restart();
-      }
-    }
-    tokio::time::sleep(UPDATE_EVERY).await;
-  }
+/// Whether the app is quiet enough to be replaced: no window shown and nothing it is installing.
+fn idle(app: &AppHandle) -> bool {
+  let Some(shared) = app.try_state::<Arc<Shared>>() else {
+    return false;
+  };
+  let hidden = app
+    .get_webview_window(MAIN_WINDOW)
+    .is_none_or(|window| !window.is_visible().unwrap_or(true));
+  hidden && !*shared.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn host_here() -> Host {
@@ -761,9 +753,22 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     }
   }
   let switches = file.settings().switches;
+  let channel = watch::Sender::new(file.settings().channel);
   let kept = record::read(&record::path(&config));
-  let visible = kept.console.is_none() || sign_in::opens_window(std::env::args(), &switches);
-  let autostart = tray(app, switches.on(Switch::StartAtSignIn))?;
+  let local = app.path().app_local_data_dir()?;
+  let updates =
+    updates.map(|feeds| (Updates::new(local.join("update"), Log::open(local.join("app.log"))), feeds));
+  let started = updates
+    .as_ref()
+    .map(|(updates, _)| updates.started(&app.package_info().version.to_string()))
+    .unwrap_or_default();
+  let visible =
+    kept.console.is_none() || (!started.hidden && sign_in::opens_window(std::env::args(), &switches));
+  let autostart = tray(app, switches.on(Switch::StartAtSignIn), started.updated.as_deref())?;
+  let feeds = match updates {
+    Some((updates, Ok(feeds))) => Some((updates, feeds)),
+    _ => None,
+  };
   let (events, received) = mpsc::unbounded_channel();
   let shared = Arc::new(Shared {
     flow: Mutex::new(Flow::default()),
@@ -778,16 +783,24 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     settings: Mutex::new(file),
     registration,
     autostart,
+    channel,
+    updates: feeds.as_ref().map(|(updates, _)| updates.clone()),
   });
   app.manage(shared.clone());
   main_window(app, visible)?;
+  let following = shared.channel.subscribe();
   tauri::async_runtime::spawn(course(app.handle().clone(), shared, received));
   let _ = events.send(Event::Began {
     console: kept.console,
     manager: kept.manager,
   });
-  if let Some(Ok(feeds)) = updates {
-    tauri::async_runtime::spawn(keep_updated(app.handle().clone(), feeds));
+  if let Some((updates, feeds)) = feeds {
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(updates::keep_updated(handle.clone(), updates.clone(), feeds, following));
+    tauri::async_runtime::spawn(updates::install_when_idle(handle, updates, idle, |app| async move {
+      let shared = app.state::<Arc<Shared>>().inner().clone();
+      stop_set(&shared).await;
+    }));
   }
   Ok(())
 }

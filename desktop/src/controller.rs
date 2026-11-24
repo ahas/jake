@@ -33,6 +33,8 @@ pub struct Controller<W: Window> {
   pub paused: watch::Receiver<bool>,
   /// The page's asks to try again: pair again, or look again.
   pub retries: mpsc::Receiver<()>,
+  /// How much work the built-in agent carries for the hub, 0 while none runs.
+  pub carrying: watch::Sender<usize>,
 }
 
 /// How long a quit waits for the built-in agent to close its connection.
@@ -176,6 +178,7 @@ impl<W: Window> Controller<W> {
   /// true.
   async fn serve(&self, machine: &Machine, mut stop: watch::Receiver<bool>) -> Ended {
     let (status, log, halt) = (self.status.clone(), self.log.clone(), stop.clone());
+    let carrying = self.carrying.clone();
     let start = || {
       status.send_modify(|status| status.agent = AgentState::Link(Link::Connecting));
       let config =
@@ -183,6 +186,15 @@ impl<W: Window> Controller<W> {
       let agent =
         Agent::new(config, AGENT_VERSION.to_owned(), log.clone()).when_superseded(WhenSuperseded::GiveUp);
       let mut link = agent.link();
+      let mut carried = agent.carrying();
+      let carrying = carrying.clone();
+      // The count goes back to 0 once the agent's watch closes, whichever way its task ended.
+      tokio::spawn(async move {
+        while carried.changed().await.is_ok() {
+          carrying.send_replace(*carried.borrow_and_update());
+        }
+        carrying.send_replace(0);
+      });
       let status = status.clone();
       // The watch's sender goes with the agent, so this ends with the task however the task ends. A
       // link reported once the agent is stopped never covers the state the stop left.
