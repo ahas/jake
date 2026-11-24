@@ -37,10 +37,12 @@ the all-in-one app, which installs and runs the whole BMO set on the person's ow
   hub's deployment builds and lints in full, every package of it, and that build must need no webview
   system libraries and pay no webview build time. And the root's release build aborts on a panic,
   while the app is built with unwinding so that a panic in the agent ends only the agent's task.
-- **Its checks are run apart:** `bun run check:desktop` lints, formats and tests it, the remote controller's
-  build and the all-in-one's, on a machine that has the webview libraries (on Linux, WebKitGTK 4.1 and its
-  development files). `bun run check`
-  stays the whole check of the root workspace and the console.
+- **Its checks are run apart:** its own `package.json` holds them as its `check` script, which lints, formats
+  and tests it, the remote controller's build and the all-in-one's, on a machine that has the webview
+  libraries (on Linux, WebKitGTK 4.1 and its development files); `bun run check:desktop` at the root runs it.
+  `bun run check` stays the whole check of the root workspace and the console. BMO's testbed runs the folder
+  as a project of its own (`testbed.toml`), so the whole suite runs these checks beside the root's crates and
+  test files.
 
 ## The agent as a library
 

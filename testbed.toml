@@ -1,7 +1,18 @@
-# How BMO's testbed deploys this repository, in the testbed's declaration format (docs/deploy.md, step 8).
+# How BMO's testbed tests and deploys this repository, in the testbed's declaration format (docs/deploy.md, step 8).
 
 testbed = 0
 name = "jake"
+
+[test]
+# The root workspace's crates, and the test files under `test/`, which build the hub and the agent they start.
+# The desktop app is a Cargo workspace of its own (docs/desktop.md, 「The crate and its workspace」), run as a
+# project of its own by its `check` script.
+languages = ["cargo", "bun"]
+setup = ["export PATH=\"$HOME/.bun/bin:$PATH\" && bun install --frozen-lockfile"]
+
+[projects]
+discover = false
+paths = ["desktop"]
 
 [build]
 # The release carries the hub's binary, which the unit runs and the deployment's health asks.

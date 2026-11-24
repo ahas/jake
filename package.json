@@ -14,7 +14,7 @@
     "test:rust": "cargo test --offline --workspace",
     "test": "bun test",
     "check": "bun run check:types && bun run check:rust && bun run test:rust && bun run test",
-    "check:desktop": "cd desktop && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features all-in-one -- -D warnings && cargo fmt --check && cargo test && cargo test --features all-in-one",
+    "check:desktop": "cd desktop && bun run check",
     "build": "bun scripts/build.ts"
   }
 }

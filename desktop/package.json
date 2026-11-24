@@ -1,0 +1,7 @@
+{
+  "name": "jake-desktop",
+  "private": true,
+  "scripts": {
+    "check": "cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features all-in-one -- -D warnings && cargo fmt --check && cargo test && cargo test --features all-in-one"
+  }
+}
