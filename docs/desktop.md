@@ -177,8 +177,10 @@ account's joining once, and the app accepts no other.
   person is told in a native message box that the link cannot be opened, and why.
 - **The scheme is the remote controller's alone.** The installer registers `bmo` for the person: the NSIS
   installer under the person's own classes in the registry, the deb's desktop entry as the handler of
-  `x-scheme-handler/bmo`. An AppImage is installed by no one, so the app registers itself as the handler each
-  time it starts as one, and a development build does the same on Windows and Linux. The all-in-one registers
+  `x-scheme-handler/bmo`. The Linux bundles' desktop entry is the crate's own template, `linux/main.desktop`,
+  the bundler's default with `%u` on its `Exec` line, since a launcher hands a link to an entry only through a
+  field code; the AppImage carries the same entry. An AppImage is installed by no one, so the app registers
+  itself as the handler each time it starts as one, and a development build does the same on Windows and Linux. The all-in-one registers
   no scheme: it runs a BMO set of its own and joins no other server, and two apps claiming one scheme would
   leave the system to pick either.
 - **A running app takes the link itself.** The system starts a new copy with the link as its one argument;
@@ -545,7 +547,8 @@ processes and its network stay as they were.
 - **Linux second:** an AppImage and a deb package.
 - **The NSIS installer and the deb register the `bmo` scheme,** from the deep-link plugin's
   `plugins.deep-link.desktop.schemes` in the app's Tauri configuration, which the all-in-one's configuration
-  removes (「Opening from a link」).
+  removes, the deb through its desktop entry's template, `bundle.linux.deb.desktopTemplate`, which the AppImage
+  reads as well (「Opening from a link」).
 - **Updates go through Tauri's updater plugin with its signature check, quietly** (「Updating quietly」). The app
   checks its channel's feed (「The update channel」) at start, every six hours and when the channel changes, and
   installs an update only once its signature verifies against the public key built into the app.
