@@ -7,7 +7,7 @@ const ROOT = join(import.meta.dir, "..");
 const MANIFEST = join(ROOT, "agent", "Cargo.toml");
 
 /** The agent under contract: started as a process, so the tests hold whatever it is written in. */
-export const AGENT_COMMAND: readonly string[] = [join(ROOT, "target", "debug", "jake")];
+export const AGENT_COMMAND = [join(ROOT, "target", "debug", "jake")] as const;
 
 let built = false;
 
