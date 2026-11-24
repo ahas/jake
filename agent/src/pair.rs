@@ -1,11 +1,11 @@
 // The Windows self-healing pair: the autostart anchors, the single-instance lock and the watchdog.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
+use crate::command::Unanswered;
 use crate::exec::{encode_powershell_script, tree_kill_command};
 use crate::log::Log;
 use crate::platform::{Platform, Role, startup_dir};
@@ -455,16 +456,61 @@ const HELPER_WITHIN: Duration = Duration::from_secs(10);
 /// How long a stop waits for the watchdog's thread to end what it was doing.
 const STOP_WITHIN: Duration = Duration::from_secs(15);
 
-/// Read the run mode's task back and register it again only where it is absent or not as it must be,
-/// so a tick that finds it in order starts nothing but the query.
-async fn refresh_task(target: AnchorTarget) {
-  let held = crate::command::output(&task_query_command(&target), HELPER_WITHIN)
-    .await
-    .ok()
-    .map(|bytes| query_text(&bytes));
-  if let Some(command) = task_refresh_command(&target, held.as_deref()) {
-    launch(&command);
+/// How long a registration of a task is waited on before it is ended.
+const REGISTER_WITHIN: Duration = Duration::from_secs(60);
+
+/// The command that registers this run mode's task, from what its query answered: none where the query
+/// said nothing, since a query that does not answer tells nothing of the task; the registration where
+/// the query failed, the task being absent; and as `task_refresh_command` says where it printed a
+/// definition.
+pub fn task_refresh_after(
+  target: &AnchorTarget,
+  queried: Result<Vec<u8>, Unanswered>,
+) -> Option<Vec<String>> {
+  match queried {
+    Ok(bytes) => task_refresh_command(target, Some(&query_text(&bytes))),
+    Err(Unanswered::Failed(_)) => task_refresh_command(target, None),
+    Err(Unanswered::Silent(_)) => None,
   }
+}
+
+/// The tasks whose refresh stands, so a tick starts none for a task whose refresh before has not ended.
+#[derive(Clone, Default)]
+pub struct Refreshing(Arc<Mutex<HashSet<&'static str>>>);
+
+/// A refresh standing for one task, which lets the task go when dropped.
+pub struct Refresh {
+  refreshing: Refreshing,
+  name: &'static str,
+}
+
+impl Refreshing {
+  /// A refresh of the task `name`, or none where one stands already.
+  pub fn begin(&self, name: &'static str) -> Option<Refresh> {
+    let mut names = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    names.insert(name).then(|| Refresh {
+      refreshing: self.clone(),
+      name,
+    })
+  }
+}
+
+impl Drop for Refresh {
+  fn drop(&mut self) {
+    let mut names = self.refreshing.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    names.remove(self.name);
+  }
+}
+
+/// Read the run mode's task back and register it again only where the query answers that it is absent
+/// or not as it must be, so a tick that finds it in order starts nothing but the query. The registration
+/// is waited on within its bound and ended there, and the refresh holds its task until then.
+async fn refresh_task(target: AnchorTarget, refresh: Refresh) {
+  let queried = crate::command::output(&task_query_command(&target), HELPER_WITHIN).await;
+  if let Some(command) = task_refresh_after(&target, queried) {
+    let _ = crate::command::finish(&command, REGISTER_WITHIN).await;
+  }
+  drop(refresh);
 }
 
 fn epoch_ms() -> u64 {
@@ -632,11 +678,12 @@ impl Watchdog {
     runtime.block_on(async move {
       let mut ticks = skipping_interval(self.tick);
       let mut watching = Watching::new(epoch_ms());
+      let refreshing = Refreshing::default();
       let watch = async {
         loop {
           ticks.tick().await;
           watching.tick(epoch_ms(), self.tick);
-          self.run_tick(&pulse, watching).await;
+          self.run_tick(&pulse, watching, &refreshing).await;
         }
       };
       tokio::select! {
@@ -649,7 +696,7 @@ impl Watchdog {
   /// Write the heartbeat as the pulse last stamped it, put back every anchor that is missing or, for
   /// the task, not as it must be, and act on the peer as `peer_action` says. A redundant relaunch is
   /// harmless, as the peer's lock drops it.
-  async fn run_tick(&self, pulse: &Pulse, watching: Watching) {
+  async fn run_tick(&self, pulse: &Pulse, watching: Watching, refreshing: &Refreshing) {
     let windows = Platform::Windows;
     let now = epoch_ms();
     let own = windows.heartbeat_path(&self.env, self.role);
@@ -662,7 +709,9 @@ impl Watchdog {
       if !Path::new(&startup_shortcut_path(&target, &self.env)).exists() {
         launch(&startup_shortcut_create_command(&target, &self.env));
       }
-      tokio::spawn(refresh_task(target));
+      if let Some(refresh) = refreshing.begin(target.name) {
+        tokio::spawn(refresh_task(target, refresh));
+      }
     }
 
     let peer = self.role.peer();
@@ -901,6 +950,32 @@ mod tests {
     let by_schtasks = query_text(REGISTERED_BY_SCHTASKS.as_bytes());
     assert_eq!(task_refresh_command(&agent, Some(&by_schtasks)), Some(task_create_command(&agent)));
     assert_eq!(task_refresh_command(&guard, None), Some(task_create_command(&guard)));
+  }
+
+  #[test]
+  fn a_query_that_says_nothing_registers_nothing_and_a_failed_one_registers_the_task() {
+    let [agent, _] = install_targets("C:\\jake");
+    let silent = Unanswered::Silent("schtasks did not finish within 10s".to_owned());
+    let failed = Unanswered::Failed("schtasks ended with exit code: 1".to_owned());
+
+    assert_eq!(task_refresh_after(&agent, Err(silent)), None);
+    assert_eq!(task_refresh_after(&agent, Err(failed)), Some(task_create_command(&agent)));
+    assert_eq!(
+      task_refresh_after(&agent, Ok(b"not a task".to_vec())),
+      Some(task_create_command(&agent))
+    );
+  }
+
+  #[test]
+  fn a_task_has_one_refresh_standing_until_it_ends() {
+    let refreshing = Refreshing::default();
+    let first = refreshing.begin(AGENT_ANCHOR_NAME);
+
+    assert!(first.is_some());
+    assert!(refreshing.begin(AGENT_ANCHOR_NAME).is_none());
+    assert!(refreshing.begin(GUARD_ANCHOR_NAME).is_some());
+    drop(first);
+    assert!(refreshing.begin(AGENT_ANCHOR_NAME).is_some());
   }
 
   #[test]

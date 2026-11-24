@@ -280,8 +280,14 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   missing, so the wipe of any single anchor is repaired within one tick as long as either process is
   alive. A tick stays cheap: the run entry is rewritten in place, the Startup shortcut is written only
   where it is missing, and the scheduled task is read back with a plain query and registered again,
-  which takes PowerShell, only where it is missing or its definition differs from the one it must
-  hold.
+  which takes PowerShell, only where the query answers that it is missing or its definition differs
+  from the one it must hold.
+- A starved machine is never handed more of that work than it finishes. A query that does not answer
+  within its bound says nothing about the task, which is left as it stands until a later tick reads
+  it. A task has at most one registration standing: a tick that finds the one before still running
+  starts no other, and a registration is waited on for at most a minute and ended at that bound with
+  its PowerShell. Without that, a machine too loaded to answer the query within its bound is handed
+  two PowerShells a minute by each process, none of which finishes, and they pile up by the hundred.
 - The watchdog runs on a thread and runtime of its own, so starting a helper, waiting on one or
   writing a file, any of which a starved machine can hold up for seconds, never holds up the runtime
   that carries the tunnel. The liveness it records is that runtime's, not its own: the runtime stamps

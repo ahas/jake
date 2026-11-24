@@ -36,15 +36,38 @@ pub async fn run(argv: &[String], within: Duration) -> Result<(), String> {
   }
 }
 
+/// How a helper that printed nothing to take ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unanswered {
+  /// It ran and ended in failure: what it was asked does not hold.
+  Failed(String),
+  /// It could not be started, or did not finish within its bound and was ended: it said nothing.
+  Silent(String),
+}
+
 /// Run a helper to its end and take what it printed, or give up on it, ending it, once `within` has
 /// passed; a helper that ends in failure prints nothing taken.
-pub async fn output(argv: &[String], within: Duration) -> Result<Vec<u8>, String> {
-  let mut command = quiet(argv).ok_or("an empty command")?;
+pub async fn output(argv: &[String], within: Duration) -> Result<Vec<u8>, Unanswered> {
+  let mut command = quiet(argv).ok_or_else(|| Unanswered::Silent("an empty command".to_owned()))?;
   command.stdout(Stdio::piped()).kill_on_drop(true);
   match tokio::time::timeout(within, command.output()).await {
     Ok(Ok(output)) if output.status.success() => Ok(output.stdout),
-    Ok(Ok(output)) => Err(format!("{} ended with {}", argv[0], output.status)),
+    Ok(Ok(output)) => Err(Unanswered::Failed(format!("{} ended with {}", argv[0], output.status))),
+    Ok(Err(error)) => Err(Unanswered::Silent(format!("{}: {error}", argv[0]))),
+    Err(_) => Err(Unanswered::Silent(format!("{} did not finish within {within:?}", argv[0]))),
+  }
+}
+
+/// Run a helper to its end, or end it once `within` has passed, so a helper given up on does not stay
+/// behind.
+pub async fn finish(argv: &[String], within: Duration) -> Result<(), String> {
+  let mut command = quiet(argv).ok_or("an empty command")?;
+  command.kill_on_drop(true);
+  let mut child = command.spawn().map_err(|error| format!("{}: {error}", argv[0]))?;
+  match tokio::time::timeout(within, child.wait()).await {
+    Ok(Ok(status)) if status.success() => Ok(()),
+    Ok(Ok(status)) => Err(format!("{} ended with {status}", argv[0])),
     Ok(Err(error)) => Err(format!("{}: {error}", argv[0])),
-    Err(_) => Err(format!("{} did not finish within {within:?}", argv[0])),
+    Err(_) => Err(format!("{} did not finish within {within:?} and was ended", argv[0])),
   }
 }
