@@ -87,7 +87,7 @@ pub enum Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ValueKey {
-  /// The update channel, `stable` or `nightly`.
+  /// The update channel, `stable`, `preview` or `nightly`.
   UpdateChannel,
   /// The server the app connects to, the console's address.
   ConsoleUrl,
@@ -112,9 +112,9 @@ impl Change {
       (Key::Switch(switch), _, _) => Err(format!("{} takes on, true or false, and no value", switch.key())),
       (Key::Value(ValueKey::UpdateChannel), None, Some(value)) => serde_json::from_value(value)
         .map(Self::Channel)
-        .map_err(|_| format!("{CHANNEL_KEY} takes a value, stable or nightly")),
+        .map_err(|_| format!("{CHANNEL_KEY} takes a value, stable, preview or nightly")),
       (Key::Value(ValueKey::UpdateChannel), _, _) => {
-        Err(format!("{CHANNEL_KEY} takes a value, stable or nightly, and no on"))
+        Err(format!("{CHANNEL_KEY} takes a value, stable, preview or nightly, and no on"))
       }
       (Key::Value(ValueKey::ConsoleUrl), None, Some(Value::String(address))) => Ok(Self::Console(address)),
       (Key::Value(ValueKey::ConsoleUrl), _, _) => {
@@ -235,7 +235,7 @@ impl Settings {
     let channel = match document.get(CHANNEL_KEY) {
       None => Channel::default(),
       Some(value) => serde_json::from_value(value.clone())
-        .map_err(|_| format!("{CHANNEL_KEY} is neither stable nor nightly"))?,
+        .map_err(|_| format!("{CHANNEL_KEY} is none of stable, preview and nightly"))?,
     };
     Ok(Self {
       console,
@@ -509,12 +509,12 @@ mod tests {
   fn the_channel_is_written_at_once_and_read_back() {
     let dir = Dir::holding("settings-channel", r#"{"closeToTray":false}"#);
     let mut file = SettingsFile::open(&dir.0);
-    file.set_channel(Channel::Nightly).unwrap();
+    file.set_channel(Channel::Preview).unwrap();
 
-    assert_eq!(file.settings().channel, Channel::Nightly);
-    assert_eq!(dir.file(), serde_json::json!({ "closeToTray": false, "updateChannel": "nightly" }));
+    assert_eq!(file.settings().channel, Channel::Preview);
+    assert_eq!(dir.file(), serde_json::json!({ "closeToTray": false, "updateChannel": "preview" }));
     let reopened = SettingsFile::open(&dir.0).settings();
-    assert_eq!(reopened.channel, Channel::Nightly);
+    assert_eq!(reopened.channel, Channel::Preview);
     assert!(!reopened.switches.on(Switch::CloseToTray));
   }
 
@@ -548,6 +548,10 @@ mod tests {
     assert_eq!(
       Change::read(channel, None, Some(Value::from("nightly"))).unwrap(),
       Change::Channel(Channel::Nightly)
+    );
+    assert_eq!(
+      Change::read(channel, None, Some(Value::from("preview"))).unwrap(),
+      Change::Channel(Channel::Preview)
     );
     assert_eq!(
       Change::read(switch, Some(false), None).unwrap(),

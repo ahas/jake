@@ -265,8 +265,8 @@ The install verb writes all three from its inputs `jake.publish-folder`, `jake.d
 `jake.public-name` (`install.toml`); a hub file written before them gets each added by hand. The hub refuses to
 start without `JAKE_AGENT_DOWNLOAD_URL` while it orders agents onto its build, and the publish step refuses
 without any of the three. A deployment writes into the folder itself, so it belongs to the account the testbed runs
-as, with the web server's group, the same as the desktop app's mirror folder inside it (docs/desktop.md, 「Making
-a release」). Hand it over once, before the first deployment that publishes:
+as, with the web server's group, the same as the desktop app's served folder inside it (docs/desktop.md, 「Where
+releases are kept」). Hand it over once, before the first deployment that publishes:
 
 ```sh
 dir="$(sed -n 's/^JAKE_PUBLISH_DIR=//p' ~/.local/share/jake/hub.env)"

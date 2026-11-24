@@ -228,13 +228,13 @@ The app's settings are kept in its `settings.json`.
 | `startAtSignIn` | Start the app when the person signs in | off | every platform |
 | `startInTray` | Start in the tray, with no window, when started at sign-in | off | every platform |
 | `keepAwake` | Keep the PC from sleeping while the built-in agent serves | off | Windows |
-| `updateChannel` | The channel updates come from, `stable` or `nightly` (「The update channel」) | `stable` | every platform |
+| `updateChannel` | The channel updates come from, `stable`, `preview` or `nightly` (「The update channel」) | `stable` | every platform |
 | `consoleUrl` | The server the app connects to, its console's address (「The server」) | none: the app asks for it | every platform |
 
 ### Reading and writing
 
 - **A key the file does not hold takes its default.** A file that cannot be read whole, broken JSON, a
-  value of the wrong type, a channel that is neither `stable` nor `nightly` or a `consoleUrl` that is no
+  value of the wrong type, a channel that is none of `stable`, `preview` and `nightly` or a `consoleUrl` that is no
   HTTPS address (plain HTTP on this machine aside), leaves the app on its defaults, with no server, and
   the reason in its log, and the console's section then says the file cannot be read and
   the app changes nothing, since writing it would overwrite the hand edit it could not read.
@@ -279,26 +279,32 @@ The app's settings are kept in its `settings.json`.
 
 ### The update channel
 
-- **Two channels, each with a feed of its own** (「Releases」). `stable` takes the set's releases alone,
-  the versions the owner declares; `nightly` takes the day's build between releases as well, named
-  `<next minor>-nightly.<YYYYMMDD>`, as bmo-chat's `docs/conventions.md` 「Versions」 states. `stable` is
-  the default, and a file that names no channel runs on it.
+- **Three channels, each with a feed of its own** (「Releases」), taking the kinds of version bmo-chat's
+  `docs/conventions.md` 「Versions」 states. `stable` takes the set's stable releases alone; `preview` takes its
+  alphas, betas and release candidates as well; `nightly` takes every kind, the day's build between releases among
+  them, named `X.Y.Z-0.nightly.<YYYYMMDD>`. `stable` is the default, and a file that names no channel runs on it.
 - **The app asks its channel's feed,** the address Tauri's updater is given at each check. The configuration's
-  updater endpoint is the stable feed, and the nightly feed is worked out from it: where it is the repository's own
-  GitHub feed, the same file of the nightly pre-release; where it is an update server's (bmo-update's `docs/api.md`,
-  「Updates」), the same address with the channel `nightly` in place of `stable`. A change of channel asks the new
-  channel's feed at once, and from then on at the usual times.
+  updater endpoint is the stable feed, and the other two are worked out from it: where it is the repository's own
+  GitHub feed, the same file of the channel's pre-release, `desktop-preview` or `desktop-nightly`; where it is an
+  update server's (bmo-update's `docs/api.md`, 「Updates」), the same address with the channel `preview` or `nightly` in
+  place of `stable`. A change of channel asks the new channel's feed at once, and from then on at the usual times.
+- **Each feed names the newest version its channel takes:** the preview feed the newer of the newest preview and the
+  newest stable release, the nightly feed the newest of all three (「Where releases are kept」); on an update server the
+  channel `preview` includes `stable` and the channel `nightly` both, to the same end.
 - **An official build reads the repository's GitHub feeds** (「Where releases are kept」), the configuration's own
   endpoint, as does a build made from the repository by hand; **a test build reads the test update server** its
-  release names (「Making a release」). The app reads the one feed its build names and falls back to no other, so an
-  official app never meets a test build and a test app never leaves the test server.
-- **An update is taken only where its version is higher than the running one,** by semver, on either
-  channel. Semver orders a nightly before the release it leads to and after the release before it, so:
-  - **Stable to nightly** takes the newest nightly at once, since it stands above the release it follows.
-  - **Nightly to stable never goes back.** The installed nightly stays until a release higher than it is
-    published: a nightly of `1.1.0` is replaced by `1.1.0` or a later release, never by the `1.0.0` it
-    followed. To return to a stable version at once, the person installs it by hand from the download
-    page.
+  release names (「Releases」). The app reads the one feed its build names and falls back to no other, so an official
+  app never meets a test build and a test app never leaves the test server.
+- **An update is taken only where its version is higher than the running one,** by semver, on every channel. For one
+  `X.Y.Z` semver orders its nightlies first, then its alphas, its betas, its release candidates and the release
+  itself, and the whole of `X.Y.Z` after every version of the release before it, so:
+  - **Onto a channel that takes more** (`stable` to `preview`, `stable` to `nightly`, `preview` to `nightly`), the app
+    takes the new channel's newest at once where it stands above the running version.
+  - **Onto a channel that takes less never goes back.** The installed version stays until the new channel publishes
+    a higher one: from `preview` to `stable`, a `1.1.0-beta.2` stays until `1.1.0` or a later release; from
+    `nightly` to `preview`, a `1.2.0-0.nightly.20261201` stays until `1.2.0-alpha.1` or a later preview or release;
+    from `nightly` to `stable`, it stays until `1.2.0`. To return to the new channel's version at once, the person
+    installs it by hand from the download page.
 
 ### Where the settings are set
 
@@ -429,11 +435,11 @@ processes and its network stay as they were.
   alone, and with no server named no remote page is given the bridge at all.
 - **The bridge holds two of the app's commands and the window's own controls:**
   - `settings` reads the settings: each switch the platform offers with its value, `updateChannel`,
-    `stable` or `nightly`, `consoleUrl`, the server the settings name (null while they name none), why
+    `stable`, `preview` or `nightly`, `consoleUrl`, the server the settings name (null while they name none), why
     the file cannot be changed where it cannot, and `windowControls`, `console` where the page draws the
     window's controls and `inset` where the system's stand inset at the top left.
   - `change_setting` changes one setting by its key, `setting`: a switch's camelCase key with `on`,
-    true or false, `updateChannel` with `value`, `stable` or `nightly`, or `consoleUrl` with `value`, the
+    true or false, `updateChannel` with `value`, `stable`, `preview` or `nightly`, or `consoleUrl` with `value`, the
     address as entered. The app checks it before anything is written: an unknown key and an `on` that
     is not true or false are refused as the call is read; a switch given no `on` or a `value`, the
     channel or the server given no `value` or an `on`, a channel's `value` that is no channel, a server's
@@ -469,21 +475,18 @@ processes and its network stay as they were.
 - **Updates go through Tauri's updater plugin with its signature check, quietly** (「Updating quietly」). The app
   checks its channel's feed (「The update channel」) at start, every six hours and when the channel changes, and
   installs an update only once its signature verifies against the public key built into the app.
-- **The update key is the owner's.** It is made once with `cargo tauri signer generate`, which writes a
-  private key and asks for its password; the private key and its password are kept outside every
-  repository, in the deployment's secret store (the data root's env folder), a file each, readable by
-  their user alone, and are handed to a release build through the `TAURI_SIGNING_PRIVATE_KEY` and
-  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` environment variables alone. Neither is ever committed. The
-  public key is written into the updater's `pubkey` in the app's Tauri configuration.
-- **The public key is written in, and the bundle makes updater artifacts,** which a release build signs
-  with the private key; a release build without the two variables fails rather than ship an unsigned
-  update. An app built from a configuration with no updater entry checks for none.
+- **The update key is the set maintainer's,** and its private half never stands in a repository of the set. Its
+  public key is written into the updater's `pubkey` in the app's Tauri configuration, and the bundle makes updater
+  artifacts, which a release build signs with the private key; a build that is handed no key fails rather than ship
+  an unsigned update. An app built from a configuration with no updater entry checks for none.
 - **The feeds are the repository's GitHub releases** (「Releases」): the configuration's own endpoint is the
   stable feed, `https://github.com/ahas/jake/releases/latest/download/latest.json`, which every official build
   reads. A test build reads the test update server (bmo-update) instead, whose address its release lays over the
-  configuration's on the build's command line, so no server's address stands in the repository; it asks the server
-  for its own product's update on its channel, for its platform, its architecture and the format it was installed
-  from. The feeds and the installers are the same for every person; only the server each app connects to differs.
+  configuration's on the build's command line, so no server's address stands in the repository: the endpoint
+  `<public address>/updates/<product>/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}`,
+  which asks the server for its own product's update on its channel, for its platform, its architecture and the
+  format it was installed from. The feeds and the installers are the same for every person; only the server each
+  app connects to differs.
 - **A build** runs `cargo tauri build` inside the `desktop` folder. The NSIS installer is built on
   main-host as well as on a Windows machine: cross-compiled for `x86_64-pc-windows-gnu` with
   `cargo-zigbuild` as the CLI's runner and `--bundles nsis`, which needs `nsis` and the mingw-w64
@@ -525,28 +528,40 @@ next time they look, and the tray says so.
 ## Releases
 
 A release is one version of the desktop apps, the remote controller and the all-in-one (docs/all-in-one.md), built
-from one commit for every platform at once and signed for the updater. It is of one of two kinds:
+from one commit for every platform at once and signed for the updater. Releases are made by the set's maintainer, as
+bmo-chat's `docs/conventions.md` 「Versions」 states, with means no repository of the set carries; this repository
+holds the apps, their build configuration and the layout below, which every reader of a release builds against. A
+release is of one of two kinds:
 
 - **An official release** is published as a GitHub release of the repository `ahas/jake`, where every official
   app's updater, the console's download page and the project's site read it. A private repository's releases
   answer 404 to everyone but its members, so official releases are published once `ahas/jake` is public, which it
-  becomes at the set's `1.0.0`; until then an official release is refused before anything is built.
+  becomes at the set's `1.0.0`.
 - **A test release** is published to the test update server alone, bmo-update at the project's
-  `https://bmo.ahas.io/updates/`, and its apps are built to ask that server and nothing else. It is how a build is
-  tried on the owner's own machines before it is released; no official app, no download page and no site ever
+  `https://bmo.ahas.io/updates/`, and its apps are built to ask that server and nothing else (「Distribution and
+  updates」). It is how a build is tried before it is released; no official app, no download page and no site ever
   names it.
 
-Either goes out on one of two channels, as bmo-chat's `docs/conventions.md` 「Versions」 states the set's versions:
+Either goes out on one of three channels, by the kind of its version (bmo-chat's `docs/conventions.md`, 「Versions」):
 
-- **`stable`** carries the set's releases, the versions the owner declares, and is what the app takes
-  unless its setting says otherwise.
-- **`nightly`** carries the day's build between releases, named `<next minor>-nightly.<YYYYMMDD>`: the
-  minor above the release the app's configuration names, then the day it was built in the platform's
-  time zone, `Asia/Seoul`, as `1.1.0-nightly.20261124` after `1.0.0`. A second nightly the same day adds
-  `.<n>` counting from 2, `1.1.0-nightly.20261124.2`, so each stands above the one before it.
+- **`stable`** carries the stable releases, `X.Y.Z`, and is what the app takes unless its setting says otherwise.
+- **`preview`** carries the alphas, betas and release candidates, `X.Y.Z-alpha.<N>`, `X.Y.Z-beta.<N>` and
+  `X.Y.Z-rc.<N>`.
+- **`nightly`** carries the day's build between releases, `X.Y.Z-0.nightly.<YYYYMMDD>`, with `.<n>` counting from 2
+  for a second nightly the same day, as `1.1.0-0.nightly.20261124.2`, so each stands above the one before it. `X.Y.Z`
+  is the version main leads to and the day is the one it was built in the platform's time zone, `Asia/Seoul`. A
+  nightly named in the earlier form, `X.Y.Z-nightly.<YYYYMMDD>[.<n>]`, is ordered as the same day's nightly of the
+  present form wherever what is published is compared.
 
-The two kinds are counted apart: an official version is checked against what GitHub holds and a test version
-against what the test update server holds.
+The version of a stable release, an alpha, a beta or a release candidate is the one in the apps' Tauri
+configuration, moved only in the commit that releases the set, and every app's configuration names the same one. A
+nightly's version is laid over the configuration's on the Tauri CLI's command line of its build alone, and is
+never written into the repository. The all-in-one is built from the same crate with its feature `all-in-one` and
+its configuration `tauri.all-in-one.conf.json` laid over the crate's own (docs/all-in-one.md, 「The crate」).
+
+The two kinds are counted apart: an official version is compared with what GitHub holds and a test version with what
+the test update server holds, and on each a version not higher than the newest of its own channel, nor for a preview
+or a nightly than the newest stable release, is never published.
 
 ### Where releases are kept
 
@@ -562,16 +577,22 @@ against what the test update server holds.
   release makes the stable release before it the latest again, whose feeds then name that version; an app that
   already took the withdrawn version keeps it, since the updater never goes back, until a higher version is
   published.
-- **Every nightly is the one pre-release tagged `desktop-nightly`,** whose assets each nightly replaces:
-  its installers and their signatures, the nightly feeds of the same two names and the nightly's own read
-  `release.json`, holding the nightly alone. Its title names the version and its notes the commit it was
-  built from; the tag stays where the first nightly put it. A nightly is withdrawn by publishing a higher one.
+- **Every preview is the one pre-release tagged `desktop-preview`, and every nightly the one tagged
+  `desktop-nightly`,** whose assets each version of its channel replaces: its installers and their signatures, the
+  channel's feeds of the same two names and the version's own read `release.json`, holding that version alone. Its
+  title names the version and its notes the commit it was built from; the tag stays where the pre-release was first
+  made. A preview or a nightly is withdrawn by publishing a higher one.
 - **The repository's latest release is always the desktop app's newest stable one,** since a pre-release
   is never the latest and a stable release is published as the latest. The repository makes no other
   release that is not a pre-release, so `releases/latest` names the desktop app's.
-- **Each app has an updater feed on each channel,** in the form Tauri's updater reads, naming that channel's
-  newest version: the file its configuration's updater endpoint names, on the latest release for `stable` and on
-  the nightly pre-release for `nightly`.
+- **Each app has an updater feed on each channel,** in the form Tauri's updater reads, the file its configuration's
+  updater endpoint names: on the latest release for `stable`, on the preview pre-release for `preview` and on the
+  nightly pre-release for `nightly`. Each names the newest version its channel takes: the stable feed the newest
+  stable release; the preview feed the newer of the newest preview and the newest stable release; the nightly feed
+  the newest of all three. A version is therefore also written into the feeds of every channel that takes it where it
+  stands above what they name, a stable release into the preview and nightly pre-releases' feeds and a preview into
+  the nightly one's, the pre-release made to hold them where it does not stand yet; a version that stands below
+  what a feed names leaves that feed as it is.
 - **An installer is published under Tauri's name for it with the product's spaces as dashes,** since GitHub
   rewrites the spaces of an asset's name: `BMO_1.0.0_amd64.AppImage` and `BMO-All-in-One_1.0.0_amd64.AppImage`.
 - **A feed names every installer of its app the updater may take,** each with its signature and its address:
@@ -580,11 +601,16 @@ against what the test update server holds.
   from the deb looks for the deb's key first, so it is never handed an AppImage.
 - **Test releases on the test update server.** Each app is a product of the update server's (bmo-update's
   `docs/design.md`): the remote controller `bmo-desktop` and the all-in-one `bmo-all-in-one`, each with the channels
-  `stable` and `nightly`, `nightly` including `stable`, and the remote controller naming the all-in-one its companion
-  `allInOne`. Every version of each is a release on its channel holding its Windows installer, AppImage and deb, each
-  with its updater signature, in that order, so the NSIS installer and the AppImage are the defaults of their
-  platforms. A published version is never written again, and one that must not be installed any more is withdrawn
-  on the update server, which then offers no app it.
+  `stable`, `preview`, including `stable`, and `nightly`, including `preview` and `stable`, and the remote controller
+  naming the all-in-one its companion `allInOne`. Every version of each is a release on its channel holding its
+  Windows installer, AppImage and deb, each with its updater signature, in that order, so the NSIS installer and the
+  AppImage are the defaults of their platforms. A published version is never written again, and one that must not be
+  installed any more is withdrawn on the update server, which then offers no app it.
+- **A served folder for the builds up to 0.2.1,** whose updater reads the owner's server's feed rather than GitHub's:
+  the `desktop` folder of the hub's `JAKE_PUBLISH_DIR`, served at its `JAKE_AGENT_DOWNLOAD_URL` followed by
+  `desktop/`. It holds `release.json` and the stable feeds at its top, each stable version in a folder of its own named
+  by the bare version, and each preview under `preview/` and each nightly under `nightly/` with their channel's own
+  feeds, the seven newest nightlies kept, every read naming the folder's own copies at its served address.
 
 ### The read the console uses
 
@@ -602,10 +628,13 @@ section.
 - **Either is a JSON object whose top level always describes the current stable version.**
 - **The object holds:** `version`, the bare semantic version; `date`, when it was published, as an
   RFC 3339 UTC timestamp; `files`, one entry per installer of the remote controller; `allInOne`, an object
-  whose `files` holds the all-in-one's installers in the same form; and `nightly`, the newest nightly as an
-  object of the same `version`, `date`, `files` and `allInOne`, absent until the first nightly is published. A
-  nightly replaces the `nightly` of the latest stable release's read, so that read always names both
-  channels' newest; the nightly pre-release's own `release.json` holds its object alone.
+  whose `files` holds the all-in-one's installers in the same form; `preview`, the newest alpha, beta or release
+  candidate as an object of the same `version`, `date`, `files` and `allInOne`, present while it stands above the
+  stable version at the top level; and `nightly`, the newest nightly as an object of the same form, absent until the
+  first nightly is published. A preview or a nightly replaces its own field of the latest stable release's read, so
+  that read always names every channel's newest; a stable release keeps the `nightly` it finds and the `preview` that
+  stands above it, and drops a `preview` it reaches. The pre-release's own `release.json` holds its version's object
+  alone.
 - **Each entry of `files` holds:** `platform`, `windows` or `linux`; `arch`, `x86_64`; `format`,
   `nsis`, `appimage` or `deb`; `file`, the file's name; `size`, its length in bytes; `sha256`, its
   SHA-256 digest in lowercase hex; and `url`, the absolute address it downloads from.
@@ -613,95 +642,10 @@ section.
   `https://github.com/ahas/jake/releases/download/<tag>/<file>`, in GitHub's read, and the update server's address of
   the file's bytes in the update server's, so a link to it downloads the installer and a stable version's link
   never changes once published.
-- **No release yet reads as not found:** until the first release is published the address answers
-  404, and the console and the site show that the app is not yet available. A nightly is published only
-  after a stable release, so the top level is always there once the read is.
+- **No release yet reads as not found:** until the first stable release is published the address answers
+  404, and the console and the site show that the app is not yet available. The read stands on the latest stable
+  release, so its top level is always there once the read is.
 - **A field may be added and none is removed or renamed,** so a console built against this contract
   reads every later release.
-
-### Making a release
-
-- **A release is one command run on main-host from the repository's root, naming its channel:**
-  `bun run release:desktop --channel stable` or `bun run release:desktop --channel nightly` for an official
-  release, and the same with `--test` for a test release. It runs `scripts/desktop-release.ts` under a memory cap of
-  its own, and that reads what is published, builds the remote controller for Windows and then for Linux, then the
-  all-in-one the same way, one after the other, finds the installers and their signatures, and publishes them: an
-  official release with the GitHub CLI, `gh`, signed in as an account that may write the repository's releases, a
-  test release to the test update server. A channel that is not named, or neither of the two, stops it before
-  anything else.
-- **An official app is built with the configuration's own endpoint,** the repository's GitHub feed, so nothing is
-  laid over it but a nightly's version.
-- **A test app is built to ask the test update server:** the release lays over each app's configuration the endpoint
-  `<public address>/updates/<product>/stable/{{target}}/{{arch}}/{{current_version}}?bundleType={{bundle_type}}`,
-  handed to the Tauri CLI's build on its command line beside a nightly's version, so nothing is written into the
-  repository.
-- **The test update server is named by the publisher's file** of the deployment's secret store,
-  `update-publisher.env`, which bmo-update's install writes: `BMO_UPDATE_ADDRESS`, the public address every test app
-  is built to ask, which must be HTTPS since a release build of the updater refuses any other;
-  `BMO_UPDATE_PUBLISH_ADDRESS`, the address the release reads and publishes at, the update server's own loopback
-  one; and `BMO_UPDATE_TOKEN`, its publishing token. Each line is read by its key, its value verbatim, and none is
-  printed. `--publisher <file>` names another file. A test release stops where the file or one of its three lines
-  is missing; an official release never reads it.
-- **The all-in-one is built from the same crate** with its feature `all-in-one` and its configuration
-  `tauri.all-in-one.conf.json` handed to the Tauri CLI's build over the crate's own (docs/all-in-one.md,
-  「The crate」). Every app's configuration must name the same version, and their updater endpoints the same
-  repository and different files, or the release stops.
-- **The repository is the one the apps' configured updater endpoints name,** so no address is stated twice; an
-  endpoint that is not a GitHub repository's latest release feed stops the release.
-- **What is published is read first.** An official release has `gh` read whether the repository is public, the
-  latest release's `release.json`, whose top level is the published stable version and whose `nightly` the published
-  nightly, and for a nightly the nightly pre-release's assets; a latest release that is not the desktop app's stops
-  the release. A test release reads each channel's newest live or withdrawn version of the remote controller from
-  the releases its product lists on the update server.
-- **An official release of a private repository is refused before anything is built,** saying that GitHub answers
-  a private repository's releases to its members alone and that the repository becomes public at the set's
-  `1.0.0`; its dry run prints what the release would do and says the same.
-- **A stable release is published on GitHub whole at once:** it is made a draft at the checkout's commit holding
-  its installers, their signatures, its feeds and the read with the published `nightly` kept, and then
-  published as the latest, so its feed never names a file that is not yet there. The commit must be on
-  the repository's GitHub copy.
-- **A nightly replaces only its own channel on GitHub:** the nightly pre-release is made at the first nightly and
-  its assets replaced at every later one, the installers, signatures and its own read first, the feeds
-  after them and the files no feed names any more last; then the latest stable release's
-  `release.json` is replaced with the new `nightly` and its top level kept.
-- **A test release's publication on the update server** declares both products, makes each app's release a draft
-  on its channel with the commit in its notes, declares each installer with its platform, architecture, format,
-  length, SHA-256 and signature, uploads its bytes, and puts the all-in-one's release live, then the remote
-  controller's. A run that broke off is run again with the same version: what stands is answered as done.
-- **`--dry-run` builds, uploads and writes nothing:** it reads what is published, works out the version
-  and checks it, and prints the kind and the channel, the version, the endpoint each app is built with, and for an
-  official release the tag, the GitHub feeds', read's and installers' addresses and every `gh` call it would make,
-  for a test release the update server's download read and every call it would make of it.
-- **`--no-publish <folder>` builds and signs everything and publishes nothing:** the installers and their
-  signatures, and for an official release the feeds and the reads, are written into the folder as they would be
-  uploaded, and every call that would publish them is printed instead of made. It proves a release's build where
-  nothing may be published, a private repository's official build among them, and takes neither `--dry-run` nor a
-  mirror.
-- **The stable version is the one in the app's Tauri configuration,** the set's release version,
-  moved only in the commit that releases the set. A version not higher than the stable one already
-  published where the release goes is refused before anything is built.
-- **The nightly version is worked out as the build starts,** from the configuration's version and the
-  day, and handed to that build alone as an override of the configuration's version on the Tauri CLI's
-  command line; nothing is written into the repository, and no commit carries it. A nightly is refused
-  before anything is built where no stable release is published yet where the release goes, and where its version
-  is not higher than both the published nightly and the published stable, which is a checkout behind the release.
-- **The update key is read from the deployment's secret store by its path:** the env folder holds
-  `jake-desktop-updater.key` and `jake-desktop-updater.password`, and the release hands the key to the
-  build as its path and the password through its variable, printing neither. Where either file is
-  missing the release stops before building.
-- **Every installer and every signature must come from this run:** a file the build did not write
-  afresh stops the release, so a stale build is never published under a new version. Each is taken into the
-  release's own folder as soon as its build ends, since the next app's build of the same format clears the
-  bundle folder it was written into.
-- **`--mirror <folder> --mirror-url <address>` also publishes into a served folder,** off unless both
-  are given: the folder keeps the layout the owner's own server serves, `release.json` and the feeds at its top, each stable version in a folder of its own named by
-  the bare version, each nightly under `nightly/` with its feeds, the seven newest
-  nightlies kept, each version's installers and signatures copied in and its reads naming them at the
-  folder's served address. A version folder already there stops the release before building. It is
-  what an installation of a build up to 0.2.1, whose updater reads the owner's server's feed, updates
-  from: on the owner's machine the `desktop` folder of the hub's `JAKE_PUBLISH_DIR`, served at its
-  `JAKE_AGENT_DOWNLOAD_URL` followed by `desktop/`.
-- **The release ends by printing** the kind, the channel, the version and, for each installer, its name, its
-  size, its SHA-256 and its address.
-- **The Authenticode signature is not part of it:** the installer stays unsigned for Windows until
+- **The Authenticode signature is no part of a release:** the installer stays unsigned for Windows until
   the owner provides a certificate (「Distribution and updates」).

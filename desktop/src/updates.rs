@@ -360,7 +360,7 @@ mod tests {
 
   #[test]
   fn a_version_is_kept_under_a_name_of_its_own() {
-    assert_eq!(file_name_of("1.1.0-nightly.20261124.2"), "1.1.0-nightly.20261124.2.update");
+    assert_eq!(file_name_of("1.1.0-0.nightly.20261124.2"), "1.1.0-0.nightly.20261124.2.update");
     assert_eq!(file_name_of("1.0.0+build/../x"), "1.0.0-build-..-x.update");
   }
 

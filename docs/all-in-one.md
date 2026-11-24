@@ -158,9 +158,9 @@ flowchart TD
 - **The app updates itself quietly through Tauri's updater,** as the remote controller does (docs/desktop.md,
   「Distribution and updates」 and 「Updating quietly」), from feeds of its own beside the remote controller's on the
   repository's GitHub releases: `all-in-one-latest.json` on the latest release for `stable`, and the same file of the
-  nightly pre-release for `nightly`; a test build asks the test update server for its product `bmo-all-in-one`
-  instead. Each release carries both apps' installers, built from one commit by the same `bun run release:desktop`
-  (docs/desktop.md, 「Making a release」), and the release read names the all-in-one's under `allInOne`.
+  preview pre-release for `preview` and of the nightly pre-release for `nightly`; a test build asks the test update
+  server for its product `bmo-all-in-one` instead. Each release carries both apps' installers, built from one commit
+  at one version (docs/desktop.md, 「Releases」), and the release read names the all-in-one's under `allInOne`.
 - **Its quiet moment is a quit, or no window shown while it installs nothing;** the set is stopped before the
   installer starts, and the app started again on the new version starts the set again.
 - **The set's repositories update through the testbed's deployment,** as every install's do: each repository's
