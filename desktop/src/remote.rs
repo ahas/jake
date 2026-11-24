@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use jake_agent::Log;
+use jake_agent::installed::Installed;
 use serde_json::{Value, json};
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -93,6 +94,21 @@ async fn set_console(app: AppHandle, address: String) -> Result<bool, String> {
 #[tauri::command]
 fn retry(shared: State<'_, Shared>) {
   let _ = shared.retries.try_send(());
+}
+
+/// Stop the installed agent the app is held off for through its own uninstaller, and start the built-in one
+/// (docs/desktop.md, 「One agent per name」).
+#[tauri::command]
+async fn switch_agent(shared: State<'_, Shared>) -> Result<(), ()> {
+  controller::switch_to_built_in(
+    &shared.status,
+    &shared.retries,
+    &shared.log,
+    jake_agent::installed::installed_agent,
+    Installed::uninstall,
+  )
+  .await;
+  Ok(())
 }
 
 /// The settings as the console draws them, and who draws the window's controls; the bridge's read.
@@ -514,6 +530,13 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
     }
   });
 
+  // The built-in agent's hello names the app's own instance, kept beside the settings (docs/desktop.md, 「Pairing」).
+  let (instance, unkept) =
+    jake_agent::instance::kept_at(&app.path().app_config_dir()?.join("agent-instance"));
+  if let Some(reason) = unkept {
+    log.warn("instance-not-kept", json!({ "reason": reason }));
+  }
+
   // The course runs on a named server alone; with none, the bundled page asks for one and the app starts
   // again on it.
   let course = console.clone().map(|console| {
@@ -529,6 +552,7 @@ fn setup(app: &mut App, updates: Option<Result<Feeds, String>>) -> Result<(), Bo
         paused: pausing,
         retries: retried,
         carrying: carrying.clone(),
+        instance: instance.clone(),
       }
       .run(),
     )
@@ -589,7 +613,15 @@ pub fn main() {
     builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
   }
   let app = builder
-    .invoke_handler(tauri::generate_handler![status, console, retry, settings, change_setting, set_console])
+    .invoke_handler(tauri::generate_handler![
+      status,
+      console,
+      retry,
+      switch_agent,
+      settings,
+      change_setting,
+      set_console
+    ])
     .setup(move |app| setup(app, updates))
     .build(context)
     .expect("the app's configuration is valid");

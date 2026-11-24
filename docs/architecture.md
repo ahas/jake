@@ -45,11 +45,24 @@ main-host. This document is the canonical statement of how the pieces fit; the c
 
 - An agent is known to the hub by the name its hello carries, and the name is the whole of its
   identity. The hub holds one connection per name, as many names at once as there are machines. A
-  hello under a name already held replaces that name's connection — the older socket is closed with
-  code 4000 and the stated reason `superseded by a new connection` — because a redial after a
-  half-dead TCP connection must not leave two peers streaming as the same machine. A hello under a
-  new name displaces nobody. The reason is part of the contract: the desktop app's built-in agent
-  reads it to give its name up rather than redial.
+  hello under a new name displaces nobody.
+- **One name, one agent instance.** Beside its name, a hello carries the instance it comes from: an id
+  each install makes once and keeps, the installed agent in its data directory and the desktop app's
+  built-in agent in the app's config directory, so every connection one install makes carries the same
+  instance and no two installs carry the same one. A hello under a name already held:
+  - from the same instance, or from an agent that names none, replaces that name's connection — the
+    older socket is closed with code 4000 and the stated reason `superseded by a new connection` —
+    because a redial after a half-dead TCP connection must not leave two peers streaming as the same
+    machine;
+  - from another instance is refused: the hub answers it with a reject whose reason is
+    `name held by another agent`, closes its socket with code 4009, and leaves the connection that
+    holds the name as it is. The first one attached keeps the name, so a race between two installs of
+    one name never makes two, and never makes them replace each other without end. The refused agent
+    dials again on its backoff and takes the name once the one holding it is gone — closed, or declared
+    dead by its missed pongs.
+
+  Both reasons are part of the contract: the desktop app's built-in agent reads either to give its
+  name up rather than redial (docs/desktop.md, 「One agent per name」).
 - Everything that belongs to a connection lives and dies with it: its liveness probe, its commands,
   its transfers and its streams. An agent that drops, is declared dead, or is superseded ends only what was
   running on it; the other agents' work carries on.
@@ -125,6 +138,10 @@ main-host. This document is the canonical statement of how the pieces fit; the c
   elevation. Because a failure on 하스's box may be exactly that the hub is unreachable, the record
   of what the agent did has to be readable there without the hub; the log rotates by size and keeps
   a fixed number of old files so it cannot fill the disk.
+- The installed agent's instance, which its hello carries, is the file `instance` in its data
+  directory: made once, by the first run that finds none, and read by every run after, the uninstaller's
+  leave notice among them, so the notice is refused while another install holds the name. A data
+  directory that cannot be written leaves the agent an id for this run alone.
 
 ## Configuration and secrets
 

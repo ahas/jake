@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
-use jake_protocol::{Frame, SUPERSEDED_REASON, decode_frame};
+use jake_protocol::{Frame, NAME_HELD_REASON, SUPERSEDED_REASON, decode_frame};
 use serde_json::{Number, json};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -44,6 +44,8 @@ pub struct Agent {
   pub config: AgentConfig,
   pub version: String,
   pub log: Log,
+  // The install the agent runs from, named in its hello; none names no instance.
+  instance: Option<String>,
   when_superseded: WhenSuperseded,
   link: watch::Sender<Link>,
   carrying: watch::Sender<usize>,
@@ -62,12 +64,13 @@ pub enum Link {
   Unreachable(String),
 }
 
-/// What the agent does once the hub hands its name to a newer connection.
+/// What the agent does once the hub hands its name to a newer connection, or refuses it because another
+/// instance holds the name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhenSuperseded {
   /// Dial again, as an installed agent does after a half-dead connection was replaced.
   Redial,
-  /// Stop, leaving the name to the connection that took it.
+  /// Stop, leaving the name to the connection that holds it.
   GiveUp,
 }
 
@@ -78,7 +81,8 @@ pub enum Ended {
   Stopped,
   /// The hub sent a leave.
   Left,
-  /// The hub handed its name to a newer connection, and it was told to give the name up.
+  /// The hub handed its name to a newer connection, or refused it because another instance holds the name,
+  /// and it was told to give the name up.
   Superseded,
 }
 
@@ -105,6 +109,7 @@ impl Agent {
       config,
       version,
       log,
+      instance: None,
       when_superseded: WhenSuperseded::Redial,
       link: watch::Sender::new(Link::Connecting),
       carrying: watch::Sender::new(0),
@@ -115,6 +120,15 @@ impl Agent {
   pub fn when_superseded(self, when: WhenSuperseded) -> Self {
     Self {
       when_superseded: when,
+      ..self
+    }
+  }
+
+  /// The same agent, naming the install it runs from in its hello (docs/architecture.md, 「Many agents, one
+  /// hub」).
+  pub fn instance(self, instance: String) -> Self {
+    Self {
+      instance: Some(instance),
       ..self
     }
   }
@@ -142,6 +156,7 @@ impl Agent {
       agent: self.config.agent_name.clone(),
       agent_version: self.version.clone(),
       capabilities: self.capabilities(),
+      instance: self.instance.clone(),
     }
   }
 
@@ -182,7 +197,7 @@ impl Agent {
           if session.leave {
             return Ended::Left;
           }
-          if session.superseded && self.when_superseded == WhenSuperseded::GiveUp {
+          if (session.superseded || session.name_held) && self.when_superseded == WhenSuperseded::GiveUp {
             self.log.warn("name-given-up", json!({ "agent": self.config.agent_name }));
             return Ended::Superseded;
           }
@@ -278,6 +293,8 @@ struct Outcome {
   welcomed: bool,
   leave: bool,
   superseded: bool,
+  // The hub refused the hello because another instance holds the name.
+  name_held: bool,
 }
 
 struct Session<'a> {
@@ -294,6 +311,7 @@ struct Session<'a> {
   welcomed: bool,
   leave: bool,
   superseded: bool,
+  name_held: bool,
   last_inbound: Instant,
 }
 
@@ -323,6 +341,7 @@ impl<'a> Session<'a> {
       welcomed: false,
       leave: false,
       superseded: false,
+      name_held: false,
       last_inbound: Instant::now(),
     }
   }
@@ -380,6 +399,7 @@ impl<'a> Session<'a> {
       welcomed: self.welcomed,
       leave: self.leave,
       superseded: self.superseded,
+      name_held: self.name_held,
     }
   }
 
@@ -429,6 +449,7 @@ impl<'a> Session<'a> {
       }
       Frame::Reject { reason } => {
         log.warn("rejected", json!({ "reason": reason }));
+        self.name_held = reason == NAME_HELD_REASON;
         self.agent.link.send_replace(Link::Refused(reason.clone()));
         return Some(format!("hub rejected the connection: {reason}"));
       }

@@ -17,6 +17,10 @@ pub const PROTOCOL_VERSION: i64 = 1;
 /// that gives its name up rather than redial reads its connection's end by it.
 pub const SUPERSEDED_REASON: &str = "superseded by a new connection";
 
+/// The reason the hub refuses a hello with where another instance holds its name; the connection that holds
+/// the name stays, and an agent that gives its name up rather than redial reads its refusal by it.
+pub const NAME_HELD_REASON: &str = "name held by another agent";
+
 /// The decoded size of one file-transfer chunk, held far below either side's payload cap.
 pub const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 
@@ -128,6 +132,9 @@ pub enum Frame {
     agent: String,
     agent_version: String,
     capabilities: Vec<String>,
+    /// The install the agent runs from, which tells two installs of one name apart; none from an agent that
+    /// names none.
+    instance: Option<String>,
   },
   Welcome {
     hub_version: String,
@@ -275,8 +282,14 @@ impl Frame {
         agent,
         agent_version,
         capabilities,
+        instance,
       } => {
-        json!({ "agent": agent, "agentVersion": agent_version, "capabilities": capabilities })
+        let mut fields =
+          json!({ "agent": agent, "agentVersion": agent_version, "capabilities": capabilities });
+        if let Some(instance) = instance {
+          fields["instance"] = json!(instance);
+        }
+        fields
       }
       Self::Welcome { hub_version } => json!({ "hubVersion": hub_version }),
       Self::Reject { reason } => json!({ "reason": reason }),
@@ -482,10 +495,16 @@ pub fn decode_frame(raw: &str, max_payload_bytes: usize) -> Result<Frame, FrameE
         }
         _ => return bad("hello.capabilities must be a string array"),
       };
+      let instance = match o.get("instance") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(instance)) => Some(instance.clone()),
+        Some(_) => return bad("hello.instance must be a string"),
+      };
       Ok(Frame::Hello {
         agent,
         agent_version,
         capabilities,
+        instance,
       })
     }
     "welcome" => Ok(Frame::Welcome {
@@ -694,6 +713,24 @@ mod tests {
   fn extra_fields_are_dropped_and_a_whole_float_counts_as_an_integer() {
     let frame = decode_frame(r#"{"type":"cancel","v":1.0,"id":"c1","extra":true}"#, CAP).expect("valid");
     assert_eq!(frame.encode(), r#"{"type":"cancel","v":1,"id":"c1"}"#);
+  }
+
+  #[test]
+  fn a_hello_carries_its_instance_where_it_names_one() {
+    let named =
+      r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[],"instance":"i-1"}"#;
+    let frame = decode_frame(named, CAP).expect("valid");
+    assert!(matches!(&frame, Frame::Hello { instance: Some(instance), .. } if instance == "i-1"));
+    assert_eq!(frame.encode(), named);
+
+    let unnamed = r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[]}"#;
+    let frame = decode_frame(unnamed, CAP).expect("valid");
+    assert!(matches!(&frame, Frame::Hello { instance: None, .. }));
+    assert_eq!(frame.encode(), unnamed);
+
+    let wrong =
+      r#"{"type":"hello","v":1,"agent":"box","agentVersion":"0.1.0","capabilities":[],"instance":7}"#;
+    assert_eq!(code_of(wrong), "bad-field");
   }
 
   #[test]

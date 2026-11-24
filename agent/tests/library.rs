@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use jake_agent::{Agent, AgentConfig, Ended, Link, Log, WhenSuperseded};
-use jake_protocol::{Frame, SUPERSEDED_REASON, decode_frame};
+use jake_protocol::{Frame, NAME_HELD_REASON, SUPERSEDED_REASON, decode_frame};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
@@ -139,6 +139,64 @@ async fn an_agent_told_to_give_its_name_up_stops_once_superseded() {
 
   assert_eq!(timeout(BOUND, running).await.unwrap().unwrap(), Ended::Superseded);
   assert!(!hub.dialed_again().await, "an agent that gave its name up dials no more");
+}
+
+async fn refuse_as_held(socket: &mut WebSocketStream<TcpStream>) {
+  let frame = Frame::Reject {
+    reason: NAME_HELD_REASON.into(),
+  };
+  socket.send(Message::Text(frame.encode().into())).await.unwrap();
+  let close = CloseFrame {
+    code: CloseCode::from(4009),
+    reason: NAME_HELD_REASON.into(),
+  };
+  socket.close(Some(close)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hello_names_the_instance_the_caller_gave() {
+  let hub = StandInHub::start().await;
+  let agent = agent(&hub, "instance").instance("install-a".into());
+  let running = tokio::spawn(async move { jake_agent::run(&agent, std::future::pending()).await });
+
+  let (mut socket, _) = hub.accept().await;
+  let said = hello(&mut socket).await;
+  assert!(
+    matches!(&said, Frame::Hello { instance: Some(instance), .. } if instance == "install-a"),
+    "{said:?}"
+  );
+  running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_told_to_give_its_name_up_stops_once_refused_for_a_held_name() {
+  let hub = StandInHub::start().await;
+  let agent = agent(&hub, "held-give-up").when_superseded(WhenSuperseded::GiveUp);
+  let running = tokio::spawn(async move { jake_agent::run(&agent, std::future::pending()).await });
+
+  let (mut socket, _) = hub.accept().await;
+  hello(&mut socket).await;
+  refuse_as_held(&mut socket).await;
+
+  assert_eq!(timeout(BOUND, running).await.unwrap().unwrap(), Ended::Superseded);
+  assert!(!hub.dialed_again().await, "an agent that gave its name up dials no more");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installed_agent_refused_for_a_held_name_dials_again() {
+  let hub = StandInHub::start().await;
+  let agent = agent(&hub, "held-redial");
+  let mut link = agent.link();
+  let running = tokio::spawn(async move { jake_agent::run(&agent, std::future::pending()).await });
+
+  let (mut first, _) = hub.accept().await;
+  hello(&mut first).await;
+  refuse_as_held(&mut first).await;
+  link_becomes(&mut link, Link::Refused(NAME_HELD_REASON.into())).await;
+
+  let (mut second, _) = hub.accept().await;
+  assert!(matches!(hello(&mut second).await, Frame::Hello { .. }));
+  running.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

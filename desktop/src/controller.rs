@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use jake_agent::installed::Installed;
 use jake_agent::{Agent, AgentConfig, Ended, Link, Log, WhenSuperseded};
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
@@ -35,6 +36,8 @@ pub struct Controller<W: Window> {
   pub retries: mpsc::Receiver<()>,
   /// How much work the built-in agent carries for the hub, 0 while none runs.
   pub carrying: watch::Sender<usize>,
+  /// The app's own instance, which the built-in agent's hello names (docs/desktop.md, 「Pairing」).
+  pub instance: String,
 }
 
 /// How long a quit waits for the built-in agent to close its connection.
@@ -99,10 +102,11 @@ impl<W: Window> Controller<W> {
 
   /// The machine's agent served until `stop`, or the state it was held off in; none once stopped.
   async fn held_or_serve(&self, machine: &Machine, stop: watch::Receiver<bool>) -> Option<AgentState> {
-    let installed = tokio::task::spawn_blocking(jake_agent::installed::running_agent_name)
+    let installed = tokio::task::spawn_blocking(jake_agent::installed::installed_agent)
       .await
       .ok()
-      .flatten();
+      .flatten()
+      .map(|installed| installed.name);
     if installed.as_deref() == Some(machine.node.as_str()) {
       self.log.info("built-in-agent-held-off", json!({ "agent": machine.node }));
       return Some(AgentState::HeldOff(machine.node.clone()));
@@ -183,8 +187,9 @@ impl<W: Window> Controller<W> {
       status.send_modify(|status| status.agent = AgentState::Link(Link::Connecting));
       let config =
         AgentConfig::new(machine.hub_url.clone(), machine.credential.clone(), machine.node.clone());
-      let agent =
-        Agent::new(config, AGENT_VERSION.to_owned(), log.clone()).when_superseded(WhenSuperseded::GiveUp);
+      let agent = Agent::new(config, AGENT_VERSION.to_owned(), log.clone())
+        .instance(self.instance.clone())
+        .when_superseded(WhenSuperseded::GiveUp);
       let mut link = agent.link();
       let mut carried = agent.carrying();
       let carrying = carrying.clone();
@@ -232,6 +237,44 @@ impl<W: Window> Controller<W> {
   }
 }
 
+/// Switch from the installed agent the course is held off for to the built-in one: the installed agent of that
+/// name, found by `find`, is stopped through its own uninstaller, `uninstall`, and the course looks again, which then
+/// starts the built-in agent. An uninstaller that fails leaves the installed agent serving, and the page says why. Asked
+/// in any other state, it does nothing.
+pub async fn switch_to_built_in<F, U>(
+  status: &watch::Sender<Status>,
+  retries: &mpsc::Sender<()>,
+  log: &Log,
+  find: F,
+  uninstall: U,
+) where
+  F: FnOnce() -> Option<Installed> + Send + 'static,
+  U: FnOnce(&Installed) -> Result<(), String> + Send + 'static,
+{
+  let name = match &status.borrow().agent {
+    AgentState::HeldOff(name) | AgentState::SwitchFailed { name, .. } => name.clone(),
+    _ => return,
+  };
+  status.send_modify(|status| status.agent = AgentState::Switching);
+  let wanted = name.clone();
+  let outcome = tokio::task::spawn_blocking(move || match find() {
+    Some(installed) if installed.name == wanted => uninstall(&installed),
+    _ => Ok(()),
+  })
+  .await
+  .unwrap_or_else(|error| Err(error.to_string()));
+  match outcome {
+    Ok(()) => {
+      log.info("installed-agent-uninstalled", json!({ "agent": name }));
+      let _ = retries.try_send(());
+    }
+    Err(reason) => {
+      log.warn("installed-agent-not-uninstalled", json!({ "agent": name, "reason": reason }));
+      status.send_modify(|status| status.agent = AgentState::SwitchFailed { name, reason });
+    }
+  }
+}
+
 /// Show the console if it answers, the bundled page with the reason if it does not; while a pairing
 /// is open, the console's page is its approval page.
 pub async fn show_console<W: Window>(
@@ -261,4 +304,113 @@ pub async fn show_console<W: Window>(
 /// Resolves once the app quits, holding no borrow of the watch past that moment.
 async fn quitting(quit: &mut watch::Receiver<bool>) {
   let _ = quit.wait_for(|quit| *quit).await;
+}
+
+#[cfg(test)]
+mod tests {
+  use std::path::PathBuf;
+  use std::sync::Mutex;
+
+  use super::*;
+
+  fn log() -> Log {
+    Log::open(std::env::temp_dir().join(format!("jake-desktop-switch-{}.log", std::process::id())))
+  }
+
+  fn held(name: &str) -> watch::Sender<Status> {
+    watch::Sender::new(Status {
+      console: ConsoleState::Shown,
+      agent: AgentState::HeldOff(name.to_owned()),
+    })
+  }
+
+  fn installed(name: &str) -> Option<Installed> {
+    Some(Installed {
+      name: name.to_owned(),
+      dir: PathBuf::from("/install"),
+    })
+  }
+
+  #[tokio::test]
+  async fn the_installed_agent_is_uninstalled_and_the_course_looks_again() {
+    let status = held("agent-a");
+    let (retries, mut retried) = mpsc::channel(1);
+    let uninstalled = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = uninstalled.clone();
+    switch_to_built_in(
+      &status,
+      &retries,
+      &log(),
+      || installed("agent-a"),
+      move |found: &Installed| {
+        seen.lock().unwrap().push(found.name.clone());
+        Ok(())
+      },
+    )
+    .await;
+
+    assert_eq!(*uninstalled.lock().unwrap(), ["agent-a"]);
+    assert_eq!(retried.try_recv(), Ok(()));
+    assert_eq!(status.borrow().agent, AgentState::Switching);
+  }
+
+  #[tokio::test]
+  async fn an_uninstaller_that_fails_leaves_the_installed_agent_serving_and_says_why() {
+    let status = held("agent-a");
+    let (retries, mut retried) = mpsc::channel(1);
+    switch_to_built_in(
+      &status,
+      &retries,
+      &log(),
+      || installed("agent-a"),
+      |_: &Installed| Err("exit 1".to_owned()),
+    )
+    .await;
+
+    assert!(retried.try_recv().is_err());
+    assert_eq!(
+      status.borrow().agent,
+      AgentState::SwitchFailed {
+        name: "agent-a".to_owned(),
+        reason: "exit 1".to_owned()
+      }
+    );
+  }
+
+  #[tokio::test]
+  async fn an_install_of_another_name_or_none_is_left_alone_and_the_course_looks_again() {
+    for found in [installed("agent-b"), None] {
+      let status = held("agent-a");
+      let (retries, mut retried) = mpsc::channel(1);
+      switch_to_built_in(
+        &status,
+        &retries,
+        &log(),
+        move || found,
+        |_: &Installed| panic!("nothing is uninstalled"),
+      )
+      .await;
+      assert_eq!(retried.try_recv(), Ok(()));
+    }
+  }
+
+  #[tokio::test]
+  async fn a_switch_asked_in_any_other_state_does_nothing() {
+    let status = watch::Sender::new(Status {
+      console: ConsoleState::Shown,
+      agent: AgentState::Link(Link::Attached),
+    });
+    let (retries, mut retried) = mpsc::channel(1);
+    switch_to_built_in(
+      &status,
+      &retries,
+      &log(),
+      || panic!("nothing is looked for"),
+      |_: &Installed| Ok(()),
+    )
+    .await;
+
+    assert!(retried.try_recv().is_err());
+    assert_eq!(status.borrow().agent, AgentState::Link(Link::Attached));
+  }
 }

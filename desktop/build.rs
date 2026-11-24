@@ -21,7 +21,15 @@ fn main() {
     )
   } else {
     (
-      &["status", "console", "retry", "settings", "change_setting", "set_console"],
+      &[
+        "status",
+        "console",
+        "retry",
+        "switch_agent",
+        "settings",
+        "change_setting",
+        "set_console",
+      ],
       "./capabilities/*.json",
     )
   };

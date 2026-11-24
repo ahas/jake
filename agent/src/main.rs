@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use jake_agent::pair::{self, GUARD_MODE_FLAG, Watchdog};
 use jake_agent::platform::{self, Platform, Role};
 use jake_agent::wsl::{self, HOLD_WSL_FLAG};
-use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure};
+use jake_agent::{Agent, Ended, LeaveNotice, Log, VERSION, config, departure, instance};
 use serde_json::json;
 
 /// The argument that has the executable tell the hub it was uninstalled, and exit.
@@ -72,6 +72,19 @@ fn start() -> Result<Start, String> {
     config,
     log,
   })
+}
+
+impl Start {
+  /// The install's instance, kept in its data directory, so the leave notice says hello as the agent does
+  /// (docs/architecture.md, 「The agent's connection」).
+  fn instance(&self) -> String {
+    let path = PathBuf::from(Platform::HOST.join(&Platform::HOST.data_dir(&self.env), &["instance"]));
+    let (id, unkept) = instance::kept_at(&path);
+    if let Some(reason) = unkept {
+      self.log.warn("instance-not-kept", json!({ "reason": reason }));
+    }
+    id
+  }
 }
 
 /// Resolves when the process is asked to stop, by an interrupt or a termination signal.
@@ -150,7 +163,7 @@ async fn run_agent(start: Start) -> ExitCode {
     "agent-starting",
     json!({ "hubUrl": start.config.hub_url, "agent": start.config.agent_name, "version": VERSION }),
   );
-  let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone());
+  let agent = Agent::new(start.config.clone(), VERSION.to_owned(), log.clone()).instance(start.instance());
   // The tunnel ends only on a hub's leave; by then every run and transfer it carried has ended.
   let leave = jake_agent::run(&agent, stop_requested(&log)).await == Ended::Left;
   // The watchdog stops before anything is torn down, so it neither rewrites an anchor nor revives the guard.
@@ -178,7 +191,8 @@ async fn run_guard(start: Start) -> ExitCode {
 }
 
 async fn run_leave(start: Start) -> ExitCode {
-  let agent = Agent::new(start.config, VERSION.to_owned(), start.log);
+  let instance = start.instance();
+  let agent = Agent::new(start.config, VERSION.to_owned(), start.log).instance(instance);
   match agent.announce_leave().await {
     Ok(LeaveNotice::Sent) => {
       println!("the hub was told {} has left", agent.config.agent_name);

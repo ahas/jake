@@ -46,6 +46,7 @@ function render(view) {
   retry.hidden = !view.action;
   retry.textContent = view.action ? ACTION_WORDS[view.action] : "";
   retry.className = view.action ? "primary" : "";
+  element("switch").hidden = !view.offersSwitch;
   element("console").textContent = view.consoleDetail ? "다시 시도" : "콘솔 열기";
   element("console").className = view.action ? "" : "primary";
 }
@@ -75,6 +76,7 @@ function wire(id, command) {
 
 wire("console", "console");
 wire("retry", "retry");
+wire("switch", "switch_agent");
 wire("server-cancel", "console");
 
 // The server's address: the app reads it, asks whether it is a BMO console and writes it, then starts

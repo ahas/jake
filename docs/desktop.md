@@ -47,11 +47,13 @@ the all-in-one app, which installs and runs the whole BMO set on the person's ow
 - **The agent crate is a library as well as the `jake` executable.** The executable reads `agent.env`
   and runs as it always has; the library entry is what the app calls.
 - **The entry takes its configuration in memory:** the hub URL, the agent's name and its credential,
-  with every other setting at the default an empty `agent.env` would give. It reads no file and no
-  environment variable.
+  with every other setting at the default an empty `agent.env` would give, and the instance its hello
+  carries where the caller names one (docs/architecture.md, 「Many agents, one hub」). It reads no file
+  and no environment variable.
 - **It runs on the caller's runtime** and ends when the caller's stop signal resolves, when the hub
   sends a leave, or, where the caller asked for it, when the hub hands the agent's name to another
-  connection. Its answer says which of the three ended it.
+  connection or refuses it because another instance holds the name. Its answer says which of the three
+  ended it.
 - **It reports its link as it goes:** connecting, attached, refused by the hub, or unable to reach it,
   through a watch the caller reads.
 - **It reports how much work it carries for the hub:** the commands still running, the transfers under way and
@@ -146,6 +148,9 @@ flowchart TD
   the account service reads it to list the machine's kind as desktop, and it is what tells the
   built-in agent from an installed one, whose version names its build. The hub orders no update onto
   such a version (docs/install.md), since the app brings its agent along with its own updates.
+- **Its hello names the app's own instance,** an id the app makes once and keeps in `agent-instance` in
+  its config directory beside `settings.json`, so the hub tells it from an installed agent of the same
+  name (「One agent per name」). Where the file cannot be written the app makes an id for this run alone.
 - **A pairing that fails is offered again,** by a button on the local page; the app never asks the
   console for pairings in a loop of its own.
 
@@ -172,33 +177,45 @@ flowchart TD
   stops the agent and offers pairing again, since the hub has removed this machine.
 - **The state is shown** in the tray icon's tooltip and on the local page: starting, pairing, pairing
   failed, no credential store, connecting, attached, refused by the hub, hub unreachable, restarting
-  after a fault, paused while the PC is locked, held off for an installed agent, given up to another
-  agent of its name, and removed by the hub.
+  after a fault, paused while the PC is locked, using the installed agent, switching to the built-in
+  agent, given up to another agent of its name, and removed by the hub.
 - **With no server named** the tooltip and the local page read as connecting to a BMO server, and the
   local page asks for its address (「The server」).
 - **A state that waits on the person shows the local page in the main window,** in place of the
-  console: a pairing that failed, no credential store, the name given up to another agent, and the
-  machine removed by the hub. Each stops the app's course until the person asks it to go on, and the
-  local page is where that ask is made, beside the way back to the console. A state that needs nothing
-  of the person, held off for an installed agent among them, leaves the console where it is.
+  console: a pairing that failed, no credential store, the installed agent in use, the name given up to
+  another agent, and the machine removed by the hub. Each stops the app's course until the person asks
+  it to go on, and the local page is where that ask is made, beside the way back to the console. A
+  state that needs nothing of the person leaves the console where it is.
 
 ## One agent per name
 
-The hub keeps one connection per name, and a newer hello replaces the older (docs/architecture.md,
-「Many agents, one hub」). Two agents of one name that both redialled would replace each other without
-end, so the built-in agent gives way, twice over.
+A person's machine is served by one agent at a time: the desktop app's built-in agent or an installed
+jake agent of its name, never both attached at once. The hub keeps one connection per name and refuses a
+second install of a held name (docs/architecture.md, 「Many agents, one hub」); the app keeps out of the
+way of an installed agent before the hub has to.
 
-- **It does not start beside an installed agent of its name.** Before the agent starts, the app looks
-  for an installed jake agent running on the machine: on Windows by the agent's single-instance lock in
-  its data directory, held by a live process; on Linux by the main process of the `jake-agent` user
-  unit. The running executable's own folder holds the `agent.env` that names it. Where that name is the
-  built-in agent's, the built-in agent stays off and the app says an installed agent already serves
-  this machine, offering to keep using it, with a button that looks again.
-- **It yields to any agent that takes its name.** When the hub closes the built-in agent's connection
-  as superseded by a new one, the built-in agent stops instead of redialling, and the app reads as held
-  off for another agent of its name. An installed agent the first check cannot see, one inside a WSL
-  distribution of the same machine, therefore wins after a single replacement, and the two never loop.
-- **The installed agent is unchanged:** it redials when superseded, as it always has.
+- **It does not start beside an installed agent of its name.** Before the built-in agent starts, the app
+  looks for a jake agent installed on the machine, running or not: the running one first — on Windows by
+  the agent's or the guard's single-instance lock in its data directory, held by a live process; on Linux
+  by the main process of the `jake-agent` user unit — whose executable's own folder holds the
+  `agent.env` that names it; and otherwise the default install, an executable with its `agent.env` in
+  the install folder (`%LOCALAPPDATA%\Programs\jake` on Windows), or on Linux in the data directory
+  (`~/.local/share/jake`) with the `jake-agent` user unit registered. Where that name is the built-in
+  agent's, the built-in agent stays off and the local page says the installed jake agent serves this
+  machine, with 콘솔 열기, 다시 확인 and 내장 에이전트로 전환.
+- **Switching stops the installed agent through its own uninstaller.** 내장 에이전트로 전환 runs the
+  uninstaller the install left beside it — `uninstall.sh` on Linux, `uninstall.ps1` on Windows — with no
+  option, which stops and unregisters the installed agent, tells the hub it left, and removes its
+  executable while keeping its `agent.env` and its log (docs/install.md, 「Uninstall」); the app deletes
+  nothing itself. Once the uninstaller has ended, the app looks again and starts the built-in agent; an
+  uninstaller that is missing or fails leaves the installed agent serving, and the local page says why.
+- **It yields to any agent that holds its name.** When the hub closes the built-in agent's connection
+  as superseded by a new one, or refuses its hello because another instance holds the name, the
+  built-in agent stops instead of redialling, and the local page says another agent of its name holds
+  it. An installed agent the first look cannot see, one inside a WSL distribution of the same machine,
+  therefore keeps the name or wins it after a single replacement, and the two never loop.
+- **The installed agent is unchanged:** it redials when superseded or refused, as it always has, and
+  takes the name once the built-in agent has let it go.
 
 ## Settings
 

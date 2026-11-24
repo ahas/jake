@@ -34,9 +34,13 @@ Connection handshake:
 - **hello** — agent to hub, first on a fresh connection: the agent's identity, its version, and its
   capabilities: `exec:<shell>` for each shell this build can run, `transfer`, and `stream:<port>`
   for each local port the agent lets a byte stream reach. The shell names are just names; the
-  protocol does not know what they mean.
+  protocol does not know what they mean. It may carry `instance`, the id of the install the agent
+  runs from, which the hub tells two installs of one name apart by (docs/architecture.md, 「Many
+  agents, one hub」); a hello without it is from an agent that names none.
 - **welcome** — hub to agent, accepting the hello and naming the hub's version.
-- **reject** — hub to agent, refusing the hello with a stated reason.
+- **reject** — hub to agent, refusing the hello with a stated reason. A hello under a name another
+  instance holds is refused with the reason `name held by another agent`, and the socket is then
+  closed.
 
 Command execution (streaming):
 

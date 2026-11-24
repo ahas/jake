@@ -34,8 +34,15 @@ pub enum AgentState {
   Restarting(Duration),
   /// The session is locked and control is not kept while it is, so the agent waits for the unlock.
   Paused,
-  /// An installed agent of this name runs on the machine, so the built-in one stays off.
+  /// An installed agent of this name is on the machine, so the built-in one stays off.
   HeldOff(String),
+  /// The installed agent's uninstaller runs, after which the built-in agent starts.
+  Switching,
+  /// The installed agent's uninstaller could not stop it, for the reason given, so it serves on.
+  SwitchFailed {
+    name: String,
+    reason: String,
+  },
   /// Another connection took this name at the hub, so the built-in agent gave it up.
   Yielded(String),
   /// The hub sent a leave: the machine was removed and its credential forgotten.
@@ -99,6 +106,8 @@ pub struct View {
   pub tone: Tone,
   pub code: Option<String>,
   pub action: Option<Action>,
+  /// Whether the page offers to stop the installed agent and start the built-in one in its place.
+  pub offers_switch: bool,
   pub console_shown: bool,
   pub console_detail: Option<String>,
   /// Whether the page asks for the server's address, which it does while the app names none.
@@ -123,6 +132,7 @@ impl Status {
         _ => None,
       },
       action,
+      offers_switch: self.agent.offers_switch(),
       console_shown,
       console_detail,
       asks_server: self.agent == AgentState::NoServer,
@@ -145,10 +155,22 @@ impl Status {
 }
 
 impl AgentState {
-  /// Whether the course stopped here for the person to act, which the local page is where they do:
-  /// a state that needs nothing of them, an installed agent serving among them, is not one.
+  /// Whether the course stopped here for the person to act, which the local page is where they do.
   pub fn waits_on_person(&self) -> bool {
-    matches!(self, Self::NoStore(_) | Self::PairingFailed(_) | Self::Yielded(_) | Self::Removed)
+    matches!(
+      self,
+      Self::NoStore(_)
+        | Self::PairingFailed(_)
+        | Self::HeldOff(_)
+        | Self::SwitchFailed { .. }
+        | Self::Yielded(_)
+        | Self::Removed
+    )
+  }
+
+  /// Whether the page offers to switch from the installed agent to the built-in one.
+  pub fn offers_switch(&self) -> bool {
+    matches!(self, Self::HeldOff(_) | Self::SwitchFailed { .. })
   }
 
   fn words(&self) -> (String, Vec<String>, Tone, Option<Action>) {
@@ -214,12 +236,25 @@ impl AgentState {
         None,
       ),
       Self::HeldOff(name) => (
-        "설치된 에이전트를 사용합니다".into(),
+        "설치된 jake를 사용합니다".into(),
         vec![
-          format!("이 기기에서 같은 이름({name})의 jake 에이전트가 실행 중입니다."),
-          "내장 에이전트는 꺼 두었습니다.".into(),
+          format!("이 PC에 같은 기기 이름({name})의 jake 에이전트가 설치되어 있어 내장 에이전트는 켜지 않았습니다."),
+          "내장 에이전트로 전환하면 설치된 jake를 중지하고 제거합니다. 설정 파일(agent.env)과 로그는 남습니다."
+            .into(),
         ],
         Tone::Good,
+        Some(Action::LookAgain),
+      ),
+      Self::Switching => (
+        "내장 에이전트로 전환하는 중".into(),
+        line("설치된 jake를 중지하고 제거하는 중입니다."),
+        Tone::Working,
+        None,
+      ),
+      Self::SwitchFailed { name, reason } => (
+        "내장 에이전트로 전환하지 못했습니다".into(),
+        vec![format!("설치된 jake 에이전트({name})를 계속 사용합니다."), reason.clone()],
+        Tone::Attention,
         Some(Action::LookAgain),
       ),
       Self::Yielded(name) => (
@@ -274,6 +309,11 @@ mod tests {
     let waiting = [
       AgentState::NoStore("none".to_owned()),
       AgentState::PairingFailed(PairingFailure::Gone),
+      AgentState::HeldOff("agent-a".to_owned()),
+      AgentState::SwitchFailed {
+        name: "agent-a".to_owned(),
+        reason: "failed".to_owned(),
+      },
       AgentState::Yielded("agent-a".to_owned()),
       AgentState::Removed,
     ];
@@ -282,7 +322,7 @@ mod tests {
       AgentState::NoServer,
       AgentState::Link(Link::Attached),
       AgentState::Paused,
-      AgentState::HeldOff("agent-a".to_owned()),
+      AgentState::Switching,
     ];
 
     for state in waiting {
@@ -291,6 +331,32 @@ mod tests {
     }
     for state in going {
       assert!(!state.waits_on_person(), "{state:?}");
+    }
+  }
+
+  #[test]
+  fn an_installed_agent_in_use_offers_the_switch_and_nothing_else_does() {
+    let held = AgentState::HeldOff("agent-a".to_owned());
+    let failed = AgentState::SwitchFailed {
+      name: "agent-a".to_owned(),
+      reason: "the uninstaller ended with 1".to_owned(),
+    };
+    for state in [&held, &failed] {
+      let view = Status {
+        console: ConsoleState::Shown,
+        agent: state.clone(),
+      }
+      .view();
+      assert!(view.offers_switch, "{state:?}");
+      assert_eq!(view.action, Some(Action::LookAgain), "{state:?}");
+    }
+    assert!(failed.words().1.iter().any(|line| line.contains("ended with 1")));
+    for state in [
+      AgentState::Switching,
+      AgentState::Link(Link::Attached),
+      AgentState::Yielded("agent-a".to_owned()),
+    ] {
+      assert!(!state.offers_switch(), "{state:?}");
     }
   }
 }

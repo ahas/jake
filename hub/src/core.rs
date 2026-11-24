@@ -18,8 +18,8 @@ use tokio::time::{Instant, interval_at};
 use crate::credential::{self, Reach};
 use crate::link::{Link, SendOutcome};
 use crate::protocol::{
-  Checksum, Direction, EncodedBytes, Frame, ReceiveWindow, STREAM_CHUNK_BYTES, SUPERSEDED_REASON,
-  SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
+  Checksum, Direction, EncodedBytes, Frame, NAME_HELD_REASON, ReceiveWindow, STREAM_CHUNK_BYTES,
+  SUPERSEDED_REASON, SendWindow, TRANSFER_CHUNK_BYTES, decode_bytes, decode_frame,
 };
 use crate::timed_names::TimedNames;
 use crate::update::{self, AgentBuild};
@@ -34,6 +34,8 @@ const TAIL_BACKLOG: usize = 1024;
 const CLOSE_HUB_INITIATED: u16 = 4000;
 /// The close code of a socket whose hello named another name than its credential was made for.
 const CLOSE_OTHER_NAME: u16 = 4003;
+/// The close code of a socket whose hello named a name another agent instance holds.
+const CLOSE_NAME_HELD: u16 = 4009;
 /// The reason a revoked name's departure is logged and its socket closed with.
 const REVOKED_REASON: &str = "its name is revoked";
 /// How much of an update order's output the hub's log keeps.
@@ -184,6 +186,8 @@ pub struct TrafficEntry {
 // One attached agent and everything that lives and dies with its connection.
 struct Agent {
   link: Link,
+  // The install the agent said hello from, where it named one.
+  instance: Option<String>,
   agent_version: String,
   capabilities: Vec<String>,
   connected_at: i64,
@@ -335,10 +339,37 @@ impl State {
       .is_some_and(|agent| agent.link.socket_id == socket_id && agent.transfers.contains_key(id))
   }
 
+  // Whether another agent instance holds `name` on another socket: both name their instances and the two
+  // differ. An agent that names none is taken for the same install, as every agent was before instances.
+  fn held_by_another(&self, name: &str, socket_id: u64, instance: Option<&str>) -> bool {
+    self.agents.get(name).is_some_and(|held| {
+      held.link.socket_id != socket_id
+        && matches!((held.instance.as_deref(), instance), (Some(held), Some(new)) if held != new)
+    })
+  }
+
+  // A hello under a name another instance holds attaches nothing: the reject goes out in the welcome's place,
+  // ahead of the socket's close, and the connection holding the name stays as it is.
+  fn refuse_held(&mut self, link: &Link, name: &str, summary: Value) {
+    self.record(Some(name), "in", "hello", summary);
+    // Whatever name the socket held goes with the socket rather than staying attached to a closed link.
+    if let Some(previous) = self.by_socket.get(&link.socket_id).cloned() {
+      self.detach(&previous, "the connection said hello under a name another agent holds", false);
+    }
+    let reject = Frame::Reject {
+      reason: NAME_HELD_REASON.into(),
+    };
+    link.send(reject.encode());
+    self.record(Some(name), "out", reject.kind(), reject.summary());
+    link.close(CLOSE_NAME_HELD, NAME_HELD_REASON);
+    eprintln!("jake hub: a hello under {name} was refused: {NAME_HELD_REASON}");
+  }
+
   fn attach(
     &mut self,
     link: &Link,
     name: String,
+    instance: Option<String>,
     agent_version: String,
     capabilities: Vec<String>,
     summary: Value,
@@ -363,6 +394,7 @@ impl State {
     let now = now_ms();
     let agent = Agent {
       link: link.clone(),
+      instance,
       agent_version,
       capabilities,
       connected_at: now,
@@ -769,6 +801,7 @@ impl Hub {
       agent,
       agent_version,
       capabilities,
+      instance,
     } = &frame
     {
       if let Some(only) = &link.only
@@ -788,7 +821,18 @@ impl Hub {
         state.answer_revoked(link, agent, summary);
         return;
       }
-      state.attach(link, agent.clone(), agent_version.clone(), capabilities.clone(), summary);
+      if state.held_by_another(agent, link.socket_id, instance.as_deref()) {
+        state.refuse_held(link, agent, summary);
+        return;
+      }
+      state.attach(
+        link,
+        agent.clone(),
+        instance.clone(),
+        agent_version.clone(),
+        capabilities.clone(),
+        summary,
+      );
       let probe = self.probe(agent.clone(), link.socket_id);
       if let Some(attached) = state.agents.get_mut(agent) {
         attached.probe = Some(probe);
@@ -1600,6 +1644,66 @@ mod tests {
     );
     assert!(matches!(other_queue.try_recv(), Ok(Outbound::Close(4003, _))));
     assert!(!attached_names(&hub).contains(&"hass".to_owned()));
+  }
+
+  fn hello_from(instance: Option<&str>) -> String {
+    let instance = instance.map_or(String::new(), |instance| format!(r#","instance":"{instance}""#));
+    format!(r#"{{"type":"hello","v":1,"agent":"u7","agentVersion":"0.1.0","capabilities":[]{instance}}}"#)
+  }
+
+  fn closed_with(queue: &mut mpsc::UnboundedReceiver<Outbound>) -> Option<u16> {
+    std::iter::from_fn(|| queue.try_recv().ok()).find_map(|outbound| match outbound {
+      Outbound::Close(code, _) => Some(code),
+      Outbound::Text(_) => None,
+    })
+  }
+
+  #[tokio::test]
+  async fn a_hello_from_another_instance_of_a_held_name_is_refused_and_the_first_stays() {
+    let hub = hub(CAP);
+    let (first, mut first_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&first, &hello_from(Some("installed")));
+    assert_eq!(attached_names(&hub), ["u7"]);
+    while first_queue.try_recv().is_ok() {}
+
+    let (second, mut second_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+    hub.on_message(&second, &hello_from(Some("desktop")));
+    // The reject goes out first, then the close; nothing else.
+    let answers: Vec<Outbound> = std::iter::from_fn(|| second_queue.try_recv().ok()).collect();
+    match answers.as_slice() {
+      [Outbound::Text(text), Outbound::Close(code, _)] => {
+        let frame = decode_frame(text, CAP).expect("a valid frame");
+        assert!(matches!(frame, Frame::Reject { ref reason } if reason == NAME_HELD_REASON), "{frame:?}");
+        assert_eq!(*code, CLOSE_NAME_HELD);
+      }
+      _ => panic!("{} answers, not a reject and a close", answers.len()),
+    }
+    assert_eq!(closed_with(&mut first_queue), None);
+    let state = hub.lock();
+    assert_eq!(state.agents["u7"].link.socket_id, first.socket_id);
+    assert_eq!(state.agents["u7"].instance.as_deref(), Some("installed"));
+    assert!(!state.by_socket.contains_key(&second.socket_id));
+  }
+
+  #[tokio::test]
+  async fn a_hello_from_the_same_instance_or_one_naming_none_replaces_the_held_connection() {
+    for (held, next) in [
+      (Some("installed"), Some("installed")),
+      (Some("installed"), None),
+      (None, Some("desktop")),
+    ] {
+      let hub = hub(CAP);
+      let (first, mut first_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+      hub.on_message(&first, &hello_from(held));
+      while first_queue.try_recv().is_ok() {}
+
+      let (second, mut second_queue) = Link::new(hub.next_socket_id(), hub.socket_backlog_bytes());
+      hub.on_message(&second, &hello_from(next));
+      assert_eq!(kinds(&queued(&mut second_queue)), ["welcome"], "{held:?} then {next:?}");
+      assert_eq!(closed_with(&mut second_queue), None, "{held:?} then {next:?}");
+      assert_eq!(closed_with(&mut first_queue), Some(CLOSE_HUB_INITIATED), "{held:?} then {next:?}");
+      assert_eq!(hub.lock().agents["u7"].link.socket_id, second.socket_id);
+    }
   }
 
   #[tokio::test]

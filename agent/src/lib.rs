@@ -7,6 +7,7 @@ pub mod console;
 pub mod departure;
 mod exec;
 pub mod installed;
+pub mod instance;
 pub mod log;
 pub mod pair;
 pub mod platform;

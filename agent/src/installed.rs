@@ -1,21 +1,135 @@
-// The installed agent running on this machine, found by the footprint its install leaves.
+// The installed agent on this machine, running or not, found by the footprint its install leaves, and the
+// uninstaller it left beside itself (docs/desktop.md, 「One agent per name」).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config;
+use crate::platform::Platform;
 #[cfg(windows)]
-use crate::platform::{Platform, Role};
+use crate::platform::Role;
 
-/// The name of the installed jake agent running on this machine, if one runs.
-pub fn running_agent_name() -> Option<String> {
-  name_of_running(running_agent_pid(), executable_dir)
+/// An installed jake agent: the name its `agent.env` gives and the folder it is installed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installed {
+  pub name: String,
+  pub dir: PathBuf,
 }
 
-/// The name in the `agent.env` beside the executable of the running process, if any.
-fn name_of_running(pid: Option<u32>, executable_dir: impl Fn(u32) -> Option<PathBuf>) -> Option<String> {
-  let dir = executable_dir(pid?)?;
-  name_beside(&dir)
+/// The default install's folder, and whether an install is registered there.
+struct DefaultInstall {
+  dir: PathBuf,
+  registered: bool,
+}
+
+/// The installed jake agent on this machine, if one is installed: the running one first, else the default
+/// install where it is registered.
+pub fn installed_agent() -> Option<Installed> {
+  let env: HashMap<String, String> = std::env::vars().collect();
+  found(running_agent_pid().and_then(executable_dir), default_install(&env))
+}
+
+fn found(running: Option<PathBuf>, default: Option<DefaultInstall>) -> Option<Installed> {
+  running
+    .and_then(named)
+    .or_else(|| default.filter(|install| install.registered).and_then(|install| named(install.dir)))
+}
+
+fn named(dir: PathBuf) -> Option<Installed> {
+  name_beside(&dir).map(|name| Installed { name, dir })
+}
+
+/// The program and arguments that run an install's own uninstaller, which keeps its `agent.env` and its log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uninstaller {
+  pub script: PathBuf,
+  pub program: String,
+  pub arguments: Vec<String>,
+}
+
+impl Installed {
+  /// The uninstaller the install left in its folder, for this machine's platform.
+  pub fn uninstaller(&self) -> Uninstaller {
+    uninstaller_for(Platform::HOST, &self.dir)
+  }
+
+  /// Stop and unregister the installed agent through its own uninstaller, waiting for it to end. Nothing is
+  /// deleted here: the uninstaller removes what the install placed and keeps the config and the log.
+  pub fn uninstall(&self) -> Result<(), String> {
+    let uninstaller = self.uninstaller();
+    if !uninstaller.script.is_file() {
+      return Err(format!("{} is missing", uninstaller.script.display()));
+    }
+    let mut command = std::process::Command::new(&uninstaller.program);
+    command.args(&uninstaller.arguments).stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+      use std::os::windows::process::CommandExt as _;
+      // The app is a window, so the uninstaller opens no console of its own.
+      const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+      command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().map_err(|error| format!("{}: {error}", uninstaller.program))?;
+    if output.status.success() {
+      return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(if said.is_empty() {
+      format!("the uninstaller ended with {}", output.status)
+    } else {
+      said
+    })
+  }
+}
+
+fn uninstaller_for(platform: Platform, dir: &Path) -> Uninstaller {
+  let folder = dir.to_string_lossy();
+  match platform {
+    Platform::Linux => {
+      let script = platform.join(&folder, &["uninstall.sh"]);
+      Uninstaller {
+        script: PathBuf::from(&script),
+        program: "bash".to_owned(),
+        arguments: vec![script],
+      }
+    }
+    Platform::Windows => {
+      let script = platform.join(&folder, &["uninstall.ps1"]);
+      let arguments = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &script,
+        "-InstallDir",
+        &folder,
+      ];
+      Uninstaller {
+        script: PathBuf::from(&script),
+        program: "powershell.exe".to_owned(),
+        arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
+      }
+    }
+  }
+}
+
+/// The default install on Linux: the executable in the data directory, registered by its user unit.
+#[cfg(unix)]
+fn default_install(env: &HashMap<String, String>) -> Option<DefaultInstall> {
+  let dir = PathBuf::from(Platform::Linux.data_dir(env));
+  let registered =
+    dir.join("jake").is_file() && Path::new(&crate::platform::systemd_unit_path(env)).is_file();
+  Some(DefaultInstall { dir, registered })
+}
+
+/// The default install on Windows: the executable in the per-user programs folder.
+#[cfg(windows)]
+fn default_install(env: &HashMap<String, String>) -> Option<DefaultInstall> {
+  let local = env.get("LOCALAPPDATA").filter(|local| !local.is_empty())?;
+  let dir = PathBuf::from(Platform::Windows.join(local, &["Programs", "jake"]));
+  let registered = dir.join("jake.exe").is_file();
+  Some(DefaultInstall { dir, registered })
 }
 
 fn name_beside(dir: &Path) -> Option<String> {
@@ -69,20 +183,115 @@ fn executable_dir(pid: u32) -> Option<PathBuf> {
 mod tests {
   use super::*;
 
+  /// A folder holding an `agent.env` naming `name`, removed when dropped.
+  struct Folder(PathBuf);
+
+  impl Folder {
+    fn named(tag: &str, name: Option<&str>) -> Self {
+      let dir = std::env::temp_dir().join(format!("jake-installed-{tag}-{}", std::process::id()));
+      std::fs::create_dir_all(&dir).unwrap();
+      if let Some(name) = name {
+        std::fs::write(dir.join("agent.env"), format!("JAKE_HUB_URL=wss://hub\nJAKE_AGENT_NAME={name}\n"))
+          .unwrap();
+      }
+      Self(dir)
+    }
+  }
+
+  impl Drop for Folder {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir_all(&self.0);
+    }
+  }
+
+  fn installed(name: &str, folder: &Folder) -> Option<Installed> {
+    Some(Installed {
+      name: name.to_owned(),
+      dir: folder.0.clone(),
+    })
+  }
+
   #[test]
   fn the_running_agent_is_named_by_the_agent_env_beside_its_executable() {
-    let dir = std::env::temp_dir().join(format!("jake-installed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("agent.env"), "JAKE_HUB_URL=wss://hub\nJAKE_AGENT_NAME=box\n").unwrap();
-    let beside = |_| Some(dir.clone());
-    let named = name_of_running(Some(7), beside);
-    let none_running = name_of_running(None, beside);
-    let elsewhere = name_of_running(Some(7), |_| Some(dir.join("missing")));
-    std::fs::remove_dir_all(&dir).unwrap();
+    let running = Folder::named("running", Some("box"));
+    let default = Folder::named("default", Some("other"));
+    let registered = || {
+      Some(DefaultInstall {
+        dir: default.0.clone(),
+        registered: true,
+      })
+    };
 
-    assert_eq!(named.as_deref(), Some("box"));
-    assert_eq!(none_running, None);
-    assert_eq!(elsewhere, None);
+    assert_eq!(found(Some(running.0.clone()), registered()), installed("box", &running));
+    assert_eq!(found(Some(running.0.join("missing")), None), None);
+  }
+
+  #[test]
+  fn an_agent_installed_but_not_running_is_found_where_its_install_is_registered() {
+    let default = Folder::named("stopped", Some("box"));
+    let at = |registered| {
+      Some(DefaultInstall {
+        dir: default.0.clone(),
+        registered,
+      })
+    };
+
+    assert_eq!(found(None, at(true)), installed("box", &default));
+    assert_eq!(found(None, at(false)), None, "an executable left with no registration is no install");
+    assert_eq!(found(None, None), None);
+  }
+
+  #[test]
+  fn an_install_whose_config_names_no_agent_is_none() {
+    let unnamed = Folder::named("unnamed", None);
+    assert_eq!(
+      found(
+        Some(unnamed.0.clone()),
+        Some(DefaultInstall {
+          dir: unnamed.0.clone(),
+          registered: true
+        })
+      ),
+      None
+    );
+  }
+
+  #[test]
+  fn the_uninstaller_is_the_one_the_install_left_run_with_no_option() {
+    let linux = uninstaller_for(Platform::Linux, Path::new("/home/person/.local/share/jake"));
+    assert_eq!(linux.script, PathBuf::from("/home/person/.local/share/jake/uninstall.sh"));
+    assert_eq!(
+      (linux.program.as_str(), linux.arguments.as_slice()),
+      ("bash", &["/home/person/.local/share/jake/uninstall.sh".to_owned()][..])
+    );
+
+    let windows =
+      uninstaller_for(Platform::Windows, Path::new("C:\\Users\\person\\AppData\\Local\\Programs\\jake"));
+    let script = "C:\\Users\\person\\AppData\\Local\\Programs\\jake\\uninstall.ps1";
+    assert_eq!(windows.script, PathBuf::from(script));
+    assert_eq!(windows.program, "powershell.exe");
+    assert!(windows.arguments.windows(2).any(|pair| pair == ["-File", script]));
+    assert!(
+      windows
+        .arguments
+        .windows(2)
+        .any(|pair| pair[0] == "-InstallDir" && pair[1].ends_with("Programs\\jake"))
+    );
+    assert!(
+      !windows.arguments.iter().any(|argument| argument == "-RemoveConfig"),
+      "the config is kept"
+    );
+  }
+
+  #[test]
+  fn a_missing_uninstaller_is_refused_and_runs_nothing() {
+    let folder = Folder::named("no-uninstaller", Some("box"));
+    let refused = Installed {
+      name: "box".to_owned(),
+      dir: folder.0.clone(),
+    }
+    .uninstall();
+    assert!(refused.is_err_and(|reason| reason.contains("missing")));
   }
 
   #[cfg(unix)]
