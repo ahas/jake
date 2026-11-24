@@ -115,6 +115,39 @@ pub fn run_key_add_command(target: &AnchorTarget) -> Vec<String> {
   ])
 }
 
+/// Read back the per-user Run value of this run mode; `reg` ends in failure where the value is missing.
+pub fn run_key_query_command(target: &AnchorTarget) -> Vec<String> {
+  owned(&["reg", "query", RUN_KEY, "/v", target.name])
+}
+
+/// The command a run mode's Run value holds, as `reg query` prints it on the line naming the value; none where
+/// no such line stands.
+pub fn run_value_held(text: &str, name: &str) -> Option<String> {
+  text.lines().find_map(|line| {
+    let line = line.trim();
+    let rest = line.strip_prefix(name)?.trim_start();
+    Some(rest.strip_prefix("REG_SZ")?.trim().to_owned())
+  })
+}
+
+/// The command that writes this run mode's Run value again, from what its query answered: none where the query
+/// said nothing, since a query that does not answer tells nothing of the value, or where the value holds the
+/// command it must; the write where the query failed, the value being absent, or where it holds another command.
+pub fn run_value_refresh_after(
+  target: &AnchorTarget,
+  queried: Result<Vec<u8>, Unanswered>,
+) -> Option<Vec<String>> {
+  match queried {
+    Ok(bytes)
+      if run_value_held(&query_text(&bytes), target.name).as_deref() == Some(&invocation(target)) =>
+    {
+      None
+    }
+    Ok(_) | Err(Unanswered::Failed(_)) => Some(run_key_add_command(target)),
+    Err(Unanswered::Silent(_)) => None,
+  }
+}
+
 pub fn run_key_remove_command(target: &AnchorTarget) -> Vec<String> {
   owned(&["reg", "delete", RUN_KEY, "/v", target.name, "/f"])
 }
@@ -456,7 +489,7 @@ const HELPER_WITHIN: Duration = Duration::from_secs(10);
 /// How long a stop waits for the watchdog's thread to end what it was doing.
 const STOP_WITHIN: Duration = Duration::from_secs(15);
 
-/// How long a registration of a task is waited on before it is ended.
+/// How long a registration of a task, or a write of a Run value, is waited on before it is ended.
 const REGISTER_WITHIN: Duration = Duration::from_secs(60);
 
 /// The command that registers this run mode's task, from what its query answered: none where the query
@@ -474,18 +507,19 @@ pub fn task_refresh_after(
   }
 }
 
-/// The tasks whose refresh stands, so a tick starts none for a task whose refresh before has not ended.
+/// The anchors, tasks or Run values, whose refresh stands, so a tick starts none for an anchor whose refresh before
+/// has not ended; the watchdog keeps one for its tasks and one for its Run values.
 #[derive(Clone, Default)]
 pub struct Refreshing(Arc<Mutex<HashSet<&'static str>>>);
 
-/// A refresh standing for one task, which lets the task go when dropped.
+/// A refresh standing for one anchor, which lets the anchor go when dropped.
 pub struct Refresh {
   refreshing: Refreshing,
   name: &'static str,
 }
 
 impl Refreshing {
-  /// A refresh of the task `name`, or none where one stands already.
+  /// A refresh of the anchor `name`, or none where one stands already.
   pub fn begin(&self, name: &'static str) -> Option<Refresh> {
     let mut names = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     names.insert(name).then(|| Refresh {
@@ -508,6 +542,17 @@ impl Drop for Refresh {
 async fn refresh_task(target: AnchorTarget, refresh: Refresh) {
   let queried = crate::command::output(&task_query_command(&target), HELPER_WITHIN).await;
   if let Some(command) = task_refresh_after(&target, queried) {
+    let _ = crate::command::finish(&command, REGISTER_WITHIN).await;
+  }
+  drop(refresh);
+}
+
+/// Read the run mode's Run value back and write it again only where the query answers that it is absent or holds
+/// another command. The write is waited on within its bound and ended there, and the refresh holds its value until
+/// then.
+async fn refresh_run_value(target: AnchorTarget, refresh: Refresh) {
+  let queried = crate::command::output(&run_key_query_command(&target), HELPER_WITHIN).await;
+  if let Some(command) = run_value_refresh_after(&target, queried) {
     let _ = crate::command::finish(&command, REGISTER_WITHIN).await;
   }
   drop(refresh);
@@ -679,11 +724,12 @@ impl Watchdog {
       let mut ticks = skipping_interval(self.tick);
       let mut watching = Watching::new(epoch_ms());
       let refreshing = Refreshing::default();
+      let run_values = Refreshing::default();
       let watch = async {
         loop {
           ticks.tick().await;
           watching.tick(epoch_ms(), self.tick);
-          self.run_tick(&pulse, watching, &refreshing).await;
+          self.run_tick(&pulse, watching, &refreshing, &run_values).await;
         }
       };
       tokio::select! {
@@ -696,7 +742,13 @@ impl Watchdog {
   /// Write the heartbeat as the pulse last stamped it, put back every anchor that is missing or, for
   /// the task, not as it must be, and act on the peer as `peer_action` says. A redundant relaunch is
   /// harmless, as the peer's lock drops it.
-  async fn run_tick(&self, pulse: &Pulse, watching: Watching, refreshing: &Refreshing) {
+  async fn run_tick(
+    &self,
+    pulse: &Pulse,
+    watching: Watching,
+    refreshing: &Refreshing,
+    run_values: &Refreshing,
+  ) {
     let windows = Platform::Windows;
     let now = epoch_ms();
     let own = windows.heartbeat_path(&self.env, self.role);
@@ -705,7 +757,9 @@ impl Watchdog {
     }
     let _ = fs::write(&own, pulse.last().to_string());
     for target in install_targets(&self.install_dir) {
-      launch(&run_key_add_command(&target));
+      if let Some(refresh) = run_values.begin(target.name) {
+        tokio::spawn(refresh_run_value(target.clone(), refresh));
+      }
       if !Path::new(&startup_shortcut_path(&target, &self.env)).exists() {
         launch(&startup_shortcut_create_command(&target, &self.env));
       }
@@ -964,6 +1018,40 @@ mod tests {
       task_refresh_after(&agent, Ok(b"not a task".to_vec())),
       Some(task_create_command(&agent))
     );
+  }
+
+  #[test]
+  fn a_run_value_is_written_only_where_its_query_answers_it_missing_or_another() {
+    let [agent, guard] = install_targets("C:\\Program Files\\jake");
+    let held = |value: &str| {
+      format!("\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n    JakeGuard    REG_SZ    {value}\r\n\r\n")
+        .into_bytes()
+    };
+    let wanted = "\"C:\\Program Files\\jake\\jake.exe\" --guard";
+    assert_eq!(run_value_held(&query_text(&held(wanted)), "JakeGuard").as_deref(), Some(wanted));
+
+    assert_eq!(run_value_refresh_after(&guard, Ok(held(wanted))), None);
+    assert_eq!(
+      run_value_refresh_after(&guard, Ok(held("\"C:\\old\\jake.exe\" --guard"))),
+      Some(run_key_add_command(&guard))
+    );
+    let missing = Unanswered::Failed("reg ended with exit code: 1".to_owned());
+    assert_eq!(run_value_refresh_after(&agent, Err(missing)), Some(run_key_add_command(&agent)));
+    let silent = Unanswered::Silent("reg did not finish within 10s".to_owned());
+    assert_eq!(run_value_refresh_after(&agent, Err(silent)), None);
+    assert_eq!(run_key_query_command(&agent), ["reg", "query", RUN_KEY, "/v", "JakeAgent"]);
+  }
+
+  #[test]
+  fn a_run_value_has_one_refresh_standing_until_it_ends_apart_from_its_task() {
+    let (tasks, run_values) = (Refreshing::default(), Refreshing::default());
+    let value = run_values.begin(GUARD_ANCHOR_NAME);
+
+    assert!(value.is_some());
+    assert!(run_values.begin(GUARD_ANCHOR_NAME).is_none());
+    assert!(tasks.begin(GUARD_ANCHOR_NAME).is_some());
+    drop(value);
+    assert!(run_values.begin(GUARD_ANCHOR_NAME).is_some());
   }
 
   #[test]

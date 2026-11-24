@@ -278,16 +278,19 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   so a hung peer that never exited is brought back just as a crashed one is. A process finding its
   peer stale relaunches it; every process, on every tick, puts back every autostart anchor that is
   missing, so the wipe of any single anchor is repaired within one tick as long as either process is
-  alive. A tick stays cheap: the run entry is rewritten in place, the Startup shortcut is written only
-  where it is missing, and the scheduled task is read back with a plain query and registered again,
-  which takes PowerShell, only where the query answers that it is missing or its definition differs
-  from the one it must hold.
+  alive. A tick stays cheap: the run entry is read back with a plain `reg query` and written again
+  with `reg add` only where the query answers that it is missing or names another command, the
+  Startup shortcut is written only where it is missing, and the scheduled task is read back with a
+  plain query and registered again, which takes PowerShell, only where the query answers that it is
+  missing or its definition differs from the one it must hold.
 - A starved machine is never handed more of that work than it finishes. A query that does not answer
-  within its bound says nothing about the task, which is left as it stands until a later tick reads
-  it. A task has at most one registration standing: a tick that finds the one before still running
-  starts no other, and a registration is waited on for at most a minute and ended at that bound with
-  its PowerShell. Without that, a machine too loaded to answer the query within its bound is handed
-  two PowerShells a minute by each process, none of which finishes, and they pile up by the hundred.
+  within its bound, ten seconds, says nothing about the anchor it asked after, a run entry or a task,
+  which is left as it stands, unregistered that round, until a later tick reads it. Each run entry and
+  each task has at most one refresh standing, its query and its registration together: a tick that
+  finds the one before still running starts no other, and a registration, a run entry's `reg add` or
+  a task's PowerShell, is waited on for at most a minute and ended at that bound. Without that, a
+  machine too loaded to answer within the bound is handed a registration of each anchor every minute
+  by each process, none of which finishes, and they pile up by the hundred.
 - The watchdog runs on a thread and runtime of its own, so starting a helper, waiting on one or
   writing a file, any of which a starved machine can hold up for seconds, never holds up the runtime
   that carries the tunnel. The liveness it records is that runtime's, not its own: the runtime stamps
