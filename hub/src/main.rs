@@ -1,5 +1,12 @@
 // The jake hub: the main-host side of the tunnel, an agent server and a loopback control API.
 
+/// The hub's version: the one a deployment hands its build as `BMO_VERSION`, read off the git tags, else the
+/// manifest's placeholder (bmo-chat's `docs/conventions.md`, 「Versions」).
+const VERSION: &str = match option_env!("BMO_VERSION") {
+  Some(version) => version,
+  None => env!("CARGO_PKG_VERSION"),
+};
+
 mod agent_server;
 mod config;
 mod connect;
@@ -113,7 +120,7 @@ async fn run() -> Result<(), String> {
 
 /// The jake hub; given a verb, a client of the running hub instead.
 #[derive(Parser)]
-#[command(name = "jake-hub", version)]
+#[command(name = "jake-hub", version = VERSION)]
 struct Cli {
   #[command(subcommand)]
   verb: Option<Verb>,
