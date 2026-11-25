@@ -51,8 +51,8 @@ pub struct Controller<W: Window> {
 /// How long a quit waits for the built-in agent to close its connection.
 const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The version the built-in agent announces in its hello, telling it from an installed one.
-const AGENT_VERSION: &str = concat!("desktop-", env!("CARGO_PKG_VERSION"));
+/// What the built-in agent's version starts with in its hello, telling it from an installed one.
+const AGENT_PREFIX: &str = "desktop-";
 
 impl<W: Window> Controller<W> {
   /// Run the course until the app quits; a state that needs the person waits for the page's ask.
@@ -248,7 +248,7 @@ impl<W: Window> Controller<W> {
       status.send_modify(|status| status.agent = AgentState::Link(Link::Connecting));
       let config =
         AgentConfig::new(machine.hub_url.clone(), machine.credential.clone(), machine.node.clone());
-      let agent = Agent::new(config, AGENT_VERSION.to_owned(), log.clone())
+      let agent = Agent::new(config, format!("{AGENT_PREFIX}{}", crate::VERSION), log.clone())
         .instance(self.instance.clone())
         .machine(self.machine.clone())
         .when_superseded(WhenSuperseded::GiveUp);

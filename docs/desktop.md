@@ -630,10 +630,10 @@ Either goes out on one of three channels, by the kind of its version (bmo-chat's
   nightly named in the earlier form, `X.Y.Z-nightly.<YYYYMMDD>[.<n>]`, is ordered as the same day's nightly of the
   present form wherever what is published is compared.
 
-The version of a stable release, an alpha, a beta or a release candidate is the one in the apps' Tauri
-configuration, moved only in the commit that releases the set, and every app's configuration names the same one. A
-nightly's version is laid over the configuration's on the Tauri CLI's command line of its build alone, and is
-never written into the repository. The all-in-one is built from the same crate with its feature `all-in-one` and
+Every version is the set's, read off its git tags (bmo-chat's `docs/conventions.md`, 「Versions」): the apps' Tauri
+configurations name a placeholder that never moves and is the same in every app's, and the version of each release,
+whatever its kind, is laid over it on the Tauri CLI's command line of its build alone and handed to the build as
+`BMO_VERSION`, which the app compiles in for its built-in agent's hello, and is never written into the repository. The all-in-one is built from the same crate with its feature `all-in-one` and
 its configuration `tauri.all-in-one.conf.json` laid over the crate's own (docs/all-in-one.md, 「The crate」).
 
 The two kinds are counted apart: an official version is compared with what GitHub holds and a test version with what

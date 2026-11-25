@@ -6,6 +6,13 @@
 // there, and the remote controller's build holds every module to the lints in full.
 #![cfg_attr(feature = "all-in-one", allow(dead_code))]
 
+/// The app's version: the one its release build is handed as `BMO_VERSION` and lays over the Tauri configuration's
+/// placeholder, else the manifest's placeholder (bmo-chat's `docs/conventions.md`, 「Versions」).
+pub const VERSION: &str = match option_env!("BMO_VERSION") {
+  Some(version) => version,
+  None => env!("CARGO_PKG_VERSION"),
+};
+
 mod channel;
 mod navigation;
 mod settings;

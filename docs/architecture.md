@@ -650,7 +650,10 @@ after a fault, and returns at sign-in only where the person turned that on (docs
   target — with zig as the linker and C compiler, so no Windows toolchain and no separate Linux
   machine are needed to produce them. Each is a single self-contained file: the Linux binary links
   its C library statically, so it runs on any distribution or WSL whatever C library that has. The
-  build version is stamped into it at compile time — the agent run mode announces it to the hub.
+  build version is stamped into it at compile time — the agent run mode announces it to the hub. It is the
+  set's version the deployment hands the build as `BMO_VERSION`, read off the git tags (bmo-chat's
+  `docs/conventions.md`, 「Versions」), or the package's placeholder version outside a deployment, followed by
+  the commit's short hash, so two builds of one day's nightly stay apart.
   The build's output is a small layout: the Windows executable, the Linux binary, the example
   config, the install scripts for both platforms, and the install guide. Nothing else is bundled, because the agent needs nothing beyond the shells
   already on the machine.

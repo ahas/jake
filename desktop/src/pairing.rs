@@ -95,7 +95,7 @@ impl Console {
   fn with_poll_floor(base: Url, poll_floor: Duration) -> Self {
     let http = reqwest::Client::builder()
       .timeout(REQUEST_TIMEOUT)
-      .user_agent(concat!("jake-desktop/", env!("CARGO_PKG_VERSION")))
+      .user_agent(format!("jake-desktop/{}", crate::VERSION))
       .build()
       .expect("an HTTPS client with a timeout and an agent name can be built");
     Self {

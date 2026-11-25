@@ -27,10 +27,14 @@ const BINARIES: ReadonlyArray<{ target: string; outName: string }> = [
   { target: "x86_64-unknown-linux-musl", outName: "jake" },
 ];
 
-/** Derive the build version: the package version, plus the git short hash and a dirty marker. */
+/**
+ * Derive the build version: the set's version a deployment hands the build as `BMO_VERSION`, read off the git tags
+ * (bmo-chat's docs/conventions.md, 「Versions」), else the package's placeholder version, plus the git short hash and
+ * a dirty marker, so two builds of one day's nightly stay apart.
+ */
 async function readVersion(): Promise<string> {
   const pkg = (await Bun.file(join(repoRoot, "package.json")).json()) as { version?: string };
-  const base = pkg.version ?? "0.0.0";
+  const base = process.env.BMO_VERSION || (pkg.version ?? "0.0.0");
   const hash = git(["rev-parse", "--short", "HEAD"]);
   if (hash === null) {
     return base;
