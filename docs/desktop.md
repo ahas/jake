@@ -264,7 +264,8 @@ before the hub has to.
   (`%LOCALAPPDATA%\Programs\jake` on Windows), or on Linux in the data directory (`~/.local/share/jake`)
   with the `jake-agent` user unit registered.
   - Where that name is the built-in agent's, the built-in agent stays off and the local page says the
-    installed jake agent serves this machine, with 콘솔 열기, 다시 확인 and 내장 에이전트로 전환.
+    installed jake agent serves this machine, with 다시 확인 at the start of the row and 콘솔 열기 and 내장
+    에이전트로 전환 at its end.
   - Where it is another name, the built-in agent stays off as well and the local page says another jake
     already serves this machine under that name, with the two ways on: keep using that install, so this
     machine works as that install's node, which the BMO administrator declares shared with this
